@@ -1,4 +1,5 @@
 #include <unzip.h>
+#include "exception.h"
 #include "zip.h"
 
 static voidpf ZCALLBACK fopen_file_func(voidpf opaque, const char* filename, int mode) {
@@ -73,7 +74,18 @@ public:
         callbacks_.zclose_file = fclose_file_func;
         callbacks_.zerror_file = ferror_file_func;
         callbacks_.opaque = nullptr;
+        file_ = nullptr;
         open(archiveFilename);
+    }
+
+    ~Zip() {
+        close();
+    }
+
+    void close() {
+        if (file_ != nullptr) {
+            ::unzClose(file_);
+        }
     }
 
     void open(const std::string& archiveFilename) {
@@ -86,15 +98,17 @@ public:
     unz_file_info getFileInfo() {
         unz_file_info fileInfo {};
         if (::unzGetCurrentFileInfo(file_, &fileInfo, nullptr, 0, nullptr, 0, nullptr, 0) != UNZ_OK) {
+            throw Exception("unzGetCurrentFileInfo return failure.");
         }
         return fileInfo;
     }
 
-    unz_file_info getFileInfo(unz_file_info fileInfo) {
-        std::string filename(fileInfo.size_filename, 0x0);
-        if (::unzGetCurrentFileInfo(file_, &fileInfo, const_cast<char *>(filename.data()), filename.size(), nullptr, 0, nullptr, 0) != UNZ_OK) {
+    std::string getFileInfo(unz_file_info & fileInfo) {
+        std::vector<char> filename(fileInfo.size_filename, 0x0);
+        if (::unzGetCurrentFileInfo(file_, &fileInfo, filename.data(), filename.size(), nullptr, 0, nullptr, 0) != UNZ_OK) {
+            throw Exception("unzGetCurrentFileInfo return failure.");
         }
-        return fileInfo;
+        return filename.data();
     }
 
     bool nextFile() {
@@ -106,7 +120,4 @@ private:
     unzFile file_;
 };
 
-std::vector<std::string> getFileList(const std::string& archiveFilename) {
-    std::vector<std::string> result;
-    return result;
-}
+

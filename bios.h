@@ -36,11 +36,6 @@ struct ReplacePattern {
     uint32_t length;
 };
 
-class Exception : public std::exception {
-public:
-    Exception(const char *str);
-};
-
 class Bios {
 public:
 

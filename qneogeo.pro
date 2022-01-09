@@ -12,6 +12,7 @@ INCLUDEPATH += ./thirdparty/zlib/contrib/minizip
 
 SOURCES += \
     bios.cpp \
+    exception.cpp \
     main.cpp \
     mainwindow.cpp \
     zip.cpp
@@ -19,6 +20,7 @@ SOURCES += \
 HEADERS += \
     bios.h \
     endian.h \
+    exception.h \
     mainwindow.h \
     memory.h \
     zip.h

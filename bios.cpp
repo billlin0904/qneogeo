@@ -1,7 +1,7 @@
-#include <array>
-#include "bios.h"
 #include "memory.h"
+#include "exception.h"
 #include "endian.h"
+#include "bios.h"
 
 static constexpr std::array<uint8_t, 4>
 VALIDITY_SEARCH_PATTERN_DATA
