@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/">
+        <file>qneogeo.ico</file>
+    </qresource>
+</RCC>

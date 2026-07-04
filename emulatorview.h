@@ -22,7 +22,9 @@ public:
         Nearest,
         Linear,
         Super2xSai,
-        XbrzFreescale
+        XbrzFreescale,
+        LibretroXbrzFreescale,
+        Libretro6xbrz
     };
 
     explicit EmulatorView(QWidget *parent = nullptr);
@@ -66,10 +68,14 @@ private:
     void updateTextureFiltering();
     void updateVertices();
     void updateFpsCounter();
+    bool initializeFrameShader();
+    bool initializeLibretroShader(QOpenGLShaderProgram &program, const QString &fileName);
+    bool usesLibretroShader() const;
 
     QMutex frame_mutex_;
     Frame pending_frame_;
     bool has_pending_frame_ = false;
+    bool shutting_down_ = false;
 
     Frame current_frame_;
     QSize texture_size_;
@@ -84,6 +90,8 @@ private:
     double fps_ = 0.0;
 
     QOpenGLShaderProgram program_;
+    QOpenGLShaderProgram libretro_xbrz_freescale_program_;
+    QOpenGLShaderProgram libretro_6xbrz_program_;
     QOpenGLBuffer vertex_buffer_;
     QOpenGLVertexArrayObject vertex_array_;
 };

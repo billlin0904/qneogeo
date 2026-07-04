@@ -180,7 +180,18 @@ if(QNEOGEO_BUILD_QT_APP)
     set(CMAKE_AUTORCC ON)
 
     find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
+    find_package(RtAudio CONFIG REQUIRED)
     find_package(SampleRate CONFIG REQUIRED)
+
+    set(QNEOGEO_SHADER_FILES
+        shaders/6xbrz.glsl
+        shaders/README.md
+        shaders/frame.frag
+        shaders/frame.vert
+        shaders/xbrz-freescale.glsl
+    )
+    set_source_files_properties(${QNEOGEO_SHADER_FILES} PROPERTIES HEADER_FILE_ONLY TRUE)
+    source_group("Shaders" FILES ${QNEOGEO_SHADER_FILES})
 
     qt_add_executable(qneogeo
         emulatorview.cpp
@@ -193,17 +204,31 @@ if(QNEOGEO_BUILD_QT_APP)
         mainwindow.cpp
         mainwindow.h
         mainwindow.ui
+        qneogeo.ico
+        qneogeo.qrc
+        qneogeo.rc
         wasapiaudio.cpp
         wasapiaudio.h
+        ${QNEOGEO_SHADER_FILES}
+    )
+
+    set_target_properties(qneogeo PROPERTIES
+        WIN32_EXECUTABLE "$<CONFIG:Release>"
     )
 
     target_include_directories(qneogeo PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/neocd_libretro/deps/libretro-common/include"
     )
 
-    target_link_libraries(qneogeo PRIVATE Qt6::Widgets Qt6::OpenGL Qt6::OpenGLWidgets SampleRate::samplerate ole32 uuid xinput)
+    target_link_libraries(qneogeo PRIVATE Qt6::Widgets Qt6::OpenGL Qt6::OpenGLWidgets RtAudio::rtaudio SampleRate::samplerate xinput)
 
     if(TARGET neocd_libretro)
         add_dependencies(qneogeo neocd_libretro)
     endif()
+
+    add_custom_command(TARGET qneogeo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+            "$<TARGET_FILE_DIR:qneogeo>/shaders"
+    )
 endif()

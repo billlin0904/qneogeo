@@ -48,6 +48,8 @@ private:
     QAction *load_state_action_;
     QAction *pause_when_inactive_action_;
     QAction *show_fps_action_;
+    QAction *arcade_socd_clean_action_ = nullptr;
+    QAction *keyboard_motion_assist_action_ = nullptr;
     QLabel *fps_label_;
     QDialog *super2xsai_dialog_ = nullptr;
     QString current_game_path_;

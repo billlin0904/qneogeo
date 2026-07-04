@@ -11,6 +11,13 @@
 #include <QSaveFile>
 #include <QSettings>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
 #include <Xinput.h>
 
 #include <cstdarg>
@@ -20,6 +27,11 @@
 LibretroCore *LibretroCore::active_core_ = nullptr;
 
 namespace {
+constexpr uint8_t DirectionUp = 0x01;
+constexpr uint8_t DirectionDown = 0x02;
+constexpr uint8_t DirectionLeft = 0x04;
+constexpr uint8_t DirectionRight = 0x08;
+
 QString bindingSettingName(unsigned retroButtonId) {
     switch (retroButtonId) {
     case RETRO_DEVICE_ID_JOYPAD_UP:
@@ -169,8 +181,12 @@ bool LibretroCore::startGame(const QString &contentPath, const QString &systemDi
         qWarning().noquote() << "WASAPI shared audio disabled:" << audio_.lastError();
 
     paused_ = false;
+    raw_keyboard_joypad_state_.fill(false);
     keyboard_joypad_state_.fill(false);
     xinput_joypad_state_.fill(false);
+    current_keyboard_direction_bits_ = 0;
+    pending_keyboard_direction_bits_ = 0;
+    motion_assist_polls_remaining_ = 0;
     frame_timer_.start(16);
     emit pausedChanged(false);
     return true;
@@ -207,8 +223,12 @@ void LibretroCore::setPaused(bool paused) {
         return;
 
     paused_ = paused;
+    raw_keyboard_joypad_state_.fill(false);
     keyboard_joypad_state_.fill(false);
     xinput_joypad_state_.fill(false);
+    current_keyboard_direction_bits_ = 0;
+    pending_keyboard_direction_bits_ = 0;
+    motion_assist_polls_remaining_ = 0;
 
     if (paused_) {
         frame_timer_.stop();
@@ -326,6 +346,7 @@ void LibretroCore::setKeyBinding(unsigned retroButtonId, int key) {
         return;
 
     key_bindings_[retroButtonId] = key;
+    raw_keyboard_joypad_state_[retroButtonId] = false;
     keyboard_joypad_state_[retroButtonId] = false;
 }
 
@@ -335,7 +356,11 @@ std::array<int, 16> LibretroCore::keyBindings() const {
 
 void LibretroCore::setKeyBindings(const std::array<int, 16> &bindings) {
     key_bindings_ = bindings;
+    raw_keyboard_joypad_state_.fill(false);
     keyboard_joypad_state_.fill(false);
+    current_keyboard_direction_bits_ = 0;
+    pending_keyboard_direction_bits_ = 0;
+    motion_assist_polls_remaining_ = 0;
 }
 
 int LibretroCore::xinputBinding(unsigned retroButtonId) const {
@@ -365,6 +390,11 @@ void LibretroCore::setXInputBindings(const std::array<int, 16> &bindings) {
 void LibretroCore::loadInputConfiguration(const QString &iniPath) {
     QSettings settings(iniPath, QSettings::IniFormat);
 
+    settings.beginGroup(QStringLiteral("Input"));
+    arcade_socd_clean_ = settings.value(QStringLiteral("ArcadeSocdClean"), arcade_socd_clean_).toBool();
+    keyboard_motion_assist_ = settings.value(QStringLiteral("KeyboardMotionAssist"), keyboard_motion_assist_).toBool();
+    settings.endGroup();
+
     for (unsigned id = 0; id < key_bindings_.size(); ++id) {
         const QString name = bindingSettingName(id);
 
@@ -377,8 +407,12 @@ void LibretroCore::loadInputConfiguration(const QString &iniPath) {
         settings.endGroup();
     }
 
+    raw_keyboard_joypad_state_.fill(false);
     keyboard_joypad_state_.fill(false);
     xinput_joypad_state_.fill(false);
+    current_keyboard_direction_bits_ = 0;
+    pending_keyboard_direction_bits_ = 0;
+    motion_assist_polls_remaining_ = 0;
 }
 
 void LibretroCore::saveInputConfiguration(const QString &iniPath) const {
@@ -386,7 +420,11 @@ void LibretroCore::saveInputConfiguration(const QString &iniPath) const {
     QDir().mkpath(file_info.absolutePath());
 
     QSettings settings(iniPath, QSettings::IniFormat);
-    settings.clear();
+
+    settings.beginGroup(QStringLiteral("Input"));
+    settings.setValue(QStringLiteral("ArcadeSocdClean"), arcade_socd_clean_);
+    settings.setValue(QStringLiteral("KeyboardMotionAssist"), keyboard_motion_assist_);
+    settings.endGroup();
 
     settings.beginGroup(QStringLiteral("Keyboard"));
     for (unsigned id = 0; id < key_bindings_.size(); ++id)
@@ -399,6 +437,31 @@ void LibretroCore::saveInputConfiguration(const QString &iniPath) const {
     settings.endGroup();
 
     settings.sync();
+}
+
+bool LibretroCore::arcadeSocdClean() const {
+    return arcade_socd_clean_;
+}
+
+void LibretroCore::setArcadeSocdClean(bool enabled) {
+    if (arcade_socd_clean_ == enabled)
+        return;
+
+    arcade_socd_clean_ = enabled;
+    applyKeyboardInputState();
+}
+
+bool LibretroCore::keyboardMotionAssist() const {
+    return keyboard_motion_assist_;
+}
+
+void LibretroCore::setKeyboardMotionAssist(bool enabled) {
+    if (keyboard_motion_assist_ == enabled)
+        return;
+
+    keyboard_motion_assist_ = enabled;
+    motion_assist_polls_remaining_ = 0;
+    applyKeyboardInputState();
 }
 
 QString LibretroCore::xinputControlName(int control) {
@@ -495,13 +558,16 @@ bool LibretroCore::eventFilter(QObject *watched, QEvent *event) {
     if (button < 0)
         return QObject::eventFilter(watched, event);
 
-    keyboard_joypad_state_[static_cast<size_t>(button)] = event->type() == QEvent::KeyPress;
+    raw_keyboard_joypad_state_[static_cast<size_t>(button)] = event->type() == QEvent::KeyPress;
+    applyKeyboardInputState();
     return true;
 }
 
 void LibretroCore::runFrame() {
-    if (game_loaded_ && !paused_ && retro_run_)
+    if (game_loaded_ && !paused_ && retro_run_) {
         retro_run_();
+        finishKeyboardMotionAssist();
+    }
 }
 
 bool LibretroCore::environmentCallback(unsigned command, void *data) {
@@ -672,6 +738,101 @@ int16_t LibretroCore::inputState(unsigned port, unsigned device, unsigned, unsig
 
     const auto index = static_cast<size_t>(id);
     return (keyboard_joypad_state_[index] || xinput_joypad_state_[index]) ? 1 : 0;
+}
+
+uint8_t LibretroCore::rawKeyboardDirectionBits() const {
+    uint8_t bits = 0;
+    if (raw_keyboard_joypad_state_[RETRO_DEVICE_ID_JOYPAD_UP])
+        bits |= DirectionUp;
+    if (raw_keyboard_joypad_state_[RETRO_DEVICE_ID_JOYPAD_DOWN])
+        bits |= DirectionDown;
+    if (raw_keyboard_joypad_state_[RETRO_DEVICE_ID_JOYPAD_LEFT])
+        bits |= DirectionLeft;
+    if (raw_keyboard_joypad_state_[RETRO_DEVICE_ID_JOYPAD_RIGHT])
+        bits |= DirectionRight;
+    return bits;
+}
+
+uint8_t LibretroCore::cleanedKeyboardDirectionBits(uint8_t directionBits) const {
+    if (!arcade_socd_clean_)
+        return directionBits;
+
+    if ((directionBits & (DirectionUp | DirectionDown)) == (DirectionUp | DirectionDown))
+        directionBits &= static_cast<uint8_t>(~(DirectionUp | DirectionDown));
+    if ((directionBits & (DirectionLeft | DirectionRight)) == (DirectionLeft | DirectionRight))
+        directionBits &= static_cast<uint8_t>(~(DirectionLeft | DirectionRight));
+
+    return directionBits;
+}
+
+void LibretroCore::setKeyboardDirectionBits(uint8_t directionBits) {
+    keyboard_joypad_state_[RETRO_DEVICE_ID_JOYPAD_UP] = (directionBits & DirectionUp) != 0;
+    keyboard_joypad_state_[RETRO_DEVICE_ID_JOYPAD_DOWN] = (directionBits & DirectionDown) != 0;
+    keyboard_joypad_state_[RETRO_DEVICE_ID_JOYPAD_LEFT] = (directionBits & DirectionLeft) != 0;
+    keyboard_joypad_state_[RETRO_DEVICE_ID_JOYPAD_RIGHT] = (directionBits & DirectionRight) != 0;
+}
+
+void LibretroCore::applyKeyboardInputState() {
+    keyboard_joypad_state_ = raw_keyboard_joypad_state_;
+
+    const uint8_t previous_bits = current_keyboard_direction_bits_;
+    const uint8_t next_bits = cleanedKeyboardDirectionBits(rawKeyboardDirectionBits());
+    pending_keyboard_direction_bits_ = next_bits;
+
+    uint8_t effective_bits = next_bits;
+    motion_assist_polls_remaining_ = 0;
+
+    if (keyboard_motion_assist_) {
+        const bool previous_down_diagonal = (previous_bits & DirectionDown) != 0 &&
+                                            ((previous_bits & DirectionLeft) != 0 || (previous_bits & DirectionRight) != 0);
+        const bool next_down_diagonal = (next_bits & DirectionDown) != 0 &&
+                                        ((next_bits & DirectionLeft) != 0 || (next_bits & DirectionRight) != 0);
+        const bool previous_up_diagonal = (previous_bits & DirectionUp) != 0 &&
+                                          ((previous_bits & DirectionLeft) != 0 || (previous_bits & DirectionRight) != 0);
+        const bool next_up_diagonal = (next_bits & DirectionUp) != 0 &&
+                                      ((next_bits & DirectionLeft) != 0 || (next_bits & DirectionRight) != 0);
+        const bool previous_left_diagonal = (previous_bits & DirectionLeft) != 0 &&
+                                            ((previous_bits & DirectionUp) != 0 || (previous_bits & DirectionDown) != 0);
+        const bool next_left_diagonal = (next_bits & DirectionLeft) != 0 &&
+                                        ((next_bits & DirectionUp) != 0 || (next_bits & DirectionDown) != 0);
+        const bool previous_right_diagonal = (previous_bits & DirectionRight) != 0 &&
+                                             ((previous_bits & DirectionUp) != 0 || (previous_bits & DirectionDown) != 0);
+        const bool next_right_diagonal = (next_bits & DirectionRight) != 0 &&
+                                         ((next_bits & DirectionUp) != 0 || (next_bits & DirectionDown) != 0);
+
+        if (previous_down_diagonal && next_down_diagonal &&
+            ((previous_bits ^ next_bits) & (DirectionLeft | DirectionRight)) == (DirectionLeft | DirectionRight)) {
+            effective_bits = DirectionDown;
+        } else if (previous_up_diagonal && next_up_diagonal &&
+                   ((previous_bits ^ next_bits) & (DirectionLeft | DirectionRight)) == (DirectionLeft | DirectionRight)) {
+            effective_bits = DirectionUp;
+        } else if (previous_left_diagonal && next_left_diagonal &&
+                   ((previous_bits ^ next_bits) & (DirectionUp | DirectionDown)) == (DirectionUp | DirectionDown)) {
+            effective_bits = DirectionLeft;
+        } else if (previous_right_diagonal && next_right_diagonal &&
+                   ((previous_bits ^ next_bits) & (DirectionUp | DirectionDown)) == (DirectionUp | DirectionDown)) {
+            effective_bits = DirectionRight;
+        }
+
+        if (effective_bits != next_bits)
+            motion_assist_polls_remaining_ = 1;
+    }
+
+    current_keyboard_direction_bits_ = effective_bits;
+    setKeyboardDirectionBits(effective_bits);
+}
+
+void LibretroCore::finishKeyboardMotionAssist() {
+    if (motion_assist_polls_remaining_ <= 0)
+        return;
+
+    --motion_assist_polls_remaining_;
+    if (motion_assist_polls_remaining_ > 0)
+        return;
+
+    current_keyboard_direction_bits_ = pending_keyboard_direction_bits_;
+    keyboard_joypad_state_ = raw_keyboard_joypad_state_;
+    setKeyboardDirectionBits(pending_keyboard_direction_bits_);
 }
 
 void LibretroCore::setError(const QString &message) {

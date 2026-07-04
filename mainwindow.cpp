@@ -20,6 +20,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QRegularExpression>
+#include <QSettings>
 #include <QSlider>
 #include <QVBoxLayout>
 
@@ -66,6 +67,14 @@ MainWindow::MainWindow(QWidget *parent)
     auto *load_game_action = main_menu->addAction(QStringLiteral("Load Game"));
     auto *configuration_input_action = main_menu->addAction(QStringLiteral("Configuration Input"));
 
+    auto *input_menu = menuBar()->addMenu(QStringLiteral("Input"));
+    arcade_socd_clean_action_ = input_menu->addAction(QStringLiteral("Arcade SOCD Clean"));
+    arcade_socd_clean_action_->setCheckable(true);
+    arcade_socd_clean_action_->setChecked(core_->arcadeSocdClean());
+    keyboard_motion_assist_action_ = input_menu->addAction(QStringLiteral("Keyboard Motion Assist"));
+    keyboard_motion_assist_action_->setCheckable(true);
+    keyboard_motion_assist_action_->setChecked(core_->keyboardMotionAssist());
+
     auto *state_menu = menuBar()->addMenu(QStringLiteral("State"));
     pause_action_ = state_menu->addAction(QStringLiteral("Pause"));
     pause_action_->setCheckable(true);
@@ -109,9 +118,43 @@ MainWindow::MainWindow(QWidget *parent)
     xbrz_action->setData(static_cast<int>(EmulatorView::ScalingFilter::XbrzFreescale));
     filter_group->addAction(xbrz_action);
 
+    auto *libretro_xbrz_action = filter_menu->addAction(QStringLiteral("libretro xBRZ Freescale"));
+    libretro_xbrz_action->setCheckable(true);
+    libretro_xbrz_action->setData(static_cast<int>(EmulatorView::ScalingFilter::LibretroXbrzFreescale));
+    filter_group->addAction(libretro_xbrz_action);
+
+    auto *libretro_6xbrz_action = filter_menu->addAction(QStringLiteral("libretro 6xBRZ"));
+    libretro_6xbrz_action->setCheckable(true);
+    libretro_6xbrz_action->setData(static_cast<int>(EmulatorView::ScalingFilter::Libretro6xbrz));
+    filter_group->addAction(libretro_6xbrz_action);
+
+    {
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        const int saved_filter = settings.value(QStringLiteral("Video/ScalingFilter"),
+                                                static_cast<int>(EmulatorView::ScalingFilter::Nearest)).toInt();
+        for (QAction *action : filter_group->actions()) {
+            if (action->data().toInt() != saved_filter)
+                continue;
+
+            action->setChecked(true);
+            emulator_view_->setScalingFilter(static_cast<EmulatorView::ScalingFilter>(saved_filter));
+            break;
+        }
+    }
+
     connect(load_game_action, &QAction::triggered, this, &MainWindow::showLoadGameDialog);
 
     connect(configuration_input_action, &QAction::triggered, this, &MainWindow::showInputConfiguration);
+
+    connect(arcade_socd_clean_action_, &QAction::toggled, this, [this](bool enabled) {
+        core_->setArcadeSocdClean(enabled);
+        core_->saveInputConfiguration(inputConfigPath());
+    });
+
+    connect(keyboard_motion_assist_action_, &QAction::toggled, this, [this](bool enabled) {
+        core_->setKeyboardMotionAssist(enabled);
+        core_->saveInputConfiguration(inputConfigPath());
+    });
 
     connect(pause_action_, &QAction::toggled, core_, &LibretroCore::setPaused);
     connect(save_state_action_, &QAction::triggered, this, &MainWindow::saveState);
@@ -127,6 +170,12 @@ MainWindow::MainWindow(QWidget *parent)
     connect(filter_group, &QActionGroup::triggered, this, [this](QAction *action) {
         const auto filter = static_cast<EmulatorView::ScalingFilter>(action->data().toInt());
         emulator_view_->setScalingFilter(filter);
+
+        QFileInfo file_info(inputConfigPath());
+        QDir().mkpath(file_info.absolutePath());
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        settings.setValue(QStringLiteral("Video/ScalingFilter"), action->data().toInt());
+        settings.sync();
 
         if (filter == EmulatorView::ScalingFilter::Super2xSai)
             showSuper2xSaiSettingsDialog();
@@ -145,6 +194,12 @@ MainWindow::MainWindow(QWidget *parent)
 }
 
 MainWindow::~MainWindow() {
+    if (core_) {
+        core_->stop();
+        delete core_;
+        core_ = nullptr;
+    }
+
     delete ui_;
 }
 

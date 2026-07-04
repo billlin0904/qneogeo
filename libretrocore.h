@@ -65,6 +65,10 @@ public:
     void setXInputBindings(const std::array<int, 16> &bindings);
     void loadInputConfiguration(const QString &iniPath);
     void saveInputConfiguration(const QString &iniPath) const;
+    bool arcadeSocdClean() const;
+    void setArcadeSocdClean(bool enabled);
+    bool keyboardMotionAssist() const;
+    void setKeyboardMotionAssist(bool enabled);
     static QString xinputControlName(int control);
     static int firstPressedXInputControl(unsigned userIndex = 0);
     QString lastError() const;
@@ -118,6 +122,11 @@ private:
     void pollXInput();
     bool initializeResampler(int sourceSampleRate);
     void releaseResampler();
+    void applyKeyboardInputState();
+    void finishKeyboardMotionAssist();
+    uint8_t rawKeyboardDirectionBits() const;
+    uint8_t cleanedKeyboardDirectionBits(uint8_t directionBits) const;
+    void setKeyboardDirectionBits(uint8_t directionBits);
 
     static LibretroCore *active_core_;
     static constexpr int output_sample_rate_ = 48000;
@@ -140,6 +149,12 @@ private:
     bool initialized_ = false;
     bool game_loaded_ = false;
     bool paused_ = false;
+    bool arcade_socd_clean_ = true;
+    bool keyboard_motion_assist_ = true;
+    uint8_t current_keyboard_direction_bits_ = 0;
+    uint8_t pending_keyboard_direction_bits_ = 0;
+    int motion_assist_polls_remaining_ = 0;
+    std::array<bool, 16> raw_keyboard_joypad_state_ {};
     std::array<bool, 16> keyboard_joypad_state_ {};
     std::array<bool, 16> xinput_joypad_state_ {};
     std::array<int, 16> key_bindings_ {};

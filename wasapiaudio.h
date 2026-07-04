@@ -3,10 +3,12 @@
 #include <QObject>
 #include <QString>
 
-#include <audioclient.h>
-#include <mmdeviceapi.h>
-
+#include <memory>
+#include <mutex>
+#include <vector>
 #include <cstdint>
+
+class RtAudio;
 
 class WasapiAudio final : public QObject {
     Q_OBJECT
@@ -22,19 +24,25 @@ public:
     QString lastError() const;
 
 private:
+    static int audioCallback(void *outputBuffer,
+                             void *inputBuffer,
+                             unsigned int frameCount,
+                             double streamTime,
+                             unsigned int status,
+                             void *userData);
+
+    int render(float *outputBuffer, unsigned int frameCount);
     void setError(const QString &message);
-    void releaseInterfaces();
-    bool initializeCom();
-    bool initializeDevice(int sampleRate);
+    void resetBuffer(size_t frameCapacity);
+    size_t freeFrames() const;
 
     QString last_error_;
-    bool com_initialized_ = false;
+    std::unique_ptr<RtAudio> audio_;
+    std::mutex buffer_mutex_;
+    std::vector<float> ring_buffer_;
+    size_t read_frame_ = 0;
+    size_t write_frame_ = 0;
+    size_t queued_frames_ = 0;
+    size_t max_queued_frames_ = 0;
     bool running_ = false;
-    UINT32 buffer_frame_count_ = 0;
-    WAVEFORMATEX format_ {};
-
-    IMMDeviceEnumerator *device_enumerator_ = nullptr;
-    IMMDevice *device_ = nullptr;
-    IAudioClient *audio_client_ = nullptr;
-    IAudioRenderClient *render_client_ = nullptr;
 };
