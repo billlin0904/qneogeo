@@ -1,4 +1,4 @@
-QT       += core gui
+QT       += core gui opengl openglwidgets
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -8,22 +8,27 @@ CONFIG += c++17
 # In order to do so, uncomment the following line.
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
-INCLUDEPATH += ./thirdparty/zlib/contrib/minizip
-
 SOURCES += \
-    bios.cpp \
-    exception.cpp \
+    emulatorview.cpp \
+    inputmappingwidget.cpp \
+    libretrocore.cpp \
     main.cpp \
     mainwindow.cpp \
-    zip.cpp
+    wasapiaudio.cpp
 
 HEADERS += \
-    bios.h \
-    endian.h \
-    exception.h \
+    emulatorview.h \
+    inputmappingwidget.h \
+    libretrocore.h \
     mainwindow.h \
     memory.h \
-    zip.h
+    wasapiaudio.h
+
+INCLUDEPATH += \
+    thirdparty/neocd_libretro/deps/libretro-common/include \
+    F:/vcpkg/vcpkg/installed/x64-windows/include
+
+win32:LIBS += -LF:/vcpkg/vcpkg/installed/x64-windows/lib -lsamplerate -lole32 -luuid -lxinput
 
 FORMS += \
     mainwindow.ui

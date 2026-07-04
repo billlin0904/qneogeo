@@ -34,6 +34,14 @@ Thumbs.db
 *.rc
 /.qmake.cache
 /.qmake.stash
+/build*/
+/build-vs*/
+
+# Local emulator data
+/config/
+/roms/
+/saves/
+/system/
 
 # qtcreator generated files
 *.pro.user*

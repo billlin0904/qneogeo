@@ -1,0 +1,3 @@
+[submodule "thirdparty/neocd_libretro"]
+	path = thirdparty/neocd_libretro
+	url = https://github.com/libretro/neocd_libretro.git
