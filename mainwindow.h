@@ -2,10 +2,10 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
+#include <QVector>
 
 class QAction;
 class QActionGroup;
-class QDialog;
 class EmulatorView;
 class QEvent;
 class QLabel;
@@ -34,7 +34,7 @@ private:
     QStringList scanGameImages() const;
     QString gameDisplayName(const QString &path) const;
     QString gameRootDirectory() const;
-    QString stateFilePath() const;
+    QString stateFilePath(int slot = 1) const;
     QString projectRoot() const;
     QString corePath() const;
     QString systemDirectory() const;
@@ -58,9 +58,8 @@ private:
     void showLoadGameDialog();
     void showInputConfiguration();
     void showMemorySearchDialog();
-    void saveState();
-    void loadState();
-    void showSuper2xSaiSettingsDialog();
+    void saveState(int slot = 1);
+    void loadState(int slot = 1);
     void updateFpsOverlay(double fps);
     void updateKof98Overlay();
 
@@ -69,8 +68,8 @@ private:
     LibretroCore *core_;
     QAction *pause_action_;
     QAction *reset_emulation_action_;
-    QAction *save_state_action_;
-    QAction *load_state_action_;
+    QVector<QAction *> save_state_actions_;
+    QVector<QAction *> load_state_actions_;
     QAction *pause_when_inactive_action_;
     QAction *show_fps_action_;
     QAction *show_hitboxes_action_;
@@ -82,7 +81,6 @@ private:
     QLabel *fps_label_;
     QLabel *health_label_;
     MemorySearchDialog *memory_search_dialog_ = nullptr;
-    QDialog *super2xsai_dialog_ = nullptr;
     QString current_game_path_;
     CoreKind core_kind_ = CoreKind::NeoCd;
     bool auto_paused_for_focus_loss_ = false;

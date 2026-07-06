@@ -277,14 +277,20 @@ Build 後 `shaders/` 會自動複製到 exe 旁邊。
 使用：
 
 ```text
-File > Save State
-File > Load State
+File > Save State > Slot 1 ... Slot 10
+File > Load State > Slot 1 ... Slot 10
 ```
 
 Save state 會放在：
 
 ```text
 saves/states/
+```
+
+每個遊戲最多可保存 10 個 slot，檔名格式為：
+
+```text
+<game>.slot1.state ... <game>.slot10.state
 ```
 
 重新模擬目前載入的遊戲：

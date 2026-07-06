@@ -12,7 +12,6 @@
 #include <QActionGroup>
 #include <QApplication>
 #include <QCheckBox>
-#include <QPushButton>
 #include <QCoreApplication>
 #include <QDir>
 #include <QDialog>
@@ -27,7 +26,6 @@
 #include <QMessageBox>
 #include <QRegularExpression>
 #include <QSettings>
-#include <QSlider>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -36,6 +34,10 @@
 #include <functional>
 #include <utility>
 
+namespace {
+constexpr int STATE_SLOT_COUNT = 10;
+}
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui_(new Ui::MainWindow)
@@ -43,8 +45,6 @@ MainWindow::MainWindow(QWidget *parent)
     , core_(nullptr)
     , pause_action_(nullptr)
     , reset_emulation_action_(nullptr)
-    , save_state_action_(nullptr)
-    , load_state_action_(nullptr)
     , pause_when_inactive_action_(nullptr)
     , show_fps_action_(nullptr)
     , show_hitboxes_action_(nullptr)
@@ -166,10 +166,21 @@ MainWindow::MainWindow(QWidget *parent)
     pause_action_->setEnabled(false);
     reset_emulation_action_ = file_menu->addAction(QStringLiteral("Reset Emulation"));
     reset_emulation_action_->setEnabled(false);
-    save_state_action_ = file_menu->addAction(QStringLiteral("Save State"));
-    save_state_action_->setEnabled(false);
-    load_state_action_ = file_menu->addAction(QStringLiteral("Load State"));
-    load_state_action_->setEnabled(false);
+    auto *save_state_menu = file_menu->addMenu(QStringLiteral("Save State"));
+    auto *load_state_menu = file_menu->addMenu(QStringLiteral("Load State"));
+    save_state_actions_.reserve(STATE_SLOT_COUNT);
+    load_state_actions_.reserve(STATE_SLOT_COUNT);
+    for (int slot = 1; slot <= STATE_SLOT_COUNT; ++slot) {
+        auto *save_action = save_state_menu->addAction(QStringLiteral("Slot %1").arg(slot));
+        save_action->setEnabled(false);
+        save_action->setData(slot);
+        save_state_actions_.push_back(save_action);
+
+        auto *load_action = load_state_menu->addAction(QStringLiteral("Slot %1").arg(slot));
+        load_action->setEnabled(false);
+        load_action->setData(slot);
+        load_state_actions_.push_back(load_action);
+    }
     file_menu->addSeparator();
     pause_when_inactive_action_ = file_menu->addAction(QStringLiteral("Pause When Focus Lost"));
     pause_when_inactive_action_->setCheckable(true);
@@ -277,8 +288,16 @@ MainWindow::MainWindow(QWidget *parent)
                                   QStringLiteral("重新模擬失敗：\n%1").arg(core_->lastError()));
         }
     });
-    connect(save_state_action_, &QAction::triggered, this, &MainWindow::saveState);
-    connect(load_state_action_, &QAction::triggered, this, &MainWindow::loadState);
+    for (QAction *action : save_state_actions_) {
+        connect(action, &QAction::triggered, this, [this, action] {
+            saveState(action->data().toInt());
+        });
+    }
+    for (QAction *action : load_state_actions_) {
+        connect(action, &QAction::triggered, this, [this, action] {
+            loadState(action->data().toInt());
+        });
+    }
     connect(memory_search_action, &QAction::triggered, this, &MainWindow::showMemorySearchDialog);
 
     connect(show_fps_action_, &QAction::toggled, fps_label_, &QLabel::setVisible);
@@ -296,8 +315,6 @@ MainWindow::MainWindow(QWidget *parent)
         settings.setValue(QStringLiteral("Video/ScalingFilter"), action->data().toInt());
         settings.sync();
 
-        if (filter == EmulatorView::ScalingFilter::Super2xSai)
-            showSuper2xSaiSettingsDialog();
     });
 
     QTimer::singleShot(0, this, &MainWindow::autoLoadStartupState);
@@ -378,7 +395,7 @@ QString MainWindow::gameRootDirectory() const {
     return QDir(projectRoot()).absoluteFilePath(QStringLiteral("roms/%1").arg(core_->romDirectoryName()));
 }
 
-QString MainWindow::stateFilePath() const {
+QString MainWindow::stateFilePath(int slot) const {
     QString name = gameDisplayName(current_game_path_);
     if (name.isEmpty())
         name = QFileInfo(current_game_path_).completeBaseName();
@@ -387,7 +404,7 @@ QString MainWindow::stateFilePath() const {
     name.replace(invalid_characters, QStringLiteral("_"));
 
     const QString states_dir = QDir(saveDirectory()).absoluteFilePath(QStringLiteral("states"));
-    return QDir(states_dir).absoluteFilePath(QStringLiteral("%1.slot1.state").arg(name));
+    return QDir(states_dir).absoluteFilePath(QStringLiteral("%1.slot%2.state").arg(name).arg(qBound(1, slot, STATE_SLOT_COUNT)));
 }
 
 QString MainWindow::projectRoot() const {
@@ -445,8 +462,10 @@ void MainWindow::setCoreKind(CoreKind kind) {
     auto_paused_for_focus_loss_ = false;
     pause_action_->setEnabled(false);
     reset_emulation_action_->setEnabled(false);
-    save_state_action_->setEnabled(false);
-    load_state_action_->setEnabled(false);
+    for (QAction *action : save_state_actions_)
+        action->setEnabled(false);
+    for (QAction *action : load_state_actions_)
+        action->setEnabled(false);
     pause_action_->setChecked(false);
     updateCoreActions();
     updateSystemOptionActions();
@@ -653,8 +672,10 @@ void MainWindow::loadGame(const QString &path) {
         current_game_path_.clear();
         pause_action_->setEnabled(false);
         reset_emulation_action_->setEnabled(false);
-        save_state_action_->setEnabled(false);
-        load_state_action_->setEnabled(false);
+        for (QAction *action : save_state_actions_)
+            action->setEnabled(false);
+        for (QAction *action : load_state_actions_)
+            action->setEnabled(false);
         pause_action_->setChecked(false);
         auto_paused_for_focus_loss_ = false;
         return;
@@ -663,8 +684,10 @@ void MainWindow::loadGame(const QString &path) {
     current_game_path_ = path;
     pause_action_->setEnabled(true);
     reset_emulation_action_->setEnabled(true);
-    save_state_action_->setEnabled(true);
-    load_state_action_->setEnabled(true);
+    for (QAction *action : save_state_actions_)
+        action->setEnabled(true);
+    for (QAction *action : load_state_actions_)
+        action->setEnabled(true);
     pause_action_->setChecked(false);
     auto_paused_for_focus_loss_ = false;
 }
@@ -773,13 +796,14 @@ void MainWindow::showMemorySearchDialog() {
     memory_search_dialog_->activateWindow();
 }
 
-void MainWindow::saveState() {
+void MainWindow::saveState(int slot) {
     if (current_game_path_.isEmpty() || !core_->isGameLoaded()) {
         QMessageBox::information(this, QStringLiteral("Save State"), QStringLiteral("目前沒有載入遊戲。"));
         return;
     }
 
-    const QString path = stateFilePath();
+    slot = qBound(1, slot, STATE_SLOT_COUNT);
+    const QString path = stateFilePath(slot);
     if (!core_->saveState(path)) {
         QMessageBox::critical(this,
                               QStringLiteral("Save State"),
@@ -789,20 +813,21 @@ void MainWindow::saveState() {
 
     QMessageBox::information(this,
                              QStringLiteral("Save State"),
-                             QStringLiteral("已儲存：\n%1").arg(QDir::toNativeSeparators(path)));
+                             QStringLiteral("Slot %1 已儲存：\n%2").arg(slot).arg(QDir::toNativeSeparators(path)));
 }
 
-void MainWindow::loadState() {
+void MainWindow::loadState(int slot) {
     if (current_game_path_.isEmpty() || !core_->isGameLoaded()) {
         QMessageBox::information(this, QStringLiteral("Load State"), QStringLiteral("目前沒有載入遊戲。"));
         return;
     }
 
-    const QString path = stateFilePath();
+    slot = qBound(1, slot, STATE_SLOT_COUNT);
+    const QString path = stateFilePath(slot);
     if (!QFileInfo::exists(path)) {
         QMessageBox::information(this,
                                  QStringLiteral("Load State"),
-                                 QStringLiteral("找不到狀態檔：\n%1").arg(QDir::toNativeSeparators(path)));
+                                 QStringLiteral("找不到 Slot %1 狀態檔：\n%2").arg(slot).arg(QDir::toNativeSeparators(path)));
         return;
     }
 
@@ -811,105 +836,6 @@ void MainWindow::loadState() {
                               QStringLiteral("Load State"),
                               QStringLiteral("讀取狀態失敗：\n%1").arg(core_->lastError()));
     }
-}
-
-void MainWindow::showSuper2xSaiSettingsDialog() {
-    if (super2xsai_dialog_) {
-        super2xsai_dialog_->show();
-        super2xsai_dialog_->raise();
-        super2xsai_dialog_->activateWindow();
-        return;
-    }
-
-    super2xsai_dialog_ = new QDialog(this);
-    super2xsai_dialog_->setWindowTitle(QStringLiteral("Super2xSaI Settings"));
-    super2xsai_dialog_->setAttribute(Qt::WA_DeleteOnClose);
-    super2xsai_dialog_->setModal(false);
-    super2xsai_dialog_->resize(360, 170);
-
-    connect(super2xsai_dialog_, &QObject::destroyed, this, [this] {
-        super2xsai_dialog_ = nullptr;
-    });
-
-    auto *layout = new QVBoxLayout(super2xsai_dialog_);
-    layout->setContentsMargins(12, 12, 12, 12);
-    layout->setSpacing(10);
-
-    auto updateParameters = [this](float sharpAmount, float edgeBlend, float nearestHold) {
-        emulator_view_->setSuper2xSaiParameters(sharpAmount, edgeBlend, nearestHold);
-    };
-
-    auto addSlider = [this, layout, updateParameters](const QString &name,
-                                                      float initialValue,
-                                                      const std::function<void(float)> &setValue) {
-        auto *row = new QHBoxLayout;
-        auto *name_label = new QLabel(name, super2xsai_dialog_);
-        auto *slider = new QSlider(Qt::Horizontal, super2xsai_dialog_);
-        auto *value_label = new QLabel(super2xsai_dialog_);
-
-        name_label->setMinimumWidth(90);
-        value_label->setMinimumWidth(42);
-        value_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-
-        slider->setRange(0, 100);
-        slider->setSingleStep(1);
-        slider->setPageStep(5);
-        slider->setValue(qRound(initialValue * 100.0f));
-        value_label->setText(QString::number(initialValue, 'f', 2));
-
-        connect(slider, &QSlider::valueChanged, this, [value_label, setValue](int value) {
-            const float normalized = static_cast<float>(value) / 100.0f;
-            value_label->setText(QString::number(normalized, 'f', 2));
-            setValue(normalized);
-        });
-
-        row->addWidget(name_label);
-        row->addWidget(slider, 1);
-        row->addWidget(value_label);
-        layout->addLayout(row);
-
-        return slider;
-    };
-
-    auto *sharp_amount_slider = addSlider(QStringLiteral("Sharp Amount"),
-                                          emulator_view_->super2xSaiSharpAmount(),
-                                          [this, updateParameters](float value) {
-                                              updateParameters(value,
-                                                               emulator_view_->super2xSaiEdgeBlend(),
-                                                               emulator_view_->super2xSaiNearestHold());
-                                          });
-
-    auto *edge_blend_slider = addSlider(QStringLiteral("Edge Blend"),
-                                        emulator_view_->super2xSaiEdgeBlend(),
-                                        [this, updateParameters](float value) {
-                                            updateParameters(emulator_view_->super2xSaiSharpAmount(),
-                                                             value,
-                                                             emulator_view_->super2xSaiNearestHold());
-                                        });
-
-    auto *nearest_hold_slider = addSlider(QStringLiteral("Nearest Hold"),
-                                          emulator_view_->super2xSaiNearestHold(),
-                                          [this, updateParameters](float value) {
-                                              updateParameters(emulator_view_->super2xSaiSharpAmount(),
-                                                               emulator_view_->super2xSaiEdgeBlend(),
-                                                               value);
-                                          });
-
-    auto *button_row = new QHBoxLayout;
-    button_row->addStretch(1);
-    auto *reset_button = new QPushButton(QStringLiteral("Reset"), super2xsai_dialog_);
-    button_row->addWidget(reset_button);
-    layout->addLayout(button_row);
-
-    connect(reset_button, &QPushButton::clicked, this, [sharp_amount_slider, edge_blend_slider, nearest_hold_slider] {
-        sharp_amount_slider->setValue(25);
-        edge_blend_slider->setValue(45);
-        nearest_hold_slider->setValue(10);
-    });
-
-    super2xsai_dialog_->show();
-    super2xsai_dialog_->raise();
-    super2xsai_dialog_->activateWindow();
 }
 
 void MainWindow::updateFpsOverlay(double fps) {
@@ -940,9 +866,9 @@ void MainWindow::updateKof98Overlay() {
         return;
     }
 
-    KofHitboxOverlayBuilder builder(std::move(ram), emulator_view_->sourceSize());
+    KofGameMemReader mem_reader(std::move(ram), emulator_view_->sourceSize());
     if (emulator_view_->hitboxOverlayEnabled()) {
-        KofHitboxOverlayBuilder::Result overlay = builder.build();
+        HitboxOverlay overlay = mem_reader.getHitboxOverlay();
         emulator_view_->setHitboxOverlay(std::move(overlay.boxes), std::move(overlay.axes));
     } else {
         emulator_view_->setHitboxOverlay({}, {});
@@ -955,13 +881,13 @@ void MainWindow::updateKof98Overlay() {
         if (health < 0)
             return QStringLiteral("--");
 
-        const int clamped = qBound(0, health, KofHitboxOverlayBuilder::MaxHealth);
-        return QStringLiteral("%1/%2").arg(clamped).arg(KofHitboxOverlayBuilder::MaxHealth);
+        const int clamped = qBound(0, health, KofGameMemReader::MaxHealth);
+        return QStringLiteral("%1/%2").arg(clamped).arg(KofGameMemReader::MaxHealth);
     };
 
     health_label_->setText(QStringLiteral("P1 HP: %1  P2 HP: %2")
-                               .arg(healthText(builder.readP1Health()),
-                                    healthText(builder.readP2Health())));
+                               .arg(healthText(mem_reader.readP1Health()),
+                                    healthText(mem_reader.readP2Health())));
     health_label_->adjustSize();
     if (fps_label_)
         health_label_->move(fps_label_->x() + fps_label_->width() + 8, fps_label_->y());

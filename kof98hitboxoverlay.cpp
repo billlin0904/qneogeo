@@ -160,6 +160,10 @@ public:
         return readRawU8(address ^ 1, value);
     }
 
+    bool readRawByte(uint32_t address, uint8_t &value) const {
+        return readRawU8(address, value);
+    }
+
     bool readS8(uint32_t address, int &value) const {
         uint8_t byte = 0;
         if (!readU8(address, byte))
@@ -304,6 +308,14 @@ int readByteOrNegative(const Kof98RamView &ram, uint32_t address) {
     return static_cast<int>(value);
 }
 
+int readRawByteOrNegative(const Kof98RamView &ram, uint32_t address) {
+    uint8_t value = 0;
+    if (!ram.readRawByte(address, value))
+        return -1;
+
+    return static_cast<int>(value);
+}
+
 int readHealthByte(const Kof98RamView &ram, uint32_t primary_address, uint32_t alternate_address, uint32_t fallback_address) {
     const std::array<uint32_t, 3> candidates {{
         primary_address,
@@ -312,7 +324,7 @@ int readHealthByte(const Kof98RamView &ram, uint32_t primary_address, uint32_t a
     }};
 
     for (uint32_t address : candidates) {
-        const int value = readByteOrNegative(ram, address);
+        const int value = readRawByteOrNegative(ram, address);
         if (value >= 0 && value <= KOF98_HEALTH_CANDIDATE_MAX)
             return value;
     }
@@ -338,13 +350,13 @@ bool readPlayerPosition(const Kof98RamView &ram, uint32_t base, QSize source_siz
 }
 } // namespace
 
-KofHitboxOverlayBuilder::KofHitboxOverlayBuilder(QByteArray ram, QSize sourceSize)
+KofGameMemReader::KofGameMemReader(QByteArray ram, QSize sourceSize)
     : ram_(std::move(ram))
     , source_size_(sourceSize) {
 }
 
-KofHitboxOverlayBuilder::Result KofHitboxOverlayBuilder::build() const {
-    Result result;
+HitboxOverlay KofGameMemReader::getHitboxOverlay() const {
+    HitboxOverlay result;
     const Kof98RamView ram(ram_);
 
     uint8_t game_phase = 0;
@@ -397,10 +409,12 @@ KofHitboxOverlayBuilder::Result KofHitboxOverlayBuilder::build() const {
         }
     };
 
-    QVector<Kof98Object> objects {
+    std::vector<Kof98Object> objects {
         { KOF98_P1_PLAYER_BASE, false },
         { KOF98_P2_PLAYER_BASE, false },
     };
+
+    objects.reserve(KOF98_PROJECTILE_LIST_SIZE / KOF98_PROJECTILE_LIST_ENTRY_SIZE);
 
     for (uint32_t list_offset = 0; list_offset < KOF98_PROJECTILE_LIST_SIZE;
          list_offset += KOF98_PROJECTILE_LIST_ENTRY_SIZE) {
@@ -429,12 +443,12 @@ KofHitboxOverlayBuilder::Result KofHitboxOverlayBuilder::build() const {
     return result;
 }
 
-int KofHitboxOverlayBuilder::readRoundTime() const {
+int KofGameMemReader::readRoundTime() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_ROUND_TIME_ADDRESS);
 }
 
-int KofHitboxOverlayBuilder::readP1Health() const {
+int KofGameMemReader::readP1Health() const {
     const Kof98RamView ram(ram_);
     return readHealthByte(ram,
                           KOF98_P1_PLAYER_BASE + KOF98_PLAYER_HEALTH_OFFSET,
@@ -442,7 +456,7 @@ int KofHitboxOverlayBuilder::readP1Health() const {
                           KOF98_P1_HEALTH_FALLBACK_ADDRESS);
 }
 
-int KofHitboxOverlayBuilder::readP2Health() const {
+int KofGameMemReader::readP2Health() const {
     const Kof98RamView ram(ram_);
     return readHealthByte(ram,
                           KOF98_P2_PLAYER_BASE + KOF98_PLAYER_HEALTH_OFFSET,
@@ -450,46 +464,42 @@ int KofHitboxOverlayBuilder::readP2Health() const {
                           KOF98_P2_HEALTH_FALLBACK_ADDRESS);
 }
 
-int KofHitboxOverlayBuilder::readP1Power() const {
+int KofGameMemReader::readP1Power() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P1_PLAYER_BASE + KOF98_PLAYER_POWER_VALUE_OFFSET);
 }
 
-int KofHitboxOverlayBuilder::readP2Power() const {
+int KofGameMemReader::readP2Power() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P2_PLAYER_BASE + KOF98_PLAYER_POWER_VALUE_OFFSET);
 }
 
-int KofHitboxOverlayBuilder::readP1PowerState() const {
+int KofGameMemReader::readP1PowerState() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P1_PLAYER_BASE + KOF98_PLAYER_POWER_STATE_OFFSET);
 }
 
-int KofHitboxOverlayBuilder::readP2PowerState() const {
+int KofGameMemReader::readP2PowerState() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P2_PLAYER_BASE + KOF98_PLAYER_POWER_STATE_OFFSET);
 }
 
-int KofHitboxOverlayBuilder::readP1Stun() const {
+int KofGameMemReader::readP1Stun() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P1_PLAYER_BASE + KOF98_PLAYER_STUN_OFFSET);
 }
 
-int KofHitboxOverlayBuilder::readP2Stun() const {
+int KofGameMemReader::readP2Stun() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P2_PLAYER_BASE + KOF98_PLAYER_STUN_OFFSET);
 }
 
-bool KofHitboxOverlayBuilder::readP1Position(QPoint &position) const {
+bool KofGameMemReader::readP1Position(QPoint &position) const {
     const Kof98RamView ram(ram_);
     return readPlayerPosition(ram, KOF98_P1_PLAYER_BASE, source_size_, position);
 }
 
-bool KofHitboxOverlayBuilder::readP2Position(QPoint &position) const {
+bool KofGameMemReader::readP2Position(QPoint &position) const {
     const Kof98RamView ram(ram_);
     return readPlayerPosition(ram, KOF98_P2_PLAYER_BASE, source_size_, position);
-}
-
-KofHitboxOverlayBuilder::Result KofHitboxOverlayBuilder::build(QByteArray ram, QSize sourceSize) {
-    return KofHitboxOverlayBuilder(std::move(ram), sourceSize).build();
 }

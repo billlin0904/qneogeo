@@ -7,20 +7,20 @@
 #include <QSize>
 #include <QVector>
 
-class KofHitboxOverlayBuilder final {
+struct HitboxOverlay {
+    QVector<EmulatorView::HitboxRect> boxes;
+    QVector<EmulatorView::HitboxAxis> axes;
+};
+
+class KofGameMemReader final {
 public:
     static constexpr int MaxHealth = 103;
     static constexpr int MaxPower = 128;
-    static constexpr int MaxTime = 99;
+    static constexpr int MaxTime = 99;    
 
-    struct Result {
-        QVector<EmulatorView::HitboxRect> boxes;
-        QVector<EmulatorView::HitboxAxis> axes;
-    };
+    explicit KofGameMemReader(QByteArray ram, QSize sourceSize);
 
-    explicit KofHitboxOverlayBuilder(QByteArray ram, QSize sourceSize);
-
-    Result build() const;
+    HitboxOverlay getHitboxOverlay() const;
     int readRoundTime() const;
     int readP1Health() const;
     int readP2Health() const;
@@ -32,8 +32,6 @@ public:
     int readP2Stun() const;
     bool readP1Position(QPoint &position) const;
     bool readP2Position(QPoint &position) const;
-
-    static Result build(QByteArray ram, QSize sourceSize);
 
 private:
     QByteArray ram_;
