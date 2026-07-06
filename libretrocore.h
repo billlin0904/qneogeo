@@ -1,6 +1,7 @@
 #pragma once
 
 #include "emulatorview.h"
+#include "iemulatorcore.h"
 #include "wasapiaudio.h"
 
 #include <QByteArray>
@@ -16,8 +17,7 @@
 #include "libretro.h"
 #include "samplerate.h"
 
-class LibretroCore final : public QObject
-{
+class LibretroCore : public IEmulatorCore {
     Q_OBJECT
 
 public:
@@ -46,14 +46,17 @@ public:
     explicit LibretroCore(EmulatorView *videoOutput, QObject *parent = nullptr);
     ~LibretroCore() override;
 
-    bool loadCore(const QString &corePath);
-    bool startGame(const QString &contentPath, const QString &systemDirectory, const QString &saveDirectory);
-    void stop();
-    void setPaused(bool paused);
-    bool isPaused() const;
-    bool isGameLoaded() const;
-    bool saveState(const QString &statePath);
-    bool loadState(const QString &statePath);
+    bool loadCore(const QString &corePath) override;
+    bool startGame(const QString &contentPath, const QString &systemDirectory, const QString &saveDirectory) override;
+    void stop() override;
+    bool reset() override;
+    void setPaused(bool paused) override;
+    bool isPaused() const override;
+    bool isGameLoaded() const override;
+    bool saveState(const QString &statePath) override;
+    bool loadState(const QString &statePath) override;
+    bool readSystemRam(QByteArray &ram) const;
+    bool readSystemRamByte(uint32_t address, uint8_t &value) const;
 
     int keyBinding(unsigned retroButtonId) const;
     void setKeyBinding(unsigned retroButtonId, int key);
@@ -69,18 +72,36 @@ public:
     void setArcadeSocdClean(bool enabled);
     bool keyboardMotionAssist() const;
     void setKeyboardMotionAssist(bool enabled);
+    QString systemRegionOption() const;
+    void setSystemRegionOption(const QString &region);
+    QString systemModeOption() const;
+    void setSystemModeOption(const QString &mode);
+    QString fbneoCpuClockOption() const;
+    void setFbneoCpuClockOption(const QString &cpuClock);
     static QString xinputControlName(int control);
     static int firstPressedXInputControl(unsigned userIndex = 0);
-    QString lastError() const;
+    QString lastError() const override;
+    QString displayName() const override;
+    QString coreFileName() const override;
+    QString romDirectoryName() const override;
+    QStringList supportedExtensions() const override;
 
 signals:
-    void pausedChanged(bool paused);
+    void frameAdvanced();
 
 private slots:
     void runFrame();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
+
+    virtual bool coreOptionValue(const QByteArray &key, const char *&value) const;
+    virtual void coreOptionsUpdated(const retro_core_options_v2 *options);
+
+    std::string selected_bios_;
+    std::string system_region_option_ = "Japan";
+    std::string system_mode_option_ = "MVS";
+    std::string fbneo_cpu_clock_option_ = "100%";
 
 private:
     using retro_set_environment_t = void (*)(retro_environment_t);
@@ -91,6 +112,7 @@ private:
     using retro_set_input_state_t = void (*)(retro_input_state_t);
     using retro_init_t = void (*)();
     using retro_deinit_t = void (*)();
+    using retro_reset_t = void (*)();
     using retro_load_game_t = bool (*)(const retro_game_info *);
     using retro_unload_game_t = void (*)();
     using retro_run_t = void (*)();
@@ -99,6 +121,8 @@ private:
     using retro_serialize_size_t = size_t (*)();
     using retro_serialize_t = bool (*)(void *, size_t);
     using retro_unserialize_t = bool (*)(const void *, size_t);
+    using retro_get_memory_data_t = void *(*)(unsigned);
+    using retro_get_memory_size_t = size_t (*)(unsigned);
 
     static bool environmentCallback(unsigned command, void *data);
     static void videoCallback(const void *data, unsigned width, unsigned height, size_t pitch);
@@ -123,10 +147,14 @@ private:
     bool initializeResampler(int sourceSampleRate);
     void releaseResampler();
     void applyKeyboardInputState();
+    void applyXInputInputState();
     void finishKeyboardMotionAssist();
+    void finishXInputMotionAssist();
     uint8_t rawKeyboardDirectionBits() const;
-    uint8_t cleanedKeyboardDirectionBits(uint8_t directionBits) const;
+    uint8_t rawXInputDirectionBits() const;
+    uint8_t cleanedDirectionBits(uint8_t directionBits) const;
     void setKeyboardDirectionBits(uint8_t directionBits);
+    void setXInputDirectionBits(uint8_t directionBits);
 
     static LibretroCore *active_core_;
     static constexpr int output_sample_rate_ = 48000;
@@ -144,8 +172,6 @@ private:
     QByteArray system_directory_utf8_;
     QByteArray save_directory_utf8_;
     QByteArray content_path_utf8_;
-    std::string selected_bios_;
-
     bool initialized_ = false;
     bool game_loaded_ = false;
     bool paused_ = false;
@@ -153,9 +179,13 @@ private:
     bool keyboard_motion_assist_ = true;
     uint8_t current_keyboard_direction_bits_ = 0;
     uint8_t pending_keyboard_direction_bits_ = 0;
+    uint8_t current_xinput_direction_bits_ = 0;
+    uint8_t pending_xinput_direction_bits_ = 0;
     int motion_assist_polls_remaining_ = 0;
+    int xinput_motion_assist_polls_remaining_ = 0;
     std::array<bool, 16> raw_keyboard_joypad_state_ {};
     std::array<bool, 16> keyboard_joypad_state_ {};
+    std::array<bool, 16> raw_xinput_joypad_state_ {};
     std::array<bool, 16> xinput_joypad_state_ {};
     std::array<int, 16> key_bindings_ {};
     std::array<int, 16> xinput_bindings_ {};
@@ -169,6 +199,7 @@ private:
     retro_set_input_state_t retro_set_input_state_ = nullptr;
     retro_init_t retro_init_ = nullptr;
     retro_deinit_t retro_deinit_ = nullptr;
+    retro_reset_t retro_reset_ = nullptr;
     retro_load_game_t retro_load_game_ = nullptr;
     retro_unload_game_t retro_unload_game_ = nullptr;
     retro_run_t retro_run_ = nullptr;
@@ -177,4 +208,6 @@ private:
     retro_serialize_size_t retro_serialize_size_ = nullptr;
     retro_serialize_t retro_serialize_ = nullptr;
     retro_unserialize_t retro_unserialize_ = nullptr;
+    retro_get_memory_data_t retro_get_memory_data_ = nullptr;
+    retro_get_memory_size_t retro_get_memory_size_ = nullptr;
 };

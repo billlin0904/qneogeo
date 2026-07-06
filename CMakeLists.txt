@@ -10,6 +10,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 option(QNEOGEO_BUILD_QT_APP "Build the Qt shell application" ON)
 option(QNEOGEO_BUILD_NEOCD_CORE "Build neocd_libretro as a Visual Studio target" ON)
 option(QNEOGEO_BUILD_TOOLS "Build local diagnostic tools" ON)
+option(QNEOGEO_FETCH_FBNEO_CORE "Download the Windows x64 fbneo_libretro core from the libretro buildbot" ON)
 
 if(QNEOGEO_BUILD_NEOCD_CORE)
     set(NEOCD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/neocd_libretro")
@@ -188,22 +189,62 @@ if(QNEOGEO_BUILD_QT_APP)
         shaders/README.md
         shaders/frame.frag
         shaders/frame.vert
+        shaders/scanline-fract.glsl
         shaders/xbrz-freescale.glsl
+        shaders/zfast_crt.glsl
+        shaders/zfast_lcd.glsl
     )
     set_source_files_properties(${QNEOGEO_SHADER_FILES} PROPERTIES HEADER_FILE_ONLY TRUE)
     source_group("Shaders" FILES ${QNEOGEO_SHADER_FILES})
 
+    if(QNEOGEO_FETCH_FBNEO_CORE)
+        set(FBNEO_CORE_URL "https://buildbot.libretro.com/nightly/windows/x86_64/latest/fbneo_libretro.dll.zip")
+        set(FBNEO_CORE_ZIP "${CMAKE_CURRENT_SOURCE_DIR}/downloads/fbneo_libretro.dll.zip")
+        set(FBNEO_CORE_EXTRACT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/downloads/fbneo_libretro")
+        set(FBNEO_CORE_DLL "${FBNEO_CORE_EXTRACT_DIR}/fbneo_libretro.dll")
+
+        if(NOT EXISTS "${FBNEO_CORE_DLL}")
+            file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/downloads")
+            message(STATUS "Downloading fbneo_libretro.dll from ${FBNEO_CORE_URL}")
+            file(DOWNLOAD
+                "${FBNEO_CORE_URL}"
+                "${FBNEO_CORE_ZIP}"
+                SHOW_PROGRESS
+                STATUS FBNEO_DOWNLOAD_STATUS
+            )
+            list(GET FBNEO_DOWNLOAD_STATUS 0 FBNEO_DOWNLOAD_RESULT)
+            list(GET FBNEO_DOWNLOAD_STATUS 1 FBNEO_DOWNLOAD_MESSAGE)
+            if(NOT FBNEO_DOWNLOAD_RESULT EQUAL 0)
+                message(FATAL_ERROR "Could not download fbneo_libretro.dll: ${FBNEO_DOWNLOAD_MESSAGE}")
+            endif()
+
+            file(REMOVE_RECURSE "${FBNEO_CORE_EXTRACT_DIR}")
+            file(MAKE_DIRECTORY "${FBNEO_CORE_EXTRACT_DIR}")
+            file(ARCHIVE_EXTRACT INPUT "${FBNEO_CORE_ZIP}" DESTINATION "${FBNEO_CORE_EXTRACT_DIR}")
+        endif()
+    endif()
+
     qt_add_executable(qneogeo
         emulatorview.cpp
         emulatorview.h
+        fbneolibretrocore.cpp
+        fbneolibretrocore.h
+        iemulatorcore.cpp
+        iemulatorcore.h
         inputmappingwidget.cpp
         inputmappingwidget.h
+        kof98hitboxoverlay.cpp
+        kof98hitboxoverlay.h
         libretrocore.cpp
         libretrocore.h
         main.cpp
         mainwindow.cpp
         mainwindow.h
         mainwindow.ui
+        memorysearchdialog.cpp
+        memorysearchdialog.h
+        neocdlibretrocore.cpp
+        neocdlibretrocore.h
         qneogeo.ico
         qneogeo.qrc
         qneogeo.rc
@@ -231,4 +272,12 @@ if(QNEOGEO_BUILD_QT_APP)
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
             "$<TARGET_FILE_DIR:qneogeo>/shaders"
     )
+
+    if(QNEOGEO_FETCH_FBNEO_CORE AND EXISTS "${FBNEO_CORE_DLL}")
+        add_custom_command(TARGET qneogeo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FBNEO_CORE_DLL}"
+                "$<TARGET_FILE_DIR:qneogeo>/fbneo_libretro.dll"
+        )
+    endif()
 endif()

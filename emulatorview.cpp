@@ -5,7 +5,10 @@
 #include <QFile>
 #include <QMatrix4x4>
 #include <QMetaObject>
+#include <QPainter>
+#include <QPen>
 #include <QVector2D>
+#include <QWidget>
 #include <algorithm>
 #include <cstring>
 
@@ -26,6 +29,86 @@ QString withShaderStageDefine(const QString &source, const char *stage) {
     return QStringLiteral("#define ") + QString::fromLatin1(stage) + QStringLiteral("\n") + source;
 }
 
+class HitboxOverlayWidget final : public QWidget {
+public:
+    explicit HitboxOverlayWidget(QWidget *parent = nullptr)
+        : QWidget(parent) {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_NoSystemBackground);
+        setAttribute(Qt::WA_TranslucentBackground);
+    }
+
+    void setOverlay(QVector<EmulatorView::HitboxRect> boxes,
+                    QVector<EmulatorView::HitboxAxis> axes,
+                    QSize sourceSize) {
+        boxes_ = std::move(boxes);
+        axes_ = std::move(axes);
+        source_size_ = sourceSize;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override {
+        if (source_size_.isEmpty())
+            return;
+
+        float output_width = static_cast<float>(width());
+        float output_height = static_cast<float>(height());
+        const float widget_aspect = output_width / output_height;
+        const float frame_aspect = static_cast<float>(source_size_.width()) / static_cast<float>(source_size_.height());
+        if (widget_aspect > frame_aspect) {
+            output_width = output_height * frame_aspect;
+        } else {
+            output_height = output_width / frame_aspect;
+        }
+
+        const float scale = output_width / static_cast<float>(source_size_.width());
+        const float offset_x = (static_cast<float>(width()) - output_width) * 0.5f;
+        const float offset_y = (static_cast<float>(height()) - output_height) * 0.5f;
+
+        auto mapPoint = [&](const QPointF &point) {
+            return QPointF(offset_x + point.x() * scale,
+                           offset_y + point.y() * scale);
+        };
+
+        auto mapRect = [&](const QRectF &rect) {
+            return QRectF(offset_x + rect.x() * scale,
+                          offset_y + rect.y() * scale,
+                          rect.width() * scale,
+                          rect.height() * scale);
+        };
+
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, false);
+
+        for (const EmulatorView::HitboxRect &box : boxes_) {
+            const QRectF target = mapRect(box.rect);
+            painter.fillRect(target, box.fill_color);
+            QPen pen(box.outline_color);
+            pen.setWidthF(2.0f);
+            painter.setPen(pen);
+            painter.drawRect(target.adjusted(1.0, 1.0, -1.0, -1.0));
+        }
+
+        for (const EmulatorView::HitboxAxis &axis : axes_) {
+            const QPointF center = mapPoint(axis.position);
+            QPen pen(axis.color);
+            pen.setWidthF(std::max(1.0f, scale));
+            painter.setPen(pen);
+            constexpr qreal axis_size = 12.0;
+            painter.drawLine(QPointF(center.x(), center.y() - axis_size * scale),
+                             QPointF(center.x(), center.y() + axis_size * scale));
+            painter.drawLine(QPointF(center.x() - axis_size * scale, center.y()),
+                             QPointF(center.x() + axis_size * scale, center.y()));
+        }
+    }
+
+private:
+    QVector<EmulatorView::HitboxRect> boxes_;
+    QVector<EmulatorView::HitboxAxis> axes_;
+    QSize source_size_;
+};
+
 } // namespace
 
 EmulatorView::EmulatorView(QWidget *parent)
@@ -33,6 +116,10 @@ EmulatorView::EmulatorView(QWidget *parent)
     , vertex_buffer_(QOpenGLBuffer::VertexBuffer) {
     setMinimumSize(320, 240);
     setFocusPolicy(Qt::StrongFocus);
+    hitbox_overlay_widget_ = new HitboxOverlayWidget(this);
+    hitbox_overlay_widget_->setGeometry(rect());
+    hitbox_overlay_widget_->raise();
+    hitbox_overlay_widget_->hide();
     fps_timer_.start();
 }
 
@@ -50,6 +137,9 @@ EmulatorView::~EmulatorView() {
     program_.removeAllShaders();
     libretro_xbrz_freescale_program_.removeAllShaders();
     libretro_6xbrz_program_.removeAllShaders();
+    zfast_crt_program_.removeAllShaders();
+    zfast_lcd_program_.removeAllShaders();
+    scanline_fract_program_.removeAllShaders();
     vertex_array_.destroy();
     vertex_buffer_.destroy();
     doneCurrent();
@@ -59,12 +149,42 @@ QSize EmulatorView::sizeHint() const {
     return QSize(960, 720);
 }
 
+QSize EmulatorView::sourceSize() const {
+    QMutexLocker lock(&frame_mutex_);
+    return QSize(current_frame_.width, current_frame_.height);
+}
+
 void EmulatorView::setSmoothScaling(bool enabled) {
     setScalingFilter(enabled ? ScalingFilter::Linear : ScalingFilter::Nearest);
 }
 
 bool EmulatorView::smoothScaling() const {
     return scaling_filter_ == ScalingFilter::Linear;
+}
+
+void EmulatorView::setHitboxOverlayEnabled(bool enabled) {
+    if (hitbox_overlay_enabled_ == enabled)
+        return;
+
+    hitbox_overlay_enabled_ = enabled;
+    if (hitbox_overlay_widget_) {
+        hitbox_overlay_widget_->setVisible(enabled);
+        if (enabled)
+            hitbox_overlay_widget_->raise();
+    }
+    update();
+}
+
+bool EmulatorView::hitboxOverlayEnabled() const {
+    return hitbox_overlay_enabled_;
+}
+
+void EmulatorView::setHitboxOverlay(QVector<HitboxRect> boxes, QVector<HitboxAxis> axes) {
+    hitbox_boxes_ = std::move(boxes);
+    hitbox_axes_ = std::move(axes);
+    updateHitboxOverlayWidget();
+    if (hitbox_overlay_enabled_)
+        update();
 }
 
 void EmulatorView::setScalingFilter(ScalingFilter filter) {
@@ -216,6 +336,9 @@ void EmulatorView::initializeGL() {
     initializeFrameShader();
     initializeLibretroShader(libretro_xbrz_freescale_program_, QStringLiteral("xbrz-freescale.glsl"));
     initializeLibretroShader(libretro_6xbrz_program_, QStringLiteral("6xbrz.glsl"));
+    initializeLibretroShader(zfast_crt_program_, QStringLiteral("zfast_crt.glsl"));
+    initializeLibretroShader(zfast_lcd_program_, QStringLiteral("zfast_lcd.glsl"));
+    initializeLibretroShader(scanline_fract_program_, QStringLiteral("scanline-fract.glsl"));
 
     glGenTextures(1, &texture_);
     glBindTexture(GL_TEXTURE_2D, texture_);
@@ -252,6 +375,8 @@ void EmulatorView::initializeGL() {
 
 void EmulatorView::resizeGL(int width, int height) {
     glViewport(0, 0, width, height);
+    if (hitbox_overlay_widget_)
+        hitbox_overlay_widget_->setGeometry(rect());
 }
 
 void EmulatorView::paintGL() {
@@ -267,6 +392,7 @@ void EmulatorView::paintGL() {
     if (frameToUpload.isValid()) {
         current_frame_ = std::move(frameToUpload);
         uploadFrame(current_frame_);
+        updateHitboxOverlayWidget();
     }
 
     glClear(GL_COLOR_BUFFER_BIT);
@@ -294,6 +420,12 @@ void EmulatorView::paintGL() {
         active_program = &libretro_xbrz_freescale_program_;
     } else if (scaling_filter_ == ScalingFilter::Libretro6xbrz && libretro_6xbrz_program_.isLinked()) {
         active_program = &libretro_6xbrz_program_;
+    } else if (scaling_filter_ == ScalingFilter::ZfastCrt && zfast_crt_program_.isLinked()) {
+        active_program = &zfast_crt_program_;
+    } else if (scaling_filter_ == ScalingFilter::ZfastLcd && zfast_lcd_program_.isLinked()) {
+        active_program = &zfast_lcd_program_;
+    } else if (scaling_filter_ == ScalingFilter::ScanlineFract && scanline_fract_program_.isLinked()) {
+        active_program = &scanline_fract_program_;
     }
 
     active_program->bind();
@@ -409,7 +541,24 @@ void EmulatorView::updateVertices() {
 
 bool EmulatorView::usesLibretroShader() const {
     return (scaling_filter_ == ScalingFilter::LibretroXbrzFreescale && libretro_xbrz_freescale_program_.isLinked()) ||
-           (scaling_filter_ == ScalingFilter::Libretro6xbrz && libretro_6xbrz_program_.isLinked());
+           (scaling_filter_ == ScalingFilter::Libretro6xbrz && libretro_6xbrz_program_.isLinked()) ||
+           (scaling_filter_ == ScalingFilter::ZfastCrt && zfast_crt_program_.isLinked()) ||
+           (scaling_filter_ == ScalingFilter::ZfastLcd && zfast_lcd_program_.isLinked()) ||
+           (scaling_filter_ == ScalingFilter::ScanlineFract && scanline_fract_program_.isLinked());
+}
+
+void EmulatorView::updateHitboxOverlayWidget() {
+    auto *overlay = static_cast<HitboxOverlayWidget *>(hitbox_overlay_widget_);
+    if (!overlay)
+        return;
+
+    const QSize source_size(current_frame_.width, current_frame_.height);
+    overlay->setGeometry(rect());
+    if (hitbox_overlay_enabled_) {
+        overlay->show();
+        overlay->raise();
+    }
+    overlay->setOverlay(hitbox_boxes_, hitbox_axes_, source_size);
 }
 
 void EmulatorView::updateFpsCounter() {

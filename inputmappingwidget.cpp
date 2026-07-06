@@ -29,7 +29,7 @@ InputMappingWidget::InputMappingWidget(LibretroCore *core, QWidget *parent)
     buildUi();
 
     xinput_timer_ = new QTimer(this);
-    xinput_timer_->setInterval(30);
+    xinput_timer_->setInterval(10);
 	xinput_timer_->setTimerType(Qt::PreciseTimer);
     connect(xinput_timer_, &QTimer::timeout, this, &InputMappingWidget::pollXInputCapture);
     xinput_timer_->start();

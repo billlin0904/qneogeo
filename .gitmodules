@@ -1,3 +1,6 @@
 [submodule "thirdparty/neocd_libretro"]
 	path = thirdparty/neocd_libretro
 	url = https://github.com/libretro/neocd_libretro.git
+[submodule "thirdparty/fbneo_libretro"]
+	path = thirdparty/fbneo_libretro
+	url = https://github.com/libretro/FBNeo.git

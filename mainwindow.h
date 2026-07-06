@@ -4,11 +4,13 @@
 #include <QMainWindow>
 
 class QAction;
+class QActionGroup;
 class QDialog;
 class EmulatorView;
 class QEvent;
 class QLabel;
 class LibretroCore;
+class MemorySearchDialog;
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
@@ -22,37 +24,67 @@ public:
     ~MainWindow();
 
 private:
+    enum class CoreKind {
+        NeoCd,
+        Fbneo
+    };
+
     bool event(QEvent *event) override;
 
     QStringList scanGameImages() const;
     QString gameDisplayName(const QString &path) const;
+    QString gameRootDirectory() const;
     QString stateFilePath() const;
     QString projectRoot() const;
     QString corePath() const;
     QString systemDirectory() const;
     QString saveDirectory() const;
     QString inputConfigPath() const;
+    LibretroCore *createCore(CoreKind kind);
+    void setCoreKind(CoreKind kind);
+    void connectCoreSignals();
+    void updateCoreActions();
+    void loadSystemOptionsIntoCore() const;
+    void setSystemRegion(const QString &region);
+    void setSystemMode(const QString &mode);
+    void setFbneoCpuClock(const QString &cpuClock);
+    void saveSystemOptions() const;
+    void updateSystemOptionActions();
+    void reloadCurrentGame();
+    CoreKind savedCoreKind() const;
+    void saveCoreKind(CoreKind kind) const;
+    void autoLoadStartupState();
     void loadGame(const QString &path);
     void showLoadGameDialog();
     void showInputConfiguration();
+    void showMemorySearchDialog();
     void saveState();
     void loadState();
     void showSuper2xSaiSettingsDialog();
     void updateFpsOverlay(double fps);
+    void updateKof98Overlay();
 
     Ui::MainWindow *ui_;
     EmulatorView *emulator_view_;
     LibretroCore *core_;
     QAction *pause_action_;
+    QAction *reset_emulation_action_;
     QAction *save_state_action_;
     QAction *load_state_action_;
     QAction *pause_when_inactive_action_;
     QAction *show_fps_action_;
-    QAction *arcade_socd_clean_action_ = nullptr;
-    QAction *keyboard_motion_assist_action_ = nullptr;
+    QAction *show_hitboxes_action_;
+    QAction *neocd_core_action_;
+    QAction *fbneo_core_action_;
+    QActionGroup *region_group_;
+    QActionGroup *mode_group_;
+    QActionGroup *cpu_clock_group_;
     QLabel *fps_label_;
+    QLabel *health_label_;
+    MemorySearchDialog *memory_search_dialog_ = nullptr;
     QDialog *super2xsai_dialog_ = nullptr;
     QString current_game_path_;
+    CoreKind core_kind_ = CoreKind::NeoCd;
     bool auto_paused_for_focus_loss_ = false;
 };
 #endif // MAINWINDOW_H

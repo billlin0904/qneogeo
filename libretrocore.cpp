@@ -67,7 +67,7 @@ QString bindingSettingName(unsigned retroButtonId) {
 }
 
 LibretroCore::LibretroCore(EmulatorView *videoOutput, QObject *parent)
-    : QObject(parent)
+    : IEmulatorCore(parent)
     , video_output_(videoOutput)
     , audio_(this) {
     key_bindings_.fill(0);
@@ -117,6 +117,11 @@ LibretroCore::~LibretroCore() {
 bool LibretroCore::loadCore(const QString &corePath) {
     stop();
 
+    if (library_.isLoaded()) {
+        resetSymbols();
+        library_.unload();
+    }
+
     library_.setFileName(corePath);
     if (!library_.load()) {
         setError(QStringLiteral("Could not load core: %1").arg(library_.errorString()));
@@ -140,7 +145,7 @@ bool LibretroCore::loadCore(const QString &corePath) {
 }
 
 bool LibretroCore::startGame(const QString &contentPath, const QString &systemDirectory, const QString &saveDirectory) {
-    if (!library_.isLoaded() && !loadCore(QStringLiteral("neocd_libretro.dll")))
+    if (!library_.isLoaded() && !loadCore(coreFileName()))
         return false;
 
     stop();
@@ -183,10 +188,14 @@ bool LibretroCore::startGame(const QString &contentPath, const QString &systemDi
     paused_ = false;
     raw_keyboard_joypad_state_.fill(false);
     keyboard_joypad_state_.fill(false);
+    raw_xinput_joypad_state_.fill(false);
     xinput_joypad_state_.fill(false);
     current_keyboard_direction_bits_ = 0;
     pending_keyboard_direction_bits_ = 0;
+    current_xinput_direction_bits_ = 0;
+    pending_xinput_direction_bits_ = 0;
     motion_assist_polls_remaining_ = 0;
+    xinput_motion_assist_polls_remaining_ = 0;
     frame_timer_.start(16);
     emit pausedChanged(false);
     return true;
@@ -208,14 +217,83 @@ void LibretroCore::stop() {
     if (video_output_)
         video_output_->clearFrame();
 
+    raw_keyboard_joypad_state_.fill(false);
+    keyboard_joypad_state_.fill(false);
+    raw_xinput_joypad_state_.fill(false);
+    xinput_joypad_state_.fill(false);
+    current_keyboard_direction_bits_ = 0;
+    pending_keyboard_direction_bits_ = 0;
+    current_xinput_direction_bits_ = 0;
+    pending_xinput_direction_bits_ = 0;
+    motion_assist_polls_remaining_ = 0;
+    xinput_motion_assist_polls_remaining_ = 0;
+
     if (paused_) {
         paused_ = false;
         emit pausedChanged(false);
     }
 }
 
+bool LibretroCore::reset() {
+    if (!game_loaded_ || !retro_reset_) {
+        setError(QStringLiteral("No running game is available to reset."));
+        return false;
+    }
+
+    const bool resume_after_reset = !paused_;
+    frame_timer_.stop();
+    audio_.stop();
+
+    raw_keyboard_joypad_state_.fill(false);
+    keyboard_joypad_state_.fill(false);
+    raw_xinput_joypad_state_.fill(false);
+    xinput_joypad_state_.fill(false);
+    current_keyboard_direction_bits_ = 0;
+    pending_keyboard_direction_bits_ = 0;
+    current_xinput_direction_bits_ = 0;
+    pending_xinput_direction_bits_ = 0;
+    motion_assist_polls_remaining_ = 0;
+    xinput_motion_assist_polls_remaining_ = 0;
+
+    if (video_output_)
+        video_output_->clearFrame();
+
+    retro_reset_();
+
+    if (resume_after_reset) {
+        if (!audio_.start(output_sample_rate_))
+            qWarning().noquote() << "WASAPI shared audio disabled:" << audio_.lastError();
+        frame_timer_.start(16);
+    }
+
+    return true;
+}
+
 QString LibretroCore::lastError() const {
     return last_error_;
+}
+
+QString LibretroCore::displayName() const {
+    return QStringLiteral("Libretro");
+}
+
+QString LibretroCore::coreFileName() const {
+    return QString();
+}
+
+QString LibretroCore::romDirectoryName() const {
+    return QString();
+}
+
+QStringList LibretroCore::supportedExtensions() const {
+    return {};
+}
+
+bool LibretroCore::coreOptionValue(const QByteArray &, const char *&) const {
+    return false;
+}
+
+void LibretroCore::coreOptionsUpdated(const retro_core_options_v2 *) {
 }
 
 void LibretroCore::setPaused(bool paused) {
@@ -225,10 +303,14 @@ void LibretroCore::setPaused(bool paused) {
     paused_ = paused;
     raw_keyboard_joypad_state_.fill(false);
     keyboard_joypad_state_.fill(false);
+    raw_xinput_joypad_state_.fill(false);
     xinput_joypad_state_.fill(false);
     current_keyboard_direction_bits_ = 0;
     pending_keyboard_direction_bits_ = 0;
+    current_xinput_direction_bits_ = 0;
+    pending_xinput_direction_bits_ = 0;
     motion_assist_polls_remaining_ = 0;
+    xinput_motion_assist_polls_remaining_ = 0;
 
     if (paused_) {
         frame_timer_.stop();
@@ -334,6 +416,34 @@ bool LibretroCore::loadState(const QString &statePath) {
     return true;
 }
 
+bool LibretroCore::readSystemRam(QByteArray &ram) const {
+    ram.clear();
+
+    if (!game_loaded_ || !retro_get_memory_data_ || !retro_get_memory_size_)
+        return false;
+
+    auto *memory = static_cast<const char *>(retro_get_memory_data_(RETRO_MEMORY_SYSTEM_RAM));
+    const size_t memory_size = retro_get_memory_size_(RETRO_MEMORY_SYSTEM_RAM);
+    if (!memory || memory_size == 0)
+        return false;
+
+    ram = QByteArray(memory, static_cast<qsizetype>(memory_size));
+    return true;
+}
+
+bool LibretroCore::readSystemRamByte(uint32_t address, uint8_t &value) const {
+    if (!game_loaded_ || !retro_get_memory_data_ || !retro_get_memory_size_)
+        return false;
+
+    auto *memory = static_cast<const uint8_t *>(retro_get_memory_data_(RETRO_MEMORY_SYSTEM_RAM));
+    const size_t memory_size = retro_get_memory_size_(RETRO_MEMORY_SYSTEM_RAM);
+    if (!memory || address >= memory_size)
+        return false;
+
+    value = memory[address];
+    return true;
+}
+
 int LibretroCore::keyBinding(unsigned retroButtonId) const {
     if (retroButtonId >= key_bindings_.size())
         return 0;
@@ -375,6 +485,7 @@ void LibretroCore::setXInputBinding(unsigned retroButtonId, int control) {
         return;
 
     xinput_bindings_[retroButtonId] = control;
+    raw_xinput_joypad_state_[retroButtonId] = false;
     xinput_joypad_state_[retroButtonId] = false;
 }
 
@@ -384,7 +495,11 @@ std::array<int, 16> LibretroCore::xinputBindings() const {
 
 void LibretroCore::setXInputBindings(const std::array<int, 16> &bindings) {
     xinput_bindings_ = bindings;
+    raw_xinput_joypad_state_.fill(false);
     xinput_joypad_state_.fill(false);
+    current_xinput_direction_bits_ = 0;
+    pending_xinput_direction_bits_ = 0;
+    xinput_motion_assist_polls_remaining_ = 0;
 }
 
 void LibretroCore::loadInputConfiguration(const QString &iniPath) {
@@ -409,10 +524,14 @@ void LibretroCore::loadInputConfiguration(const QString &iniPath) {
 
     raw_keyboard_joypad_state_.fill(false);
     keyboard_joypad_state_.fill(false);
+    raw_xinput_joypad_state_.fill(false);
     xinput_joypad_state_.fill(false);
     current_keyboard_direction_bits_ = 0;
     pending_keyboard_direction_bits_ = 0;
+    current_xinput_direction_bits_ = 0;
+    pending_xinput_direction_bits_ = 0;
     motion_assist_polls_remaining_ = 0;
+    xinput_motion_assist_polls_remaining_ = 0;
 }
 
 void LibretroCore::saveInputConfiguration(const QString &iniPath) const {
@@ -449,6 +568,7 @@ void LibretroCore::setArcadeSocdClean(bool enabled) {
 
     arcade_socd_clean_ = enabled;
     applyKeyboardInputState();
+    applyXInputInputState();
 }
 
 bool LibretroCore::keyboardMotionAssist() const {
@@ -461,7 +581,33 @@ void LibretroCore::setKeyboardMotionAssist(bool enabled) {
 
     keyboard_motion_assist_ = enabled;
     motion_assist_polls_remaining_ = 0;
+    xinput_motion_assist_polls_remaining_ = 0;
     applyKeyboardInputState();
+    applyXInputInputState();
+}
+
+QString LibretroCore::systemRegionOption() const {
+    return QString::fromStdString(system_region_option_);
+}
+
+void LibretroCore::setSystemRegionOption(const QString &region) {
+    system_region_option_ = region.toStdString();
+}
+
+QString LibretroCore::systemModeOption() const {
+    return QString::fromStdString(system_mode_option_);
+}
+
+void LibretroCore::setSystemModeOption(const QString &mode) {
+    system_mode_option_ = mode.toStdString();
+}
+
+QString LibretroCore::fbneoCpuClockOption() const {
+    return QString::fromStdString(fbneo_cpu_clock_option_);
+}
+
+void LibretroCore::setFbneoCpuClockOption(const QString &cpuClock) {
+    fbneo_cpu_clock_option_ = cpuClock.toStdString();
 }
 
 QString LibretroCore::xinputControlName(int control) {
@@ -567,6 +713,8 @@ void LibretroCore::runFrame() {
     if (game_loaded_ && !paused_ && retro_run_) {
         retro_run_();
         finishKeyboardMotionAssist();
+        finishXInputMotionAssist();
+        emit frameAdvanced();
     }
 }
 
@@ -642,26 +790,15 @@ bool LibretroCore::environment(unsigned command, void *data) {
             return false;
 
         const QByteArray key(variable->key);
-        if (key == "neocd_region") {
-            variable->value = "Japan";
+        const char *value = nullptr;
+        if (coreOptionValue(key, value)) {
+            variable->value = value;
+            if (key.startsWith("fbneo-neogeo") || key == "fbneo-cpu-speed-adjust" || key == "neocd_region")
+                qInfo().noquote() << "Libretro option" << key << "=" << value;
             return true;
         }
-        if (key == "neocd_cdspeedhack") {
-            variable->value = "On";
-            return true;
-        }
-        if (key == "neocd_loadskip") {
-            variable->value = "On";
-            return true;
-        }
-        if (key == "neocd_per_content_saves") {
-            variable->value = "Off";
-            return true;
-        }
-        if (key == "neocd_bios" && !selected_bios_.empty()) {
-            variable->value = selected_bios_.c_str();
-            return true;
-        }
+        if (key.startsWith("fbneo-neogeo") || key == "fbneo-cpu-speed-adjust" || key == "neocd_region")
+            qInfo().noquote() << "Unsupported libretro option request" << key;
         return false;
     }
     case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
@@ -670,14 +807,7 @@ bool LibretroCore::environment(unsigned command, void *data) {
         if (!options || !options->definitions)
             return true;
 
-        for (const retro_core_option_v2_definition *definition = options->definitions; definition->key; ++definition) {
-            if (QByteArray(definition->key) != "neocd_bios")
-                continue;
-            if (definition->default_value)
-                selected_bios_ = definition->default_value;
-            else if (definition->values[0].value)
-                selected_bios_ = definition->values[0].value;
-        }
+        coreOptionsUpdated(options);
         return true;
     }
     case RETRO_ENVIRONMENT_SET_VARIABLES:
@@ -753,7 +883,20 @@ uint8_t LibretroCore::rawKeyboardDirectionBits() const {
     return bits;
 }
 
-uint8_t LibretroCore::cleanedKeyboardDirectionBits(uint8_t directionBits) const {
+uint8_t LibretroCore::rawXInputDirectionBits() const {
+    uint8_t bits = 0;
+    if (raw_xinput_joypad_state_[RETRO_DEVICE_ID_JOYPAD_UP])
+        bits |= DirectionUp;
+    if (raw_xinput_joypad_state_[RETRO_DEVICE_ID_JOYPAD_DOWN])
+        bits |= DirectionDown;
+    if (raw_xinput_joypad_state_[RETRO_DEVICE_ID_JOYPAD_LEFT])
+        bits |= DirectionLeft;
+    if (raw_xinput_joypad_state_[RETRO_DEVICE_ID_JOYPAD_RIGHT])
+        bits |= DirectionRight;
+    return bits;
+}
+
+uint8_t LibretroCore::cleanedDirectionBits(uint8_t directionBits) const {
     if (!arcade_socd_clean_)
         return directionBits;
 
@@ -772,11 +915,18 @@ void LibretroCore::setKeyboardDirectionBits(uint8_t directionBits) {
     keyboard_joypad_state_[RETRO_DEVICE_ID_JOYPAD_RIGHT] = (directionBits & DirectionRight) != 0;
 }
 
+void LibretroCore::setXInputDirectionBits(uint8_t directionBits) {
+    xinput_joypad_state_[RETRO_DEVICE_ID_JOYPAD_UP] = (directionBits & DirectionUp) != 0;
+    xinput_joypad_state_[RETRO_DEVICE_ID_JOYPAD_DOWN] = (directionBits & DirectionDown) != 0;
+    xinput_joypad_state_[RETRO_DEVICE_ID_JOYPAD_LEFT] = (directionBits & DirectionLeft) != 0;
+    xinput_joypad_state_[RETRO_DEVICE_ID_JOYPAD_RIGHT] = (directionBits & DirectionRight) != 0;
+}
+
 void LibretroCore::applyKeyboardInputState() {
     keyboard_joypad_state_ = raw_keyboard_joypad_state_;
 
     const uint8_t previous_bits = current_keyboard_direction_bits_;
-    const uint8_t next_bits = cleanedKeyboardDirectionBits(rawKeyboardDirectionBits());
+    const uint8_t next_bits = cleanedDirectionBits(rawKeyboardDirectionBits());
     pending_keyboard_direction_bits_ = next_bits;
 
     uint8_t effective_bits = next_bits;
@@ -822,6 +972,56 @@ void LibretroCore::applyKeyboardInputState() {
     setKeyboardDirectionBits(effective_bits);
 }
 
+void LibretroCore::applyXInputInputState() {
+    xinput_joypad_state_ = raw_xinput_joypad_state_;
+
+    const uint8_t previous_bits = current_xinput_direction_bits_;
+    const uint8_t next_bits = cleanedDirectionBits(rawXInputDirectionBits());
+    pending_xinput_direction_bits_ = next_bits;
+
+    uint8_t effective_bits = next_bits;
+    xinput_motion_assist_polls_remaining_ = 0;
+
+    if (keyboard_motion_assist_) {
+        const bool previous_down_diagonal = (previous_bits & DirectionDown) != 0 &&
+                                            ((previous_bits & DirectionLeft) != 0 || (previous_bits & DirectionRight) != 0);
+        const bool next_down_diagonal = (next_bits & DirectionDown) != 0 &&
+                                        ((next_bits & DirectionLeft) != 0 || (next_bits & DirectionRight) != 0);
+        const bool previous_up_diagonal = (previous_bits & DirectionUp) != 0 &&
+                                          ((previous_bits & DirectionLeft) != 0 || (previous_bits & DirectionRight) != 0);
+        const bool next_up_diagonal = (next_bits & DirectionUp) != 0 &&
+                                      ((next_bits & DirectionLeft) != 0 || (next_bits & DirectionRight) != 0);
+        const bool previous_left_diagonal = (previous_bits & DirectionLeft) != 0 &&
+                                            ((previous_bits & DirectionUp) != 0 || (previous_bits & DirectionDown) != 0);
+        const bool next_left_diagonal = (next_bits & DirectionLeft) != 0 &&
+                                        ((next_bits & DirectionUp) != 0 || (next_bits & DirectionDown) != 0);
+        const bool previous_right_diagonal = (previous_bits & DirectionRight) != 0 &&
+                                             ((previous_bits & DirectionUp) != 0 || (previous_bits & DirectionDown) != 0);
+        const bool next_right_diagonal = (next_bits & DirectionRight) != 0 &&
+                                         ((next_bits & DirectionUp) != 0 || (next_bits & DirectionDown) != 0);
+
+        if (previous_down_diagonal && next_down_diagonal &&
+            ((previous_bits ^ next_bits) & (DirectionLeft | DirectionRight)) == (DirectionLeft | DirectionRight)) {
+            effective_bits = DirectionDown;
+        } else if (previous_up_diagonal && next_up_diagonal &&
+                   ((previous_bits ^ next_bits) & (DirectionLeft | DirectionRight)) == (DirectionLeft | DirectionRight)) {
+            effective_bits = DirectionUp;
+        } else if (previous_left_diagonal && next_left_diagonal &&
+                   ((previous_bits ^ next_bits) & (DirectionUp | DirectionDown)) == (DirectionUp | DirectionDown)) {
+            effective_bits = DirectionLeft;
+        } else if (previous_right_diagonal && next_right_diagonal &&
+                   ((previous_bits ^ next_bits) & (DirectionUp | DirectionDown)) == (DirectionUp | DirectionDown)) {
+            effective_bits = DirectionRight;
+        }
+
+        if (effective_bits != next_bits)
+            xinput_motion_assist_polls_remaining_ = 1;
+    }
+
+    current_xinput_direction_bits_ = effective_bits;
+    setXInputDirectionBits(effective_bits);
+}
+
 void LibretroCore::finishKeyboardMotionAssist() {
     if (motion_assist_polls_remaining_ <= 0)
         return;
@@ -833,6 +1033,19 @@ void LibretroCore::finishKeyboardMotionAssist() {
     current_keyboard_direction_bits_ = pending_keyboard_direction_bits_;
     keyboard_joypad_state_ = raw_keyboard_joypad_state_;
     setKeyboardDirectionBits(pending_keyboard_direction_bits_);
+}
+
+void LibretroCore::finishXInputMotionAssist() {
+    if (xinput_motion_assist_polls_remaining_ <= 0)
+        return;
+
+    --xinput_motion_assist_polls_remaining_;
+    if (xinput_motion_assist_polls_remaining_ > 0)
+        return;
+
+    current_xinput_direction_bits_ = pending_xinput_direction_bits_;
+    xinput_joypad_state_ = raw_xinput_joypad_state_;
+    setXInputDirectionBits(pending_xinput_direction_bits_);
 }
 
 void LibretroCore::setError(const QString &message) {
@@ -849,6 +1062,7 @@ bool LibretroCore::resolveSymbols() {
     retro_set_input_state_ = reinterpret_cast<retro_set_input_state_t>(library_.resolve("retro_set_input_state"));
     retro_init_ = reinterpret_cast<retro_init_t>(library_.resolve("retro_init"));
     retro_deinit_ = reinterpret_cast<retro_deinit_t>(library_.resolve("retro_deinit"));
+    retro_reset_ = reinterpret_cast<retro_reset_t>(library_.resolve("retro_reset"));
     retro_load_game_ = reinterpret_cast<retro_load_game_t>(library_.resolve("retro_load_game"));
     retro_unload_game_ = reinterpret_cast<retro_unload_game_t>(library_.resolve("retro_unload_game"));
     retro_run_ = reinterpret_cast<retro_run_t>(library_.resolve("retro_run"));
@@ -857,13 +1071,15 @@ bool LibretroCore::resolveSymbols() {
     retro_serialize_size_ = reinterpret_cast<retro_serialize_size_t>(library_.resolve("retro_serialize_size"));
     retro_serialize_ = reinterpret_cast<retro_serialize_t>(library_.resolve("retro_serialize"));
     retro_unserialize_ = reinterpret_cast<retro_unserialize_t>(library_.resolve("retro_unserialize"));
+    retro_get_memory_data_ = reinterpret_cast<retro_get_memory_data_t>(library_.resolve("retro_get_memory_data"));
+    retro_get_memory_size_ = reinterpret_cast<retro_get_memory_size_t>(library_.resolve("retro_get_memory_size"));
 
     if (!retro_set_environment_ || !retro_set_video_refresh_ || !retro_set_audio_sample_ ||
         !retro_set_audio_sample_batch_ || !retro_set_input_poll_ || !retro_set_input_state_ ||
-        !retro_init_ || !retro_deinit_ || !retro_load_game_ || !retro_unload_game_ ||
+        !retro_init_ || !retro_deinit_ || !retro_reset_ || !retro_load_game_ || !retro_unload_game_ ||
         !retro_run_ || !retro_get_system_info_ || !retro_get_system_av_info_ ||
         !retro_serialize_size_ || !retro_serialize_ || !retro_unserialize_) {
-        setError(QStringLiteral("neocd_libretro.dll is missing required libretro exports."));
+        setError(QStringLiteral("%1 is missing required libretro exports.").arg(coreFileName()));
         resetSymbols();
         return false;
     }
@@ -880,6 +1096,7 @@ void LibretroCore::resetSymbols() {
     retro_set_input_state_ = nullptr;
     retro_init_ = nullptr;
     retro_deinit_ = nullptr;
+    retro_reset_ = nullptr;
     retro_load_game_ = nullptr;
     retro_unload_game_ = nullptr;
     retro_run_ = nullptr;
@@ -888,6 +1105,8 @@ void LibretroCore::resetSymbols() {
     retro_serialize_size_ = nullptr;
     retro_serialize_ = nullptr;
     retro_unserialize_ = nullptr;
+    retro_get_memory_data_ = nullptr;
+    retro_get_memory_size_ = nullptr;
 }
 
 void LibretroCore::installCallbacks() {
@@ -904,17 +1123,28 @@ QByteArray LibretroCore::pathToUtf8(const QString &path) const {
 }
 
 void LibretroCore::pollXInput() {
+    raw_xinput_joypad_state_.fill(false);
     xinput_joypad_state_.fill(false);
 
-    if (QApplication::activeModalWidget())
+    if (QApplication::activeModalWidget()) {
+        current_xinput_direction_bits_ = 0;
+        pending_xinput_direction_bits_ = 0;
+        xinput_motion_assist_polls_remaining_ = 0;
         return;
+    }
 
     XINPUT_STATE state {};
-    if (XInputGetState(xinput_user_index_, &state) != ERROR_SUCCESS)
+    if (::XInputGetState(xinput_user_index_, &state) != ERROR_SUCCESS) {
+        current_xinput_direction_bits_ = 0;
+        pending_xinput_direction_bits_ = 0;
+        xinput_motion_assist_polls_remaining_ = 0;
         return;
+    }
 
-    for (size_t id = 0; id < xinput_joypad_state_.size(); ++id)
-        xinput_joypad_state_[id] = isXInputControlPressed(xinput_bindings_[id], &state);
+    for (size_t id = 0; id < raw_xinput_joypad_state_.size(); ++id)
+        raw_xinput_joypad_state_[id] = isXInputControlPressed(xinput_bindings_[id], &state);
+
+    applyXInputInputState();
 }
 
 bool LibretroCore::isXInputControlPressed(int control, const void *statePtr) {
