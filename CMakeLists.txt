@@ -233,8 +233,10 @@ if(QNEOGEO_BUILD_QT_APP)
         iemulatorcore.h
         inputmappingwidget.cpp
         inputmappingwidget.h
-        kof98hitboxoverlay.cpp
-        kof98hitboxoverlay.h
+        gameai.cpp
+        gameai.h
+        gamememreader.cpp
+        gamememreader.h
         libretrocore.cpp
         libretrocore.h
         main.cpp

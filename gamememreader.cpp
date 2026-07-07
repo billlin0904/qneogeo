@@ -1,4 +1,4 @@
-#include "kof98hitboxoverlay.h"
+#include "gamememreader.h"
 
 #include <QColor>
 #include <QPointF>
@@ -20,8 +20,8 @@ constexpr uint32_t KOF98_HITBOX_X_OFFSET = 1;
 constexpr uint32_t KOF98_HITBOX_Y_OFFSET = 2;
 constexpr uint32_t KOF98_HITBOX_RADIUS_X_OFFSET = 3;
 constexpr uint32_t KOF98_HITBOX_RADIUS_Y_OFFSET = 4;
-constexpr int KOF98_NATIVE_SCREEN_WIDTH = 320;
-constexpr int KOF98_HEALTH_CANDIDATE_MAX = 0x78;
+constexpr int32_t KOF98_NATIVE_SCREEN_WIDTH = 320;
+constexpr int32_t KOF98_HEALTH_CANDIDATE_MAX = 0x78;
 constexpr uint16_t KOF98_BIOS_TEST_PATTERN_A = 0x5555;
 constexpr uint16_t KOF98_BIOS_TEST_PATTERN_B = 0xAAAA;
 constexpr uint32_t KOF98_PLAYER_HEALTH_OFFSET = 0x138;
@@ -121,9 +121,9 @@ struct Kof98GameProfile {
 struct Kof98Object {
     uint32_t base = 0;
     bool projectile = false;
-    int pos_x = 0;
-    int pos_y = 0;
-    int flip_x = 1;
+    int32_t pos_x = 0;
+    int32_t pos_y = 0;
+    int32_t flip_x = 1;
     uint8_t status = 0;
 };
 
@@ -132,14 +132,14 @@ struct Kof98Box {
     Kof98HitboxType type = Kof98HitboxType::Undefined;
     bool clear = false;
     uint8_t id = 0;
-    int val_x = 0;
-    int val_y = 0;
+    int32_t val_x = 0;
+    int32_t val_y = 0;
     uint8_t rad_x = 0;
     uint8_t rad_y = 0;
-    int left = 0;
-    int right = 0;
-    int top = 0;
-    int bottom = 0;
+    int32_t left = 0;
+    int32_t right = 0;
+    int32_t top = 0;
+    int32_t bottom = 0;
 };
 
 struct Kof98HitboxPalette {
@@ -164,23 +164,23 @@ public:
         return readRawU8(address, value);
     }
 
-    bool readS8(uint32_t address, int &value) const {
+    bool readS8(uint32_t address, int32_t &value) const {
         uint8_t byte = 0;
         if (!readU8(address, byte))
             return false;
 
-        value = static_cast<int>(static_cast<int8_t>(byte));
+        value = static_cast<int32_t>(static_cast<int8_t>(byte));
         return true;
     }
 
-    bool readS16Be(uint32_t address, int &value) const {
+    bool readS16Be(uint32_t address, int32_t &value) const {
         uint8_t high = 0;
         uint8_t low = 0;
         if (!readU8(address, high) || !readU8(address + 1, low))
             return false;
 
         const uint16_t word = static_cast<uint16_t>((high << 8) | low);
-        value = static_cast<int>(static_cast<int16_t>(word));
+        value = static_cast<int32_t>(static_cast<int16_t>(word));
         return true;
     }
 
@@ -201,7 +201,7 @@ private:
         if (address >= static_cast<uint32_t>(ram_.size()))
             return false;
 
-        value = static_cast<uint8_t>(ram_[static_cast<int>(address)]);
+        value = static_cast<uint8_t>(ram_[static_cast<qsizetype>(address)]);
         return true;
     }
 
@@ -300,23 +300,23 @@ std::optional<Kof98Box> defineBox(const Kof98RamView &ram, const Kof98Object &ob
     return box;
 }
 
-int readByteOrNegative(const Kof98RamView &ram, uint32_t address) {
+int32_t readByteOrNegative(const Kof98RamView &ram, uint32_t address) {
     uint8_t value = 0;
     if (!ram.readU8(address, value))
         return -1;
 
-    return static_cast<int>(value);
+    return static_cast<int32_t>(value);
 }
 
-int readRawByteOrNegative(const Kof98RamView &ram, uint32_t address) {
+int32_t readRawByteOrNegative(const Kof98RamView &ram, uint32_t address) {
     uint8_t value = 0;
     if (!ram.readRawByte(address, value))
         return -1;
 
-    return static_cast<int>(value);
+    return static_cast<int32_t>(value);
 }
 
-int readHealthByte(const Kof98RamView &ram, uint32_t primary_address, uint32_t alternate_address, uint32_t fallback_address) {
+int32_t readHealthByte(const Kof98RamView &ram, uint32_t primary_address, uint32_t alternate_address, uint32_t fallback_address) {
     const std::array<uint32_t, 3> candidates {{
         primary_address,
         alternate_address,
@@ -324,7 +324,7 @@ int readHealthByte(const Kof98RamView &ram, uint32_t primary_address, uint32_t a
     }};
 
     for (uint32_t address : candidates) {
-        const int value = readRawByteOrNegative(ram, address);
+        const int32_t value = readRawByteOrNegative(ram, address);
         if (value >= 0 && value <= KOF98_HEALTH_CANDIDATE_MAX)
             return value;
     }
@@ -333,9 +333,9 @@ int readHealthByte(const Kof98RamView &ram, uint32_t primary_address, uint32_t a
 }
 
 bool readPlayerPosition(const Kof98RamView &ram, uint32_t base, QSize source_size, QPoint &position) {
-    int screen_left = 0;
-    int raw_x = 0;
-    int raw_y = 0;
+    int32_t screen_left = 0;
+    int32_t raw_x = 0;
+    int32_t raw_y = 0;
     if (!ram.readS16Be(KOF98_CAMERA_LEFT_ADDRESS, screen_left) ||
         !ram.readS16Be(base + KOF98_GAME.offset.pos_x, raw_x) ||
         !ram.readS16Be(base + KOF98_GAME.offset.pos_y, raw_y)) {
@@ -345,17 +345,17 @@ bool readPlayerPosition(const Kof98RamView &ram, uint32_t base, QSize source_siz
     if (source_size.width() > 0 && source_size.width() < KOF98_NATIVE_SCREEN_WIDTH)
         screen_left += (KOF98_NATIVE_SCREEN_WIDTH - source_size.width()) / 2;
 
-    position = QPoint(raw_x - screen_left, raw_y - static_cast<int>(KOF98_GAME.address.ground_level));
+    position = QPoint(raw_x - screen_left, raw_y - static_cast<int32_t>(KOF98_GAME.address.ground_level));
     return true;
 }
 } // namespace
 
-KofGameMemReader::KofGameMemReader(QByteArray ram, QSize sourceSize)
+GameMemReader::GameMemReader(QByteArray ram, QSize sourceSize)
     : ram_(std::move(ram))
     , source_size_(sourceSize) {
 }
 
-HitboxOverlay KofGameMemReader::getHitboxOverlay() const {
+HitboxOverlay GameMemReader::getHitboxOverlay() const {
     HitboxOverlay result;
     const Kof98RamView ram(ram_);
 
@@ -366,7 +366,7 @@ HitboxOverlay KofGameMemReader::getHitboxOverlay() const {
         return result;
     }
 
-    int screen_left = 0;
+    int32_t screen_left = 0;
     if (!ram.readS16Be(KOF98_CAMERA_LEFT_ADDRESS, screen_left))
         return result;
 
@@ -374,8 +374,8 @@ HitboxOverlay KofGameMemReader::getHitboxOverlay() const {
         screen_left += (KOF98_NATIVE_SCREEN_WIDTH - source_size_.width()) / 2;
 
     auto appendObjectOverlay = [&](Kof98Object object) {
-        int raw_x = 0;
-        int raw_y = 0;
+        int32_t raw_x = 0;
+        int32_t raw_y = 0;
         uint8_t flip_byte = 0;
         if (!ram.readS16Be(object.base + KOF98_GAME.offset.pos_x, raw_x) ||
             !ram.readS16Be(object.base + KOF98_GAME.offset.pos_y, raw_y) ||
@@ -385,7 +385,7 @@ HitboxOverlay KofGameMemReader::getHitboxOverlay() const {
         }
 
         object.pos_x = raw_x - screen_left;
-        object.pos_y = raw_y - static_cast<int>(KOF98_GAME.address.ground_level);
+        object.pos_y = raw_y - static_cast<int32_t>(KOF98_GAME.address.ground_level);
         object.flip_x = (flip_byte & 0x01) != 0 ? -1 : 1;
 
         if (!object.projectile)
@@ -397,8 +397,8 @@ HitboxOverlay KofGameMemReader::getHitboxOverlay() const {
                 continue;
 
             const Kof98Box &box = *maybe_box;
-            const int width = std::max(1, box.right - box.left + 1);
-            const int height = std::max(1, box.bottom - box.top + 1);
+            const int32_t width = std::max<int32_t>(1, box.right - box.left + 1);
+            const int32_t height = std::max<int32_t>(1, box.bottom - box.top + 1);
             const Kof98HitboxPalette palette = paletteForKof98HitboxType(box.type);
 
             result.boxes.push_back({
@@ -423,7 +423,7 @@ HitboxOverlay KofGameMemReader::getHitboxOverlay() const {
             break;
 
         const uint32_t object_base = KOF98_RAM_BASE | object_base_low;
-        int object_state = 0;
+        int32_t object_state = 0;
         if (!ram.readS16Be(object_base + KOF98_OBJECT_STATE_OFFSET, object_state) || object_state < 0)
             break;
 
@@ -443,12 +443,12 @@ HitboxOverlay KofGameMemReader::getHitboxOverlay() const {
     return result;
 }
 
-int KofGameMemReader::readRoundTime() const {
+int32_t GameMemReader::readRoundTime() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_ROUND_TIME_ADDRESS);
 }
 
-int KofGameMemReader::readP1Health() const {
+int32_t GameMemReader::readP1Health() const {
     const Kof98RamView ram(ram_);
     return readHealthByte(ram,
                           KOF98_P1_PLAYER_BASE + KOF98_PLAYER_HEALTH_OFFSET,
@@ -456,7 +456,7 @@ int KofGameMemReader::readP1Health() const {
                           KOF98_P1_HEALTH_FALLBACK_ADDRESS);
 }
 
-int KofGameMemReader::readP2Health() const {
+int32_t GameMemReader::readP2Health() const {
     const Kof98RamView ram(ram_);
     return readHealthByte(ram,
                           KOF98_P2_PLAYER_BASE + KOF98_PLAYER_HEALTH_OFFSET,
@@ -464,42 +464,42 @@ int KofGameMemReader::readP2Health() const {
                           KOF98_P2_HEALTH_FALLBACK_ADDRESS);
 }
 
-int KofGameMemReader::readP1Power() const {
+int32_t GameMemReader::readP1Power() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P1_PLAYER_BASE + KOF98_PLAYER_POWER_VALUE_OFFSET);
 }
 
-int KofGameMemReader::readP2Power() const {
+int32_t GameMemReader::readP2Power() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P2_PLAYER_BASE + KOF98_PLAYER_POWER_VALUE_OFFSET);
 }
 
-int KofGameMemReader::readP1PowerState() const {
+int32_t GameMemReader::readP1PowerState() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P1_PLAYER_BASE + KOF98_PLAYER_POWER_STATE_OFFSET);
 }
 
-int KofGameMemReader::readP2PowerState() const {
+int32_t GameMemReader::readP2PowerState() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P2_PLAYER_BASE + KOF98_PLAYER_POWER_STATE_OFFSET);
 }
 
-int KofGameMemReader::readP1Stun() const {
+int32_t GameMemReader::readP1Stun() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P1_PLAYER_BASE + KOF98_PLAYER_STUN_OFFSET);
 }
 
-int KofGameMemReader::readP2Stun() const {
+int32_t GameMemReader::readP2Stun() const {
     const Kof98RamView ram(ram_);
     return readByteOrNegative(ram, KOF98_P2_PLAYER_BASE + KOF98_PLAYER_STUN_OFFSET);
 }
 
-bool KofGameMemReader::readP1Position(QPoint &position) const {
+bool GameMemReader::readP1Position(QPoint &position) const {
     const Kof98RamView ram(ram_);
     return readPlayerPosition(ram, KOF98_P1_PLAYER_BASE, source_size_, position);
 }
 
-bool KofGameMemReader::readP2Position(QPoint &position) const {
+bool GameMemReader::readP2Position(QPoint &position) const {
     const Kof98RamView ram(ram_);
     return readPlayerPosition(ram, KOF98_P2_PLAYER_BASE, source_size_, position);
 }

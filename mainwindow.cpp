@@ -1,7 +1,7 @@
 #include "inputmappingwidget.h"
 #include "emulatorview.h"
 #include "fbneolibretrocore.h"
-#include "kof98hitboxoverlay.h"
+#include "gamememreader.h"
 #include "libretrocore.h"
 #include "mainwindow.h"
 #include "memorysearchdialog.h"
@@ -31,11 +31,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <utility>
 
 namespace {
-constexpr int STATE_SLOT_COUNT = 10;
+constexpr int32_t STATE_SLOT_COUNT = 10;
 }
 
 MainWindow::MainWindow(QWidget *parent)
@@ -69,7 +70,7 @@ MainWindow::MainWindow(QWidget *parent)
         "color: white;"
         "border: 1px solid rgba(255, 255, 255, 90);"
         "padding: 3px 7px;"
-        "font: 700 12px 'Consolas';"
+        "font: 700 12px 'Roboto Mono';"
         "}"
     ));
     fps_label_->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -85,7 +86,7 @@ MainWindow::MainWindow(QWidget *parent)
         "color: white;"
         "border: 1px solid rgba(255, 255, 255, 90);"
         "padding: 3px 7px;"
-        "font: 700 12px 'Consolas';"
+        "font: 700 12px 'Roboto Mono';"
         "}"
     ));
     health_label_->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -151,7 +152,7 @@ MainWindow::MainWindow(QWidget *parent)
     auto *cpu_clock_menu = file_menu->addMenu(QStringLiteral("CPU Clock"));
     cpu_clock_group_ = new QActionGroup(this);
     cpu_clock_group_->setExclusive(true);
-    for (int percent : {50, 100, 150, 200}) {
+    for (int32_t percent : {50, 100, 150, 200}) {
         const QString value = QStringLiteral("%1%").arg(percent);
         auto *action = cpu_clock_menu->addAction(value);
         action->setCheckable(true);
@@ -170,7 +171,7 @@ MainWindow::MainWindow(QWidget *parent)
     auto *load_state_menu = file_menu->addMenu(QStringLiteral("Load State"));
     save_state_actions_.reserve(STATE_SLOT_COUNT);
     load_state_actions_.reserve(STATE_SLOT_COUNT);
-    for (int slot = 1; slot <= STATE_SLOT_COUNT; ++slot) {
+    for (int32_t slot = 1; slot <= STATE_SLOT_COUNT; ++slot) {
         auto *save_action = save_state_menu->addAction(QStringLiteral("Slot %1").arg(slot));
         save_action->setEnabled(false);
         save_action->setData(slot);
@@ -250,8 +251,8 @@ MainWindow::MainWindow(QWidget *parent)
 
     {
         QSettings settings(inputConfigPath(), QSettings::IniFormat);
-        const int saved_filter = settings.value(QStringLiteral("Video/ScalingFilter"),
-                                                static_cast<int>(EmulatorView::ScalingFilter::Nearest)).toInt();
+        const int32_t saved_filter = settings.value(QStringLiteral("Video/ScalingFilter"),
+                                                    static_cast<int>(EmulatorView::ScalingFilter::Nearest)).toInt();
         for (QAction *action : filter_group->actions()) {
             if (action->data().toInt() != saved_filter)
                 continue;
@@ -395,7 +396,7 @@ QString MainWindow::gameRootDirectory() const {
     return QDir(projectRoot()).absoluteFilePath(QStringLiteral("roms/%1").arg(core_->romDirectoryName()));
 }
 
-QString MainWindow::stateFilePath(int slot) const {
+QString MainWindow::stateFilePath(int32_t slot) const {
     QString name = gameDisplayName(current_game_path_);
     if (name.isEmpty())
         name = QFileInfo(current_game_path_).completeBaseName();
@@ -796,7 +797,7 @@ void MainWindow::showMemorySearchDialog() {
     memory_search_dialog_->activateWindow();
 }
 
-void MainWindow::saveState(int slot) {
+void MainWindow::saveState(int32_t slot) {
     if (current_game_path_.isEmpty() || !core_->isGameLoaded()) {
         QMessageBox::information(this, QStringLiteral("Save State"), QStringLiteral("目前沒有載入遊戲。"));
         return;
@@ -816,7 +817,7 @@ void MainWindow::saveState(int slot) {
                              QStringLiteral("Slot %1 已儲存：\n%2").arg(slot).arg(QDir::toNativeSeparators(path)));
 }
 
-void MainWindow::loadState(int slot) {
+void MainWindow::loadState(int32_t slot) {
     if (current_game_path_.isEmpty() || !core_->isGameLoaded()) {
         QMessageBox::information(this, QStringLiteral("Load State"), QStringLiteral("目前沒有載入遊戲。"));
         return;
@@ -866,7 +867,8 @@ void MainWindow::updateKof98Overlay() {
         return;
     }
 
-    KofGameMemReader mem_reader(std::move(ram), emulator_view_->sourceSize());
+    GameMemReader mem_reader(std::move(ram), emulator_view_->sourceSize());
+
     if (emulator_view_->hitboxOverlayEnabled()) {
         HitboxOverlay overlay = mem_reader.getHitboxOverlay();
         emulator_view_->setHitboxOverlay(std::move(overlay.boxes), std::move(overlay.axes));
@@ -877,12 +879,12 @@ void MainWindow::updateKof98Overlay() {
     if (!health_label_)
         return;
 
-    auto healthText = [](int health) {
+    auto healthText = [](int32_t health) {
         if (health < 0)
             return QStringLiteral("--");
 
-        const int clamped = qBound(0, health, KofGameMemReader::MaxHealth);
-        return QStringLiteral("%1/%2").arg(clamped).arg(KofGameMemReader::MaxHealth);
+        const int32_t clamped = qBound<int32_t>(0, health, GameMemReader::MaxHealth);
+        return QStringLiteral("%1/%2").arg(clamped).arg(GameMemReader::MaxHealth);
     };
 
     health_label_->setText(QStringLiteral("P1 HP: %1  P2 HP: %2")

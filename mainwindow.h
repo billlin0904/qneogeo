@@ -4,6 +4,8 @@
 #include <QMainWindow>
 #include <QVector>
 
+#include <cstdint>
+
 class QAction;
 class QActionGroup;
 class EmulatorView;
@@ -34,7 +36,7 @@ private:
     QStringList scanGameImages() const;
     QString gameDisplayName(const QString &path) const;
     QString gameRootDirectory() const;
-    QString stateFilePath(int slot = 1) const;
+    QString stateFilePath(int32_t slot = 1) const;
     QString projectRoot() const;
     QString corePath() const;
     QString systemDirectory() const;
@@ -58,8 +60,8 @@ private:
     void showLoadGameDialog();
     void showInputConfiguration();
     void showMemorySearchDialog();
-    void saveState(int slot = 1);
-    void loadState(int slot = 1);
+    void saveState(int32_t slot = 1);
+    void loadState(int32_t slot = 1);
     void updateFpsOverlay(double fps);
     void updateKof98Overlay();
 
