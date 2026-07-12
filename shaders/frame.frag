@@ -2,147 +2,7 @@ uniform sampler2D frameTexture;
 uniform vec2 textureSize;
 uniform vec2 outputSize;
 uniform int scalingFilter;
-uniform float sharpAmount;
-uniform float edgeBlend;
-uniform float nearestHold;
 varying vec2 vTexCoord;
-
-float luma(vec4 c) {
-    return dot(c.rgb, vec3(0.299, 0.587, 0.114));
-}
-
-float colorDistance(vec4 a, vec4 b) {
-    vec3 pa = a.rgb * a.a;
-    vec3 pb = b.rgb * b.a;
-    vec3 d = pa - pb;
-
-    float y = dot(d, vec3(0.299, 0.587, 0.114));
-    vec2 chroma = vec2(d.r - d.g, d.b - d.g);
-    float da = a.a - b.a;
-
-    return y * y * 2.5 + dot(chroma, chroma) * 0.5 + da * da;
-}
-
-vec4 sampleAt(vec2 pixel, vec2 offset) {
-    return texture2D(frameTexture, (pixel + offset + vec2(0.5)) / textureSize);
-}
-
-vec4 cubicWeights(float t) {
-    float t2 = t * t;
-    float t3 = t2 * t;
-
-    return vec4(
-        -0.5 * t + t2 - 0.5 * t3,
-         1.0 - 2.5 * t2 + 1.5 * t3,
-         0.5 * t + 2.0 * t2 - 1.5 * t3,
-        -0.5 * t2 + 0.5 * t3
-    );
-}
-
-vec4 cubicRow(vec2 pixel, float y, vec4 wx) {
-    return sampleAt(pixel, vec2(-1.0, y)) * wx.x +
-           sampleAt(pixel, vec2( 0.0, y)) * wx.y +
-           sampleAt(pixel, vec2( 1.0, y)) * wx.z +
-           sampleAt(pixel, vec2( 2.0, y)) * wx.w;
-}
-
-vec4 catmullRomAntiRing(vec2 pixel, vec2 local) {
-    vec4 wx = cubicWeights(local.x);
-    vec4 wy = cubicWeights(local.y);
-
-    vec4 r0 = cubicRow(pixel, -1.0, wx);
-    vec4 r1 = cubicRow(pixel,  0.0, wx);
-    vec4 r2 = cubicRow(pixel,  1.0, wx);
-    vec4 r3 = cubicRow(pixel,  2.0, wx);
-
-    vec4 c = r0 * wy.x + r1 * wy.y + r2 * wy.z + r3 * wy.w;
-
-    vec4 c00 = sampleAt(pixel, vec2(0.0, 0.0));
-    vec4 c10 = sampleAt(pixel, vec2(1.0, 0.0));
-    vec4 c01 = sampleAt(pixel, vec2(0.0, 1.0));
-    vec4 c11 = sampleAt(pixel, vec2(1.0, 1.0));
-
-    vec4 mn = min(min(c00, c10), min(c01, c11));
-    vec4 mx = max(max(c00, c10), max(c01, c11));
-
-    return clamp(c, mn, mx);
-}
-
-vec4 refinedScale() {
-    vec2 pixel_position = (vTexCoord * textureSize) - vec2(0.5);
-    vec2 pixel = floor(pixel_position);
-    vec2 local = fract(pixel_position);
-
-    vec4 center     = sampleAt(pixel, vec2( 0.0,  0.0));
-    vec4 left       = sampleAt(pixel, vec2(-1.0,  0.0));
-    vec4 right      = sampleAt(pixel, vec2( 1.0,  0.0));
-    vec4 up         = sampleAt(pixel, vec2( 0.0, -1.0));
-    vec4 down       = sampleAt(pixel, vec2( 0.0,  1.0));
-    vec4 up_left    = sampleAt(pixel, vec2(-1.0, -1.0));
-    vec4 up_right   = sampleAt(pixel, vec2( 1.0, -1.0));
-    vec4 down_left  = sampleAt(pixel, vec2(-1.0,  1.0));
-    vec4 down_right = sampleAt(pixel, vec2( 1.0,  1.0));
-
-    vec4 base = catmullRomAntiRing(pixel, local);
-
-    float gx =
-        luma(right) - luma(left) +
-        0.5 * ((luma(up_right) - luma(up_left)) +
-               (luma(down_right) - luma(down_left)));
-
-    float gy =
-        luma(down) - luma(up) +
-        0.5 * ((luma(down_left) - luma(up_left)) +
-               (luma(down_right) - luma(up_right)));
-
-    float ax = abs(gx);
-    float ay = abs(gy);
-    float edge = smoothstep(0.04, 0.25, sqrt(gx * gx + gy * gy));
-
-    vec4 noCross = base;
-
-    if (ax > ay * 1.20) {
-        float xSide = step(0.5, local.x);
-        vec4 a = sampleAt(pixel, vec2(xSide, 0.0));
-        vec4 b = sampleAt(pixel, vec2(xSide, 1.0));
-        noCross = mix(a, b, local.y);
-    } else if (ay > ax * 1.20) {
-        float ySide = step(0.5, local.y);
-        vec4 a = sampleAt(pixel, vec2(0.0, ySide));
-        vec4 b = sampleAt(pixel, vec2(1.0, ySide));
-        noCross = mix(a, b, local.x);
-    }
-
-    vec4 outColor = mix(base, noCross, edge * edgeBlend);
-
-    vec2 nearestOffset = step(vec2(0.5), local);
-    vec4 nearestColor = sampleAt(pixel, nearestOffset);
-
-    vec2 nearestDist = abs(local - nearestOffset);
-    float nearestWeight =
-        1.0 - smoothstep(0.12, 0.48, max(nearestDist.x, nearestDist.y));
-
-    outColor = mix(outColor, nearestColor, nearestWeight * edge * nearestHold);
-
-    vec4 lowpass = (center * 4.0 + left + right + up + down) * 0.125;
-    vec4 detail = outColor - lowpass;
-
-    float contrast = max(
-        max(colorDistance(center, left), colorDistance(center, right)),
-        max(colorDistance(center, up),   colorDistance(center, down))
-    );
-
-    float sharpenMask = smoothstep(0.001, 0.06, contrast);
-    outColor += detail * sharpAmount * sharpenMask;
-
-    vec4 mn = min(center, min(min(left, right), min(up, down)));
-    mn = min(mn, min(min(up_left, up_right), min(down_left, down_right)));
-
-    vec4 mx = max(center, max(max(left, right), max(up, down)));
-    mx = max(mx, max(max(up_left, up_right), max(down_left, down_right)));
-
-    return clamp(outColor, mn, mx);
-}
 
 float xbrzDistYCbCr(vec3 pixA, vec3 pixB) {
     const vec3 w = vec3(0.2627, 0.6780, 0.0593);
@@ -308,9 +168,7 @@ vec4 xbrzFreescale() {
 }
 
 void main() {
-    if (scalingFilter == 2) {
-        gl_FragColor = refinedScale();
-    } else if (scalingFilter == 3) {
+    if (scalingFilter == 3) {
         gl_FragColor = xbrzFreescale();
     } else {
         gl_FragColor = texture2D(frameTexture, vTexCoord);

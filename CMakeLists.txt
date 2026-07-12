@@ -173,6 +173,22 @@ if(QNEOGEO_BUILD_TOOLS)
     target_include_directories(neocd_bios_probe PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/neocd_libretro/deps/libretro-common/include"
     )
+
+    add_library(fbneo_training SHARED
+        gamememreadercore.cpp
+        gamememreadercore.h
+        tools/fbneo_training.cpp
+        tools/fbneo_training.h
+    )
+    target_compile_features(fbneo_training PRIVATE cxx_std_17)
+    target_compile_definitions(fbneo_training PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        _CRT_SECURE_NO_WARNINGS
+    )
+    target_include_directories(fbneo_training PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/neocd_libretro/deps/libretro-common/include"
+    )
 endif()
 
 if(QNEOGEO_BUILD_QT_APP)
@@ -229,14 +245,16 @@ if(QNEOGEO_BUILD_QT_APP)
         emulatorview.h
         fbneolibretrocore.cpp
         fbneolibretrocore.h
+        fbneotrainingcore.cpp
+        fbneotrainingcore.h
         iemulatorcore.cpp
         iemulatorcore.h
         inputmappingwidget.cpp
         inputmappingwidget.h
-        gameai.cpp
-        gameai.h
         gamememreader.cpp
         gamememreader.h
+        gamememreadercore.cpp
+        gamememreadercore.h
         libretrocore.cpp
         libretrocore.h
         main.cpp
@@ -267,6 +285,15 @@ if(QNEOGEO_BUILD_QT_APP)
 
     if(TARGET neocd_libretro)
         add_dependencies(qneogeo neocd_libretro)
+    endif()
+
+    if(TARGET fbneo_training)
+        add_dependencies(qneogeo fbneo_training)
+        add_custom_command(TARGET qneogeo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:fbneo_training>"
+                "$<TARGET_FILE_DIR:qneogeo>/fbneo_training.dll"
+        )
     endif()
 
     add_custom_command(TARGET qneogeo POST_BUILD

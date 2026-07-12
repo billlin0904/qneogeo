@@ -23,15 +23,14 @@ public:
     };
 
     enum class ScalingFilter {
-        Nearest,
-        Linear,
-        Super2xSai,
-        XbrzFreescale,
-        LibretroXbrzFreescale,
-        Libretro6xbrz,
-        ZfastCrt,
-        ZfastLcd,
-        ScanlineFract
+        Nearest = 0,
+        Linear = 1,
+        XbrzFreescale = 3,
+        LibretroXbrzFreescale = 4,
+        Libretro6xbrz = 5,
+        ZfastCrt = 6,
+        ZfastLcd = 7,
+        ScanlineFract = 8
     };
 
     explicit EmulatorView(QWidget *parent = nullptr);
@@ -42,10 +41,6 @@ public:
 
     void setScalingFilter(ScalingFilter filter);
     ScalingFilter scalingFilter() const;
-    void setSuper2xSaiParameters(float sharpAmount, float edgeBlend, float nearestHold);
-    float super2xSaiSharpAmount() const;
-    float super2xSaiEdgeBlend() const;
-    float super2xSaiNearestHold() const;
     void setSmoothScaling(bool enabled);
     bool smoothScaling() const;
     void setHitboxOverlayEnabled(bool enabled);
@@ -106,9 +101,6 @@ private:
     PixelFormat texture_format_ = PixelFormat::Rgb565;
     GLuint texture_ = 0;
     ScalingFilter scaling_filter_ = ScalingFilter::Nearest;
-    float super2xsai_sharp_amount_ = 0.25f;
-    float super2xsai_edge_blend_ = 0.45f;
-    float super2xsai_nearest_hold_ = 0.10f;
     QElapsedTimer fps_timer_;
     int fps_frame_count_ = 0;
     double fps_ = 0.0;

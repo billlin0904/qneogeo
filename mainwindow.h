@@ -28,7 +28,8 @@ public:
 private:
     enum class CoreKind {
         NeoCd,
-        Fbneo
+        Fbneo,
+        FbneoTraining
     };
 
     bool event(QEvent *event) override;
@@ -64,6 +65,7 @@ private:
     void loadState(int32_t slot = 1);
     void updateFpsOverlay(double fps);
     void updateKof98Overlay();
+    void updateOverlayLabelPositions();
 
     Ui::MainWindow *ui_;
     EmulatorView *emulator_view_;
@@ -77,14 +79,18 @@ private:
     QAction *show_hitboxes_action_;
     QAction *neocd_core_action_;
     QAction *fbneo_core_action_;
+    QAction *fbneo_training_core_action_;
     QActionGroup *region_group_;
     QActionGroup *mode_group_;
     QActionGroup *cpu_clock_group_;
     QLabel *fps_label_;
     QLabel *health_label_;
+    QLabel *combo_label_;
+    QLabel *power_label_;
     MemorySearchDialog *memory_search_dialog_ = nullptr;
     QString current_game_path_;
     CoreKind core_kind_ = CoreKind::NeoCd;
     bool auto_paused_for_focus_loss_ = false;
+    bool switching_core_ = false;
 };
 #endif // MAINWINDOW_H

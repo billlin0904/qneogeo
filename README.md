@@ -23,7 +23,6 @@ qneogeo 是一個使用 Qt 6 製作的 Neo Geo 前端。模擬核心目前可使
 - 影像濾鏡：
   - Nearest
   - Linear
-  - Super2xSaI
   - xBRZ Freescale
   - libretro xBRZ Freescale
   - libretro 6xBRZ

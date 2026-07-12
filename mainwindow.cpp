@@ -1,6 +1,7 @@
 #include "inputmappingwidget.h"
 #include "emulatorview.h"
 #include "fbneolibretrocore.h"
+#include "fbneotrainingcore.h"
 #include "gamememreader.h"
 #include "libretrocore.h"
 #include "mainwindow.h"
@@ -26,6 +27,7 @@
 #include <QMessageBox>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -51,11 +53,14 @@ MainWindow::MainWindow(QWidget *parent)
     , show_hitboxes_action_(nullptr)
     , neocd_core_action_(nullptr)
     , fbneo_core_action_(nullptr)
+    , fbneo_training_core_action_(nullptr)
     , region_group_(nullptr)
     , mode_group_(nullptr)
     , cpu_clock_group_(nullptr)
     , fps_label_(nullptr)
-    , health_label_(nullptr) {
+    , health_label_(nullptr)
+    , combo_label_(nullptr)
+    , power_label_(nullptr) {
     ui_->setupUi(this);
     setWindowTitle(QStringLiteral("qneogeo"));
 
@@ -94,6 +99,38 @@ MainWindow::MainWindow(QWidget *parent)
     health_label_->move(fps_label_->x() + fps_label_->width() + 8, fps_label_->y());
     health_label_->raise();
 
+    combo_label_ = new QLabel(emulator_view_);
+    combo_label_->setText(QStringLiteral("P1 Combo: --  P2 Combo: --"));
+    combo_label_->setStyleSheet(QStringLiteral(
+        "QLabel {"
+        "background: rgba(0, 0, 0, 150);"
+        "color: white;"
+        "border: 1px solid rgba(255, 255, 255, 90);"
+        "padding: 3px 7px;"
+        "font: 700 12px 'Roboto Mono';"
+        "}"
+    ));
+    combo_label_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    combo_label_->adjustSize();
+    combo_label_->move(health_label_->x() + health_label_->width() + 8, health_label_->y());
+    combo_label_->raise();
+
+    power_label_ = new QLabel(emulator_view_);
+    power_label_->setText(QStringLiteral("P1 POW: --/--  P2 POW: --/--"));
+    power_label_->setStyleSheet(QStringLiteral(
+        "QLabel {"
+        "background: rgba(0, 0, 0, 150);"
+        "color: white;"
+        "border: 1px solid rgba(255, 255, 255, 90);"
+        "padding: 3px 7px;"
+        "font: 700 12px 'Roboto Mono';"
+        "}"
+    ));
+    power_label_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    power_label_->adjustSize();
+    power_label_->move(combo_label_->x() + combo_label_->width() + 8, combo_label_->y());
+    power_label_->raise();
+
     core_kind_ = savedCoreKind();
     core_ = createCore(core_kind_);
     core_->loadInputConfiguration(inputConfigPath());
@@ -117,6 +154,11 @@ MainWindow::MainWindow(QWidget *parent)
     fbneo_core_action_->setCheckable(true);
     fbneo_core_action_->setData(static_cast<int>(CoreKind::Fbneo));
     core_group->addAction(fbneo_core_action_);
+
+    fbneo_training_core_action_ = core_menu->addAction(QStringLiteral("FBNeo Training DLL"));
+    fbneo_training_core_action_->setCheckable(true);
+    fbneo_training_core_action_->setData(static_cast<int>(CoreKind::FbneoTraining));
+    core_group->addAction(fbneo_training_core_action_);
     updateCoreActions();
 
     auto *region_menu = file_menu->addMenu(QStringLiteral("Region"));
@@ -214,11 +256,6 @@ MainWindow::MainWindow(QWidget *parent)
     linear_action->setData(static_cast<int>(EmulatorView::ScalingFilter::Linear));
     filter_group->addAction(linear_action);
 
-    auto *super2xsai_action = filter_menu->addAction(QStringLiteral("Super2xSaI"));
-    super2xsai_action->setCheckable(true);
-    super2xsai_action->setData(static_cast<int>(EmulatorView::ScalingFilter::Super2xSai));
-    filter_group->addAction(super2xsai_action);
-
     auto *xbrz_action = filter_menu->addAction(QStringLiteral("xBRZ Freescale"));
     xbrz_action->setCheckable(true);
     xbrz_action->setData(static_cast<int>(EmulatorView::ScalingFilter::XbrzFreescale));
@@ -303,6 +340,8 @@ MainWindow::MainWindow(QWidget *parent)
 
     connect(show_fps_action_, &QAction::toggled, fps_label_, &QLabel::setVisible);
     connect(show_fps_action_, &QAction::toggled, health_label_, &QLabel::setVisible);
+    connect(show_fps_action_, &QAction::toggled, combo_label_, &QLabel::setVisible);
+    connect(show_fps_action_, &QAction::toggled, power_label_, &QLabel::setVisible);
     connect(show_hitboxes_action_, &QAction::toggled, emulator_view_, &EmulatorView::setHitboxOverlayEnabled);
     connect(emulator_view_, &EmulatorView::fpsChanged, this, &MainWindow::updateFpsOverlay);
 
@@ -334,7 +373,8 @@ MainWindow::~MainWindow() {
 bool MainWindow::event(QEvent *event) {
     if (event->type() == QEvent::WindowDeactivate) {
         QTimer::singleShot(0, this, [this] {
-            if (!pause_when_inactive_action_ || !pause_when_inactive_action_->isChecked() ||
+            if (switching_core_ ||
+                !pause_when_inactive_action_ || !pause_when_inactive_action_->isChecked() ||
                 !core_ || !core_->isGameLoaded() || core_->isPaused() || auto_paused_for_focus_loss_) {
                 return;
             }
@@ -431,6 +471,8 @@ QString MainWindow::inputConfigPath() const {
 
 LibretroCore *MainWindow::createCore(CoreKind kind) {
     switch (kind) {
+    case CoreKind::FbneoTraining:
+        return new FbneoTrainingCore(emulator_view_, this);
     case CoreKind::Fbneo:
         return new FbneoLibretroCore(emulator_view_, this);
     case CoreKind::NeoCd:
@@ -445,10 +487,24 @@ void MainWindow::setCoreKind(CoreKind kind) {
         return;
     }
 
+    switching_core_ = true;
+
+    if (memory_search_dialog_)
+        memory_search_dialog_->setCore(nullptr);
+
+    if (pause_action_) {
+        const QSignalBlocker blocker(pause_action_);
+        pause_action_->setChecked(false);
+    }
+
     if (core_) {
-        core_->stop();
-        delete core_;
+        auto *old_core = core_;
         core_ = nullptr;
+        disconnect(old_core, nullptr, this, nullptr);
+        if (pause_action_)
+            disconnect(pause_action_, nullptr, old_core, nullptr);
+        old_core->stop();
+        old_core->deleteLater();
     }
 
     core_kind_ = kind;
@@ -472,6 +528,8 @@ void MainWindow::setCoreKind(CoreKind kind) {
     updateSystemOptionActions();
     if (memory_search_dialog_)
         memory_search_dialog_->setCore(core_);
+
+    switching_core_ = false;
 }
 
 void MainWindow::connectCoreSignals() {
@@ -491,6 +549,8 @@ void MainWindow::updateCoreActions() {
         neocd_core_action_->setChecked(core_kind_ == CoreKind::NeoCd);
     if (fbneo_core_action_)
         fbneo_core_action_->setChecked(core_kind_ == CoreKind::Fbneo);
+    if (fbneo_training_core_action_)
+        fbneo_training_core_action_->setChecked(core_kind_ == CoreKind::FbneoTraining);
     if (core_)
         setWindowTitle(QStringLiteral("qneogeo - %1").arg(core_->displayName()));
 }
@@ -587,14 +647,14 @@ void MainWindow::updateSystemOptionActions() {
     if (mode_group_) {
         for (QAction *action : mode_group_->actions()) {
             action->setChecked(action->data().toString() == core_->systemModeOption());
-            action->setEnabled(core_kind_ == CoreKind::Fbneo);
+            action->setEnabled(core_kind_ == CoreKind::Fbneo || core_kind_ == CoreKind::FbneoTraining);
         }
     }
 
     if (cpu_clock_group_) {
         for (QAction *action : cpu_clock_group_->actions()) {
             action->setChecked(action->data().toString() == core_->fbneoCpuClockOption());
-            action->setEnabled(core_kind_ == CoreKind::Fbneo);
+            action->setEnabled(core_kind_ == CoreKind::Fbneo || core_kind_ == CoreKind::FbneoTraining);
         }
     }
 }
@@ -613,6 +673,8 @@ MainWindow::CoreKind MainWindow::savedCoreKind() const {
                                               QStringLiteral("neocd")).toString();
     if (saved_core == QStringLiteral("fbneo"))
         return CoreKind::Fbneo;
+    if (saved_core == QStringLiteral("fbneo_training"))
+        return CoreKind::FbneoTraining;
 
     return CoreKind::NeoCd;
 }
@@ -622,14 +684,19 @@ void MainWindow::saveCoreKind(CoreKind kind) const {
     QDir().mkpath(file_info.absolutePath());
 
     QSettings settings(inputConfigPath(), QSettings::IniFormat);
-    settings.setValue(QStringLiteral("Core/Selected"),
-                      kind == CoreKind::Fbneo ? QStringLiteral("fbneo") : QStringLiteral("neocd"));
+    QString value = QStringLiteral("neocd");
+    if (kind == CoreKind::Fbneo)
+        value = QStringLiteral("fbneo");
+    else if (kind == CoreKind::FbneoTraining)
+        value = QStringLiteral("fbneo_training");
+
+    settings.setValue(QStringLiteral("Core/Selected"), value);
     settings.sync();
 }
 
 void MainWindow::autoLoadStartupState() {
-    if (core_kind_ != CoreKind::Fbneo)
-        setCoreKind(CoreKind::Fbneo);
+    if (core_kind_ == CoreKind::NeoCd)
+        setCoreKind(CoreKind::FbneoTraining);
 
     QString game_path = QDir(gameRootDirectory()).absoluteFilePath(QStringLiteral("kof98.zip"));
     if (!QFileInfo::exists(game_path)) {
@@ -850,8 +917,7 @@ void MainWindow::updateFpsOverlay(double fps) {
     }
 
     fps_label_->adjustSize();
-    if (health_label_)
-        health_label_->move(fps_label_->x() + fps_label_->width() + 8, fps_label_->y());
+    updateOverlayLabelPositions();
 }
 
 void MainWindow::updateKof98Overlay() {
@@ -891,6 +957,54 @@ void MainWindow::updateKof98Overlay() {
                                .arg(healthText(mem_reader.readP1Health()),
                                     healthText(mem_reader.readP2Health())));
     health_label_->adjustSize();
-    if (fps_label_)
-        health_label_->move(fps_label_->x() + fps_label_->width() + 8, fps_label_->y());
+
+    if (combo_label_) {
+        auto comboText = [](int32_t combo) {
+            if (combo < 0)
+                return QStringLiteral("--");
+
+            return QString::number(combo);
+        };
+
+        combo_label_->setText(QStringLiteral("P1 Combo: %1  P2 Combo: %2")
+                                  .arg(comboText(mem_reader.readP1ComboCount()),
+                                       comboText(mem_reader.readP2ComboCount())));
+        combo_label_->adjustSize();
+    }
+
+    if (power_label_) {
+        auto powerText = [](int32_t value, int32_t stocks) {
+            if (value < 0 || stocks < 0)
+                return QStringLiteral("--/--");
+
+            return QStringLiteral("%1/%2").arg(value).arg(stocks);
+        };
+
+        power_label_->setText(QStringLiteral("P1 POW: %1  P2 POW: %2")
+                                  .arg(powerText(mem_reader.readP1AdvancedPowerValue(),
+                                                 mem_reader.readP1AdvancedPowerStocks()),
+                                       powerText(mem_reader.readP2AdvancedPowerValue(),
+                                                 mem_reader.readP2AdvancedPowerStocks())));
+        power_label_->adjustSize();
+    }
+
+    updateOverlayLabelPositions();
+}
+
+void MainWindow::updateOverlayLabelPositions() {
+    if (!fps_label_)
+        return;
+
+    int32_t x = fps_label_->x() + fps_label_->width() + 8;
+    const int32_t y = fps_label_->y();
+    if (health_label_) {
+        health_label_->move(x, y);
+        x = health_label_->x() + health_label_->width() + 8;
+    }
+    if (combo_label_)
+        combo_label_->move(x, y);
+    if (combo_label_)
+        x = combo_label_->x() + combo_label_->width() + 8;
+    if (power_label_)
+        power_label_->move(x, y);
 }

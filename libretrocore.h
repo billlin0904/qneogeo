@@ -55,8 +55,8 @@ public:
     bool isGameLoaded() const override;
     bool saveState(const QString &statePath) override;
     bool loadState(const QString &statePath) override;
-    bool readSystemRam(QByteArray &ram) const;
-    bool readSystemRamByte(uint32_t address, uint8_t &value) const;
+    virtual bool readSystemRam(QByteArray &ram) const;
+    virtual bool readSystemRamByte(uint32_t address, uint8_t &value) const;
 
     int keyBinding(unsigned retroButtonId) const;
     void setKeyBinding(unsigned retroButtonId, int key);
@@ -97,6 +97,12 @@ protected:
 
     virtual bool coreOptionValue(const QByteArray &key, const char *&value) const;
     virtual void coreOptionsUpdated(const retro_core_options_v2 *options);
+    EmulatorView *videoOutput() const;
+    void setError(const QString &message);
+    void pollXInput();
+    int16_t inputState(unsigned port, unsigned device, unsigned index, unsigned id) const;
+    void finishKeyboardMotionAssist();
+    void finishXInputMotionAssist();
 
     std::string selected_bios_;
     std::string system_region_option_ = "Japan";
@@ -135,21 +141,16 @@ private:
     bool environment(unsigned command, void *data);
     void video(const void *data, unsigned width, unsigned height, size_t pitch);
     size_t audioBatch(const int16_t *data, size_t frames);
-    int16_t inputState(unsigned port, unsigned device, unsigned index, unsigned id) const;
-    void setError(const QString &message);
     bool resolveSymbols();
     void resetSymbols();
     void installCallbacks();
     QByteArray pathToUtf8(const QString &path) const;
     int buttonForKey(int key) const;
     static bool isXInputControlPressed(int control, const void *state);
-    void pollXInput();
     bool initializeResampler(int sourceSampleRate);
     void releaseResampler();
     void applyKeyboardInputState();
     void applyXInputInputState();
-    void finishKeyboardMotionAssist();
-    void finishXInputMotionAssist();
     uint8_t rawKeyboardDirectionBits() const;
     uint8_t rawXInputDirectionBits() const;
     uint8_t cleanedDirectionBits(uint8_t directionBits) const;

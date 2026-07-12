@@ -30,8 +30,14 @@ public:
     int32_t readP2Power() const;
     int32_t readP1PowerState() const;
     int32_t readP2PowerState() const;
+    int32_t readP1AdvancedPowerValue() const;
+    int32_t readP1AdvancedPowerStocks() const;
+    int32_t readP2AdvancedPowerValue() const;
+    int32_t readP2AdvancedPowerStocks() const;
     int32_t readP1Stun() const;
     int32_t readP2Stun() const;
+    int32_t readP1ComboCount() const;
+    int32_t readP2ComboCount() const;
     bool readP1Position(QPoint &position) const;
     bool readP2Position(QPoint &position) const;
 

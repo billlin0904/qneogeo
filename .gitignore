@@ -43,6 +43,11 @@ Thumbs.db
 /roms/
 /saves/
 /system/
+/ai_logs/
+/trained_models/
+/.vscode/
+/.vs/
+**/.vscode/
 
 # qtcreator generated files
 *.pro.user*

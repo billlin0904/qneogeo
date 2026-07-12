@@ -14,7 +14,7 @@ video filters without embedding large shader strings in C++.
   `Scanline-fract`.
 - `frame.vert`: qneogeo's current frame rendering vertex shader.
 - `frame.frag`: qneogeo's current frame rendering fragment shader, including
-  nearest, linear, Super2xSaI, and xBRZ Freescale modes.
+  nearest, linear, and xBRZ Freescale modes.
 
 Source:
 

@@ -204,35 +204,6 @@ EmulatorView::ScalingFilter EmulatorView::scalingFilter() const {
     return scaling_filter_;
 }
 
-void EmulatorView::setSuper2xSaiParameters(float sharpAmount, float edgeBlend, float nearestHold) {
-    sharpAmount = std::clamp(sharpAmount, 0.0f, 1.0f);
-    edgeBlend = std::clamp(edgeBlend, 0.0f, 1.0f);
-    nearestHold = std::clamp(nearestHold, 0.0f, 1.0f);
-
-    if (super2xsai_sharp_amount_ == sharpAmount &&
-        super2xsai_edge_blend_ == edgeBlend &&
-        super2xsai_nearest_hold_ == nearestHold) {
-        return;
-    }
-
-    super2xsai_sharp_amount_ = sharpAmount;
-    super2xsai_edge_blend_ = edgeBlend;
-    super2xsai_nearest_hold_ = nearestHold;
-    update();
-}
-
-float EmulatorView::super2xSaiSharpAmount() const {
-    return super2xsai_sharp_amount_;
-}
-
-float EmulatorView::super2xSaiEdgeBlend() const {
-    return super2xsai_edge_blend_;
-}
-
-float EmulatorView::super2xSaiNearestHold() const {
-    return super2xsai_nearest_hold_;
-}
-
 void EmulatorView::submitFrame(const void *pixels, int width, int height, int pitch, PixelFormat format) {
     if (shutting_down_)
         return;
@@ -365,9 +336,6 @@ void EmulatorView::initializeGL() {
     program_.setUniformValue("textureSize", QVector2D(1.0f, 1.0f));
     program_.setUniformValue("outputSize", QVector2D(1.0f, 1.0f));
     program_.setUniformValue("scalingFilter", 0);
-    program_.setUniformValue("sharpAmount", super2xsai_sharp_amount_);
-    program_.setUniformValue("edgeBlend", super2xsai_edge_blend_);
-    program_.setUniformValue("nearestHold", super2xsai_nearest_hold_);
     program_.release();
 
     vertex_buffer_.release();
@@ -447,9 +415,6 @@ void EmulatorView::paintGL() {
         active_program->setUniformValue("textureSize", texture_size);
         active_program->setUniformValue("outputSize", output_size);
         active_program->setUniformValue("scalingFilter", static_cast<int>(scaling_filter_));
-        active_program->setUniformValue("sharpAmount", super2xsai_sharp_amount_);
-        active_program->setUniformValue("edgeBlend", super2xsai_edge_blend_);
-        active_program->setUniformValue("nearestHold", super2xsai_nearest_hold_);
     }
 
     QOpenGLVertexArrayObject::Binder vertex_array_binder(&vertex_array_);

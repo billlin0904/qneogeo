@@ -23,6 +23,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cmath>
+#include <stdexcept>
+#include <type_traits>
 
 LibretroCore *LibretroCore::active_core_ = nullptr;
 
@@ -63,6 +65,21 @@ QString bindingSettingName(unsigned retroButtonId) {
     default:
         return QStringLiteral("Button%1").arg(retroButtonId);
     }
+}
+
+template <typename T>
+T resolveSymbol(QLibrary &library, const char *name) {
+    static_assert(
+        std::is_pointer_v<T> &&
+        std::is_function_v<std::remove_pointer_t<T>>,
+        "T must be a function pointer type"
+    );
+
+    auto symbol = library.resolve(name);
+    if (!symbol)
+        throw std::runtime_error(name);
+
+    return reinterpret_cast<T>(symbol);
 }
 }
 
@@ -294,6 +311,10 @@ bool LibretroCore::coreOptionValue(const QByteArray &, const char *&) const {
 }
 
 void LibretroCore::coreOptionsUpdated(const retro_core_options_v2 *) {
+}
+
+EmulatorView *LibretroCore::videoOutput() const {
+    return video_output_;
 }
 
 void LibretroCore::setPaused(bool paused) {
@@ -657,7 +678,7 @@ QString LibretroCore::xinputControlName(int control) {
 
 int LibretroCore::firstPressedXInputControl(unsigned userIndex) {
     XINPUT_STATE state {};
-    if (XInputGetState(userIndex, &state) != ERROR_SUCCESS)
+    if (::XInputGetState(userIndex, &state) != ERROR_SUCCESS)
         return XInputNone;
 
     constexpr int controls[] = {
@@ -1054,32 +1075,30 @@ void LibretroCore::setError(const QString &message) {
 }
 
 bool LibretroCore::resolveSymbols() {
-    retro_set_environment_ = reinterpret_cast<retro_set_environment_t>(library_.resolve("retro_set_environment"));
-    retro_set_video_refresh_ = reinterpret_cast<retro_set_video_refresh_t>(library_.resolve("retro_set_video_refresh"));
-    retro_set_audio_sample_ = reinterpret_cast<retro_set_audio_sample_t>(library_.resolve("retro_set_audio_sample"));
-    retro_set_audio_sample_batch_ = reinterpret_cast<retro_set_audio_sample_batch_t>(library_.resolve("retro_set_audio_sample_batch"));
-    retro_set_input_poll_ = reinterpret_cast<retro_set_input_poll_t>(library_.resolve("retro_set_input_poll"));
-    retro_set_input_state_ = reinterpret_cast<retro_set_input_state_t>(library_.resolve("retro_set_input_state"));
-    retro_init_ = reinterpret_cast<retro_init_t>(library_.resolve("retro_init"));
-    retro_deinit_ = reinterpret_cast<retro_deinit_t>(library_.resolve("retro_deinit"));
-    retro_reset_ = reinterpret_cast<retro_reset_t>(library_.resolve("retro_reset"));
-    retro_load_game_ = reinterpret_cast<retro_load_game_t>(library_.resolve("retro_load_game"));
-    retro_unload_game_ = reinterpret_cast<retro_unload_game_t>(library_.resolve("retro_unload_game"));
-    retro_run_ = reinterpret_cast<retro_run_t>(library_.resolve("retro_run"));
-    retro_get_system_info_ = reinterpret_cast<retro_get_system_info_t>(library_.resolve("retro_get_system_info"));
-    retro_get_system_av_info_ = reinterpret_cast<retro_get_system_av_info_t>(library_.resolve("retro_get_system_av_info"));
-    retro_serialize_size_ = reinterpret_cast<retro_serialize_size_t>(library_.resolve("retro_serialize_size"));
-    retro_serialize_ = reinterpret_cast<retro_serialize_t>(library_.resolve("retro_serialize"));
-    retro_unserialize_ = reinterpret_cast<retro_unserialize_t>(library_.resolve("retro_unserialize"));
-    retro_get_memory_data_ = reinterpret_cast<retro_get_memory_data_t>(library_.resolve("retro_get_memory_data"));
-    retro_get_memory_size_ = reinterpret_cast<retro_get_memory_size_t>(library_.resolve("retro_get_memory_size"));
+    try {
+        retro_set_environment_ = resolveSymbol<retro_set_environment_t>(library_, "retro_set_environment");
+        retro_set_video_refresh_ = resolveSymbol<retro_set_video_refresh_t>(library_, "retro_set_video_refresh");
+        retro_set_audio_sample_ = resolveSymbol<retro_set_audio_sample_t>(library_, "retro_set_audio_sample");
+        retro_set_audio_sample_batch_ = resolveSymbol<retro_set_audio_sample_batch_t>(library_, "retro_set_audio_sample_batch");
+        retro_set_input_poll_ = resolveSymbol<retro_set_input_poll_t>(library_, "retro_set_input_poll");
+        retro_set_input_state_ = resolveSymbol<retro_set_input_state_t>(library_, "retro_set_input_state");
+        retro_init_ = resolveSymbol<retro_init_t>(library_, "retro_init");
+        retro_deinit_ = resolveSymbol<retro_deinit_t>(library_, "retro_deinit");
+        retro_reset_ = resolveSymbol<retro_reset_t>(library_, "retro_reset");
+        retro_load_game_ = resolveSymbol<retro_load_game_t>(library_, "retro_load_game");
+        retro_unload_game_ = resolveSymbol<retro_unload_game_t>(library_, "retro_unload_game");
+        retro_run_ = resolveSymbol<retro_run_t>(library_, "retro_run");
+        retro_get_system_info_ = resolveSymbol<retro_get_system_info_t>(library_, "retro_get_system_info");
+        retro_get_system_av_info_ = resolveSymbol<retro_get_system_av_info_t>(library_, "retro_get_system_av_info");
+        retro_serialize_size_ = resolveSymbol<retro_serialize_size_t>(library_, "retro_serialize_size");
+        retro_serialize_ = resolveSymbol<retro_serialize_t>(library_, "retro_serialize");
+        retro_unserialize_ = resolveSymbol<retro_unserialize_t>(library_, "retro_unserialize");
+        retro_get_memory_data_ = resolveSymbol<retro_get_memory_data_t>(library_, "retro_get_memory_data");
+        retro_get_memory_size_ = resolveSymbol<retro_get_memory_size_t>(library_, "retro_get_memory_size");
 
-    if (!retro_set_environment_ || !retro_set_video_refresh_ || !retro_set_audio_sample_ ||
-        !retro_set_audio_sample_batch_ || !retro_set_input_poll_ || !retro_set_input_state_ ||
-        !retro_init_ || !retro_deinit_ || !retro_reset_ || !retro_load_game_ || !retro_unload_game_ ||
-        !retro_run_ || !retro_get_system_info_ || !retro_get_system_av_info_ ||
-        !retro_serialize_size_ || !retro_serialize_ || !retro_unserialize_) {
-        setError(QStringLiteral("%1 is missing required libretro exports.").arg(coreFileName()));
+    } catch (const std::exception &exception) {
+        setError(QStringLiteral("%1 is missing required libretro export: %2")
+                     .arg(coreFileName(), QString::fromLatin1(exception.what())));
         resetSymbols();
         return false;
     }
