@@ -341,6 +341,7 @@ def main() -> int:
             self.reward_super = 0.0
             self.reward_anti_air = 0.0
             self.reward_safety = 0.0
+            self.reward_fast_win = 0.0
             self.reward_time = 0.0
 
         def _on_step(self) -> bool:
@@ -397,6 +398,7 @@ def main() -> int:
                 self.reward_super += float(info.get("reward_super", 0.0))
                 self.reward_anti_air += float(info.get("reward_anti_air", 0.0))
                 self.reward_safety += float(info.get("reward_safety", 0.0))
+                self.reward_fast_win += float(info.get("reward_fast_win", 0.0))
                 self.reward_time += float(info.get("reward_time", 0.0))
 
             return True
@@ -464,6 +466,7 @@ def main() -> int:
             self.logger.record("kof/reward_super_total", self.reward_super)
             self.logger.record("kof/reward_anti_air_total", self.reward_anti_air)
             self.logger.record("kof/reward_safety_total", self.reward_safety)
+            self.logger.record("kof/reward_fast_win_total", self.reward_fast_win)
             self.logger.record("kof/reward_time_total", self.reward_time)
             self.reset_rollout_metrics()
 

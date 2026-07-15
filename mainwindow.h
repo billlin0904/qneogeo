@@ -75,6 +75,7 @@ private:
     QVector<QAction *> save_state_actions_;
     QVector<QAction *> load_state_actions_;
     QAction *pause_when_inactive_action_;
+    QAction *gameplay_with_ai_p2_action_;
     QAction *show_fps_action_;
     QAction *show_hitboxes_action_;
     QAction *neocd_core_action_;

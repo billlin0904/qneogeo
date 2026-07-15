@@ -28,6 +28,7 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QStatusBar>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -49,6 +50,7 @@ MainWindow::MainWindow(QWidget *parent)
     , pause_action_(nullptr)
     , reset_emulation_action_(nullptr)
     , pause_when_inactive_action_(nullptr)
+    , gameplay_with_ai_p2_action_(nullptr)
     , show_fps_action_(nullptr)
     , show_hitboxes_action_(nullptr)
     , neocd_core_action_(nullptr)
@@ -230,6 +232,13 @@ MainWindow::MainWindow(QWidget *parent)
     pause_when_inactive_action_->setChecked(true);
 
     auto *tools_menu = menuBar()->addMenu(QStringLiteral("Tools"));
+    gameplay_with_ai_p2_action_ = tools_menu->addAction(QStringLiteral("GamePlay With AI (P2)"));
+    gameplay_with_ai_p2_action_->setCheckable(true);
+    {
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        gameplay_with_ai_p2_action_->setChecked(
+            settings.value(QStringLiteral("AI/GamePlayWithP2"), false).toBool());
+    }
     auto *memory_search_action = tools_menu->addAction(QStringLiteral("Memory View"));
 
     auto *video_menu = menuBar()->addMenu(QStringLiteral("Video"));
@@ -337,6 +346,15 @@ MainWindow::MainWindow(QWidget *parent)
         });
     }
     connect(memory_search_action, &QAction::triggered, this, &MainWindow::showMemorySearchDialog);
+    connect(gameplay_with_ai_p2_action_, &QAction::toggled, this, [this](bool enabled) {
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        settings.setValue(QStringLiteral("AI/GamePlayWithP2"), enabled);
+        settings.sync();
+        statusBar()->showMessage(enabled
+                                     ? QStringLiteral("GamePlay With AI (P2) enabled")
+                                     : QStringLiteral("GamePlay With AI (P2) disabled"),
+                                 2500);
+    });
 
     connect(show_fps_action_, &QAction::toggled, fps_label_, &QLabel::setVisible);
     connect(show_fps_action_, &QAction::toggled, health_label_, &QLabel::setVisible);

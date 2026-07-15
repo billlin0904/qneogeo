@@ -121,6 +121,7 @@ ATTACK_RISK_CLOSE_DISTANCE = 55
 ATTACK_RISK_PUNISH_PENALTY = 4.0
 ATTACK_RISK_UNSAFE_CLOSE_PENALTY = 0.12
 ATTACK_RISK_SAFE_REWARD = 0.05
+FAST_WIN_BONUS_MAX = 15.0
 
 
 def can_use_super(observation: Optional["Kof98Observation"]) -> bool:
@@ -576,6 +577,7 @@ class Kof98Env(gym.Env if gym else object):
             "reward_super": reward_parts["super"],
             "reward_anti_air": reward_parts["anti_air"],
             "reward_safety": reward_parts["safety"],
+            "reward_fast_win": reward_parts["fast_win"],
             "reward_time": reward_parts["time"],
         }
         return observation_to_vector(observation), reward, terminated, truncated, info
@@ -661,6 +663,7 @@ class Kof98Env(gym.Env if gym else object):
             "super": 0.0,
             "anti_air": 0.0,
             "safety": 0.0,
+            "fast_win": 0.0,
             "time": -0.001,
         }
         if previous is None:
@@ -700,6 +703,10 @@ class Kof98Env(gym.Env if gym else object):
         if action_id in SUPER_ACTION_IDS and not super_available:
             reward_parts["super"] -= SUPER_NO_STOCK_PENALTY
 
+        if previous.p2_health > 0 and 0 <= current.p2_health <= 0:
+            remaining_time = max(0.0, min(99.0, float(current.round_time)))
+            reward_parts["fast_win"] += FAST_WIN_BONUS_MAX * (remaining_time / 99.0)
+
         if current.p1_has_position and current.p2_has_position:
             distance = abs(current.distance_x)
             if EFFECTIVE_DISTANCE_MIN <= distance <= EFFECTIVE_DISTANCE_MAX:
@@ -721,6 +728,7 @@ class Kof98Env(gym.Env if gym else object):
             + reward_parts["super"]
             + reward_parts["anti_air"]
             + reward_parts["safety"]
+            + reward_parts["fast_win"]
             + reward_parts["time"]
         )
         return reward, reward_parts

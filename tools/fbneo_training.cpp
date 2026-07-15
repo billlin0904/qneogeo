@@ -10,9 +10,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "../gamememreadercore.h"
@@ -95,6 +97,230 @@ FbneoTrainingRuntime *g_active_runtime = nullptr;
 struct InputFrame {
     kof_env_joypad_state state {};
     int32_t frames = 0;
+};
+
+enum class CharacterID {
+    Kyo,
+};
+
+using CharacterActionTable = std::map<int32_t, std::vector<InputFrame>>;
+
+void setForwardOn(kof_env_joypad_state &input, bool forward_is_right) {
+    if (forward_is_right)
+        input.right = 1;
+    else
+        input.left = 1;
+}
+
+void setBackOn(kof_env_joypad_state &input, bool forward_is_right) {
+    if (forward_is_right)
+        input.left = 1;
+    else
+        input.right = 1;
+}
+
+std::vector<InputFrame> simpleAction(const kof_env_joypad_state &input) {
+    return {
+        { input, 4 },
+        { {}, 2 },
+    };
+}
+
+CharacterActionTable buildCharacterActions(bool forward_is_right) {
+    auto forward = [forward_is_right] {
+        kof_env_joypad_state input {};
+        setForwardOn(input, forward_is_right);
+        return input;
+    };
+    auto back = [forward_is_right] {
+        kof_env_joypad_state input {};
+        setBackOn(input, forward_is_right);
+        return input;
+    };
+    auto down = [] {
+        kof_env_joypad_state input {};
+        input.down = 1;
+        return input;
+    };
+    auto up_forward = [forward_is_right] {
+        kof_env_joypad_state input {};
+        input.up = 1;
+        setForwardOn(input, forward_is_right);
+        return input;
+    };
+    auto down_forward = [forward_is_right] {
+        kof_env_joypad_state input {};
+        input.down = 1;
+        setForwardOn(input, forward_is_right);
+        return input;
+    };
+    auto down_back = [forward_is_right] {
+        kof_env_joypad_state input {};
+        input.down = 1;
+        setBackOn(input, forward_is_right);
+        return input;
+    };
+
+    kof_env_joypad_state crouch_back = down_back();
+    kof_env_joypad_state neutral_a {};
+    neutral_a.a = 1;
+    kof_env_joypad_state neutral_b {};
+    neutral_b.b = 1;
+    kof_env_joypad_state neutral_c {};
+    neutral_c.c = 1;
+    kof_env_joypad_state neutral_d {};
+    neutral_d.d = 1;
+    kof_env_joypad_state crouch_a = down();
+    crouch_a.a = 1;
+    kof_env_joypad_state crouch_b = down();
+    crouch_b.b = 1;
+    kof_env_joypad_state crouch_c = down();
+    crouch_c.c = 1;
+    kof_env_joypad_state crouch_d = down();
+    crouch_d.d = 1;
+
+    kof_env_joypad_state qcf_a = down_forward();
+    qcf_a.a = 1;
+    kof_env_joypad_state qcf_c = down_forward();
+    qcf_c.c = 1;
+    kof_env_joypad_state hcb_c = back();
+    hcb_c.c = 1;
+    kof_env_joypad_state hcb_d = back();
+    hcb_d.d = 1;
+    kof_env_joypad_state dp_a = down_forward();
+    dp_a.a = 1;
+    kof_env_joypad_state red_kick_b = down_back();
+    red_kick_b.b = 1;
+    kof_env_joypad_state super_a = forward();
+    super_a.a = 1;
+    kof_env_joypad_state jump_forward_c = forward();
+    jump_forward_c.c = 1;
+    kof_env_joypad_state jump_forward_d = forward();
+    jump_forward_d.d = 1;
+    kof_env_joypad_state forward_b = forward();
+    forward_b.b = 1;
+
+    CharacterActionTable kyo {
+        { 0, { { {}, 6 } } },
+        { 1, simpleAction(forward()) },
+        { 2, simpleAction(back()) },
+        { 3, simpleAction(crouch_back) },
+        { 4, simpleAction(back()) },
+        { 5, simpleAction(up_forward()) },
+        { 6, simpleAction(neutral_a) },
+        { 7, simpleAction(neutral_b) },
+        { 8, simpleAction(neutral_c) },
+        { 9, simpleAction(neutral_d) },
+        { 10, simpleAction(crouch_a) },
+        { 11, simpleAction(crouch_b) },
+        { 12, simpleAction(crouch_c) },
+        { 13, simpleAction(crouch_d) },
+        { 14, {
+            { down(), 2 },
+            { down_forward(), 2 },
+            { qcf_a, 2 },
+            { {}, 4 },
+        } },
+        { 15, {
+            { {}, 9 },
+            { down(), 2 },
+            { down_forward(), 2 },
+            { qcf_c, 4 },
+            { {}, 18 },
+            { forward(), 2 },
+            { down_forward(), 2 },
+            { down(), 2 },
+            { down_back(), 2 },
+            { hcb_c, 4 },
+            { {}, 16 },
+            { qcf_c, 4 },
+            { {}, 10 },
+        } },
+        { 16, {
+            { {}, 9 },
+            { forward(), 2 },
+            { down_forward(), 2 },
+            { down(), 2 },
+            { down_back(), 2 },
+            { hcb_d, 4 },
+            { {}, 12 },
+        } },
+        { 17, {
+            { forward(), 2 },
+            { down(), 2 },
+            { dp_a, 4 },
+            { {}, 8 },
+        } },
+        { 18, {
+            { back(), 2 },
+            { down(), 2 },
+            { red_kick_b, 4 },
+            { {}, 8 },
+        } },
+        { 19, {
+            { down(), 2 },
+            { down_back(), 2 },
+            { back(), 2 },
+            { down_back(), 2 },
+            { down(), 2 },
+            { down_forward(), 2 },
+            { super_a, 5 },
+            { {}, 12 },
+        } },
+        { 20, {
+            { down(), 2 },
+            { down_forward(), 2 },
+            { forward(), 2 },
+            { down(), 2 },
+            { down_forward(), 2 },
+            { super_a, 5 },
+            { {}, 12 },
+        } },
+        { 21, {
+            { up_forward(), 2 },
+            { forward(), 12 },
+            { jump_forward_c, 5 },
+            { {}, 18 },
+        } },
+        { 22, {
+            { up_forward(), 2 },
+            { forward(), 12 },
+            { jump_forward_d, 5 },
+            { {}, 10 },
+        } },
+        { 23, {
+            { forward_b, 5 },
+            { {}, 8 },
+        } },
+    };
+
+    return kyo;
+}
+
+
+class CharacterActionMapLut {
+public:
+    CharacterActionMapLut() {
+        lut_.insert(std::make_pair(
+            CharacterID::Kyo,
+            std::make_pair(buildCharacterActions(true), buildCharacterActions(false))));
+    }
+
+    void setCharacter(CharacterID id) {
+        current_character_ = id;
+    }
+
+    const CharacterActionTable *getAction(bool forward_is_right) const {
+        const auto it = lut_.find(current_character_);
+        if (it != lut_.end()) {
+            return (forward_is_right ? &it->second.first : &it->second.second);
+        }
+        return nullptr;
+    }
+
+private:
+	CharacterID current_character_ = CharacterID::Kyo;
+	std::map<CharacterID, std::pair<CharacterActionTable, CharacterActionTable>> lut_;
 };
 
 class FbneoTrainingRuntime {
@@ -273,8 +499,6 @@ public:
         if (!active_script_.empty())
             return true;
 
-        kof_env_joypad_state state {};
-
         kof_env_observation observation {};
         const bool has_observation = getObservation(&observation);
         bool facing_left = false;
@@ -288,332 +512,15 @@ public:
 
         const bool p2_is_right = !has_observation || observation.p2_x >= observation.p1_x;
         const bool forward_is_right = has_facing ? !facing_left : p2_is_right;
-        auto setForward = [&] {
-            if (forward_is_right)
-                state.right = 1;
-            else
-                state.left = 1;
-        };
-        auto setBack = [&] {
-            if (forward_is_right)
-                state.left = 1;
-            else
-                state.right = 1;
-        };
-        auto setForwardOn = [forward_is_right](kof_env_joypad_state &input) {
-            if (forward_is_right)
-                input.right = 1;
-            else
-                input.left = 1;
-        };
-        auto setBackOn = [forward_is_right](kof_env_joypad_state &input) {
-            if (forward_is_right)
-                input.left = 1;
-            else
-                input.right = 1;
-        };
-        auto startSimpleAction = [&](const kof_env_joypad_state &input) {
-            return startActionScript({
-                { input, 4 },
-                { {}, 2 },
-            });
-        };
+        const CharacterActionTable *actions = action_lut_.getAction(forward_is_right);
+        if (!actions)
+            return fail("Character action table is missing.");
 
-        switch (action_id) {
-        case 0:
-            return startActionScript({
-                { {}, 6 },
-            });
-        case 1:
-            setForward();
-            return startSimpleAction(state);
-        case 2:
-            setBack();
-            return startSimpleAction(state);
-        case 3:
-            state.down = 1;
-            setBack();
-            return startSimpleAction(state);
-        case 4:
-            setBack();
-            return startSimpleAction(state);
-        case 5:
-            state.up = 1;
-            setForward();
-            return startSimpleAction(state);
-        case 6:
-            state.a = 1;
-            return startSimpleAction(state);
-        case 7:
-            state.b = 1;
-            return startSimpleAction(state);
-        case 8:
-            state.c = 1;
-            return startSimpleAction(state);
-        case 9:
-            state.d = 1;
-            return startSimpleAction(state);
-        case 10:
-            state.down = 1;
-            state.a = 1;
-            return startSimpleAction(state);
-        case 11:
-            state.down = 1;
-            state.b = 1;
-            return startSimpleAction(state);
-        case 12:
-            state.down = 1;
-            state.c = 1;
-            return startSimpleAction(state);
-        case 13:
-            state.down = 1;
-            state.d = 1;
-            return startSimpleAction(state);
-        case 14:
-        {
-            kof_env_joypad_state down {};
-            down.down = 1;
-
-            kof_env_joypad_state down_forward {};
-            down_forward.down = 1;
-            setForwardOn(down_forward);
-
-            kof_env_joypad_state forward_a {};
-            setForwardOn(forward_a);
-            forward_a.a = 1;
-
-            return startActionScript({
-                { down, 2 },
-                { down_forward, 2 },
-                { forward_a, 2 },
-                { {}, 4 },
-            });
-        }
-        case 15:
-        {
-            kof_env_joypad_state down {};
-            down.down = 1;
-
-            kof_env_joypad_state down_forward {};
-            down_forward.down = 1;
-            setForwardOn(down_forward);
-
-            kof_env_joypad_state poison_bite_forward_c {};
-            setForwardOn(poison_bite_forward_c);
-            poison_bite_forward_c.c = 1;
-
-            kof_env_joypad_state forward {};
-            setForwardOn(forward);
-
-            kof_env_joypad_state down_back {};
-            down_back.down = 1;
-            setBackOn(down_back);
-
-            kof_env_joypad_state back_c {};
-            setBackOn(back_c);
-            back_c.c = 1;
-
-            kof_env_joypad_state final_forward_c {};
-            setForwardOn(final_forward_c);
-            final_forward_c.c = 1;
-
-            return startActionScript({
-                { {}, 9 },
-                { down, 2 },
-                { down_forward, 2 },
-                { poison_bite_forward_c, 4 },
-                { {}, 18 },
-                { forward, 2 },
-                { down_forward, 2 },
-                { down, 2 },
-                { down_back, 2 },
-                { back_c, 4 },
-                { {}, 16 },
-                { final_forward_c, 4 },
-                { {}, 10 },
-            });
-        }
-        case 16:
-        {
-            kof_env_joypad_state forward {};
-            setForwardOn(forward);
-
-            kof_env_joypad_state down_forward {};
-            down_forward.down = 1;
-            setForwardOn(down_forward);
-
-            kof_env_joypad_state down {};
-            down.down = 1;
-
-            kof_env_joypad_state down_back {};
-            down_back.down = 1;
-            setBackOn(down_back);
-
-            kof_env_joypad_state back_d {};
-            setBackOn(back_d);
-            back_d.d = 1;
-
-            return startActionScript({
-                { {}, 9 },
-                { forward, 2 },
-                { down_forward, 2 },
-                { down, 2 },
-                { down_back, 2 },
-                { back_d, 4 },
-                { {}, 12 },
-            });
-        }
-        case 17:
-        {
-            kof_env_joypad_state forward {};
-            setForwardOn(forward);
-
-            kof_env_joypad_state down {};
-            down.down = 1;
-
-            kof_env_joypad_state down_forward_a {};
-            down_forward_a.down = 1;
-            setForwardOn(down_forward_a);
-            down_forward_a.a = 1;
-
-            return startActionScript({
-                { forward, 2 },
-                { down, 2 },
-                { down_forward_a, 4 },
-                { {}, 8 },
-            });
-        }
-        case 18:
-        {
-            kof_env_joypad_state back {};
-            setBackOn(back);
-
-            kof_env_joypad_state down {};
-            down.down = 1;
-
-            kof_env_joypad_state down_back_b {};
-            down_back_b.down = 1;
-            setBackOn(down_back_b);
-            down_back_b.b = 1;
-
-            return startActionScript({
-                { back, 2 },
-                { down, 2 },
-                { down_back_b, 4 },
-                { {}, 8 },
-            });
-        }
-        case 19:
-        {
-            kof_env_joypad_state down {};
-            down.down = 1;
-
-            kof_env_joypad_state down_back {};
-            down_back.down = 1;
-            setBackOn(down_back);
-
-            kof_env_joypad_state back {};
-            setBackOn(back);
-
-            kof_env_joypad_state down_forward {};
-            down_forward.down = 1;
-            setForwardOn(down_forward);
-
-            kof_env_joypad_state forward_a {};
-            setForwardOn(forward_a);
-            forward_a.a = 1;
-
-            return startActionScript({
-                { down, 2 },
-                { down_back, 2 },
-                { back, 2 },
-                { down_back, 2 },
-                { down, 2 },
-                { down_forward, 2 },
-                { forward_a, 5 },
-                { {}, 12 },
-            });
-        }
-        case 20:
-        {
-            kof_env_joypad_state down {};
-            down.down = 1;
-
-            kof_env_joypad_state down_forward {};
-            down_forward.down = 1;
-            setForwardOn(down_forward);
-
-            kof_env_joypad_state forward {};
-            setForwardOn(forward);
-
-            kof_env_joypad_state forward_a {};
-            setForwardOn(forward_a);
-            forward_a.a = 1;
-
-            return startActionScript({
-                { down, 2 },
-                { down_forward, 2 },
-                { forward, 2 },
-                { down, 2 },
-                { down_forward, 2 },
-                { forward_a, 5 },
-                { {}, 12 },
-            });
-        }
-        case 21:
-        {
-            kof_env_joypad_state up_forward {};
-            up_forward.up = 1;
-            setForwardOn(up_forward);
-
-            kof_env_joypad_state forward{};
-            setForwardOn(forward);
-
-            kof_env_joypad_state forward_c {};
-            setForwardOn(forward_c);
-            forward_c.c = 1;
-
-            return startActionScript({
-                { up_forward, 2 },
-                { forward, 12 },
-                { forward_c, 5 },
-                { {}, 18 },
-            });
-        }
-        case 22:
-        {
-            kof_env_joypad_state up_forward {};
-            up_forward.up = 1;
-            setForwardOn(up_forward);
-
-            kof_env_joypad_state forward {};
-            setForwardOn(forward);
-
-            kof_env_joypad_state forward_d {};
-            setForwardOn(forward_d);
-            forward_d.d = 1;
-
-            return startActionScript({
-                { up_forward, 2 },
-                { forward, 12 },
-                { forward_d, 5 },
-                { {}, 10 },
-            });
-        }
-        case 23:
-        {
-            kof_env_joypad_state forward_b {};
-            setForwardOn(forward_b);
-            forward_b.b = 1;
-
-            return startActionScript({
-                { forward_b, 5 },
-                { {}, 8 },
-            });
-        }
-        default:
+        const auto action_it = actions->find(action_id);
+        if (action_it == actions->cend())
             return fail("Action id is out of range.");
-        }
+
+        return startActionScript(action_it->second);
     }
 
     bool runFrames(int32_t frame_count) {
@@ -1014,6 +921,7 @@ private:
     std::vector<InputFrame> active_script_;
     size_t active_script_index_ = 0;
     int32_t active_script_remaining_frames_ = 0;
+    CharacterActionMapLut action_lut_;
     std::string game_path_utf8_;
     std::string system_directory_utf8_;
     std::string save_directory_utf8_;
