@@ -1,8 +1,10 @@
 #include "fbneotrainingcore.h"
 
+#include <QApplication>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
+#include <QKeyEvent>
 
 #include <stdexcept>
 #include <type_traits>
@@ -189,6 +191,14 @@ bool FbneoTrainingCore::readSystemRamByte(uint32_t address, uint8_t &value) cons
     return true;
 }
 
+void FbneoTrainingCore::setP2RandomAiEnabled(bool enabled) {
+    p2_random_ai_enabled_ = enabled;
+    if (handle_ && kof_env_set_p2_random_ai_)
+        kof_env_set_p2_random_ai_(handle_, enabled ? 1 : 0);
+    if (!enabled)
+        updateJoypad();
+}
+
 QString FbneoTrainingCore::displayName() const {
     return QStringLiteral("FBNeo Training DLL");
 }
@@ -233,7 +243,10 @@ bool FbneoTrainingCore::resolveSymbols() {
         kof_env_load_state_ = resolveSymbol<kof_env_load_state_t>("kof_env_load_state");
         kof_env_save_state_ = resolveSymbol<kof_env_save_state_t>("kof_env_save_state");
         kof_env_set_joypad_ = resolveSymbol<kof_env_set_joypad_t>("kof_env_set_joypad");
+        kof_env_set_joypad_for_port_ =
+            resolveSymbol<kof_env_set_joypad_for_port_t>("kof_env_set_joypad_for_port");
         kof_env_set_video_refresh_ = resolveSymbol<kof_env_set_video_refresh_t>("kof_env_set_video_refresh");
+        kof_env_set_p2_random_ai_ = resolveSymbol<kof_env_set_p2_random_ai_t>("kof_env_set_p2_random_ai");
         kof_env_run_frames_ = resolveSymbol<kof_env_run_frames_t>("kof_env_run_frames");
         kof_env_system_ram_size_ = resolveSymbol<kof_env_system_ram_size_t>("kof_env_system_ram_size");
         kof_env_copy_system_ram_ = resolveSymbol<kof_env_copy_system_ram_t>("kof_env_copy_system_ram");
@@ -254,6 +267,8 @@ bool FbneoTrainingCore::recreateRuntime() {
         return fail(QStringLiteral("kof_env_create failed."));
 
     kof_env_set_video_refresh_(handle_, videoRefreshCallback, this);
+    if (kof_env_set_p2_random_ai_)
+        kof_env_set_p2_random_ai_(handle_, p2_random_ai_enabled_ ? 1 : 0);
     return true;
 }
 
@@ -294,7 +309,9 @@ void FbneoTrainingCore::unloadLibrary() {
     kof_env_load_state_ = nullptr;
     kof_env_save_state_ = nullptr;
     kof_env_set_joypad_ = nullptr;
+    kof_env_set_joypad_for_port_ = nullptr;
     kof_env_set_video_refresh_ = nullptr;
+    kof_env_set_p2_random_ai_ = nullptr;
     kof_env_run_frames_ = nullptr;
     kof_env_system_ram_size_ = nullptr;
     kof_env_copy_system_ram_ = nullptr;
@@ -354,6 +371,73 @@ void FbneoTrainingCore::updateJoypad() {
     }
 
     kof_env_set_joypad_(handle_, &state);
+
+    if (!p2_random_ai_enabled_ && kof_env_set_joypad_for_port_) {
+        auto p2Pressed = [this](unsigned id) -> uint8_t {
+            return id < p2_keyboard_joypad_state_.size() && p2_keyboard_joypad_state_[id] ? 1 : 0;
+        };
+
+        kof_env_joypad_state p2_state {};
+        p2_state.up = p2Pressed(RETRO_DEVICE_ID_JOYPAD_UP);
+        p2_state.down = p2Pressed(RETRO_DEVICE_ID_JOYPAD_DOWN);
+        p2_state.left = p2Pressed(RETRO_DEVICE_ID_JOYPAD_LEFT);
+        p2_state.right = p2Pressed(RETRO_DEVICE_ID_JOYPAD_RIGHT);
+        p2_state.start = p2Pressed(RETRO_DEVICE_ID_JOYPAD_START);
+        p2_state.coin = p2Pressed(RETRO_DEVICE_ID_JOYPAD_SELECT);
+        p2_state.a = p2Pressed(RETRO_DEVICE_ID_JOYPAD_B);
+        p2_state.b = p2Pressed(RETRO_DEVICE_ID_JOYPAD_A);
+        p2_state.c = p2Pressed(RETRO_DEVICE_ID_JOYPAD_Y);
+        p2_state.d = p2Pressed(RETRO_DEVICE_ID_JOYPAD_X);
+
+        kof_env_set_joypad_for_port_(handle_, 1, &p2_state);
+    }
+}
+
+int FbneoTrainingCore::p2ButtonForKey(int key) const {
+    switch (key) {
+    case Qt::Key_I:
+        return RETRO_DEVICE_ID_JOYPAD_UP;
+    case Qt::Key_K:
+        return RETRO_DEVICE_ID_JOYPAD_DOWN;
+    case Qt::Key_J:
+        return RETRO_DEVICE_ID_JOYPAD_LEFT;
+    case Qt::Key_L:
+        return RETRO_DEVICE_ID_JOYPAD_RIGHT;
+    case Qt::Key_8:
+        return RETRO_DEVICE_ID_JOYPAD_START;
+    case Qt::Key_7:
+        return RETRO_DEVICE_ID_JOYPAD_SELECT;
+    case Qt::Key_U:
+        return RETRO_DEVICE_ID_JOYPAD_B;
+    case Qt::Key_O:
+        return RETRO_DEVICE_ID_JOYPAD_A;
+    case Qt::Key_H:
+        return RETRO_DEVICE_ID_JOYPAD_Y;
+    case Qt::Key_Semicolon:
+        return RETRO_DEVICE_ID_JOYPAD_X;
+    default:
+        return -1;
+    }
+}
+
+bool FbneoTrainingCore::eventFilter(QObject *watched, QEvent *event) {
+    if (QApplication::activeModalWidget())
+        return LibretroCore::eventFilter(watched, event);
+
+    if (event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) {
+        auto *key_event = static_cast<QKeyEvent *>(event);
+        const int button = p2ButtonForKey(key_event->key());
+        if (button >= 0) {
+            if (!key_event->isAutoRepeat()) {
+                p2_keyboard_joypad_state_[static_cast<size_t>(button)] = event->type() == QEvent::KeyPress;
+                if (!p2_random_ai_enabled_)
+                    updateJoypad();
+            }
+            return true;
+        }
+    }
+
+    return LibretroCore::eventFilter(watched, event);
 }
 
 void FbneoTrainingCore::handleVideoFrame(const void *data, unsigned width, unsigned height, size_t pitch) {

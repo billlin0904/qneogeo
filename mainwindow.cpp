@@ -350,6 +350,8 @@ MainWindow::MainWindow(QWidget *parent)
         QSettings settings(inputConfigPath(), QSettings::IniFormat);
         settings.setValue(QStringLiteral("AI/GamePlayWithP2"), enabled);
         settings.sync();
+        if (auto *training_core = dynamic_cast<FbneoTrainingCore *>(core_))
+            training_core->setP2RandomAiEnabled(enabled);
         statusBar()->showMessage(enabled
                                      ? QStringLiteral("GamePlay With AI (P2) enabled")
                                      : QStringLiteral("GamePlay With AI (P2) disabled"),
@@ -553,6 +555,9 @@ void MainWindow::setCoreKind(CoreKind kind) {
 void MainWindow::connectCoreSignals() {
     if (!core_ || !pause_action_)
         return;
+
+    if (auto *training_core = dynamic_cast<FbneoTrainingCore *>(core_))
+        training_core->setP2RandomAiEnabled(gameplay_with_ai_p2_action_ && gameplay_with_ai_p2_action_->isChecked());
 
     connect(pause_action_, &QAction::toggled, core_, &LibretroCore::setPaused);
     connect(core_, &LibretroCore::pausedChanged, this, [this](bool paused) {

@@ -101,9 +101,13 @@ KOF_ENV_API int kof_env_load_state(kof_env_handle handle, const wchar_t *state_p
 KOF_ENV_API int kof_env_save_state(kof_env_handle handle, const wchar_t *state_path);
 
 KOF_ENV_API void kof_env_set_joypad(kof_env_handle handle, const kof_env_joypad_state *state);
+KOF_ENV_API void kof_env_set_joypad_for_port(kof_env_handle handle,
+                                             unsigned port,
+                                             const kof_env_joypad_state *state);
 KOF_ENV_API void kof_env_set_video_refresh(kof_env_handle handle,
                                            kof_env_video_refresh_t callback,
                                            void *user_data);
+KOF_ENV_API void kof_env_set_p2_random_ai(kof_env_handle handle, int enabled);
 KOF_ENV_API int kof_env_set_action(kof_env_handle handle, int32_t action_id);
 KOF_ENV_API int kof_env_run_frames(kof_env_handle handle, int32_t frame_count);
 KOF_ENV_API int kof_env_step(kof_env_handle handle,

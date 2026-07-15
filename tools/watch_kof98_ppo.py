@@ -30,6 +30,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fixed-action", type=int, default=None, help="Always send this action id, ignoring model/random.")
     parser.add_argument("--fixed-action-once", action="store_true", help="Send --fixed-action once after reset, then idle.")
     parser.add_argument("--fixed-action-ignore-ready", action="store_true", help="Send --fixed-action even while P1 is not in normal object state.")
+    parser.add_argument(
+        "--p2-training-ai",
+        dest="p2_training_ai",
+        action="store_true",
+        default=True,
+        help="Make P2 repeatedly run the built-in training action. Enabled by default for the viewer.",
+    )
+    parser.add_argument(
+        "--no-p2-training-ai",
+        dest="p2_training_ai",
+        action="store_false",
+        help="Disable the built-in P2 training action.",
+    )
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic model actions.")
     parser.add_argument("--show-paths", action="store_true", help="Print Python/OpenGL/runtime paths before launching.")
     parser.add_argument("--hitboxes", action="store_true", help="Draw KOF98 hitboxes from FBNeo system RAM.")
@@ -356,6 +369,7 @@ def main() -> int:
         save_dir=root / "saves",
         state_path=state_path,
         action_repeat=args.action_repeat,
+        p2_training_ai=args.p2_training_ai,
     )
     env.client.set_video_refresh_callback(sink.receive)
 

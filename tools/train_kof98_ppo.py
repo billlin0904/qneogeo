@@ -39,6 +39,7 @@ def make_env(
             state_path=state_path,
             action_repeat=action_repeat,
             hitbox_reward=hitbox_reward,
+            p2_training_ai=True,
         )
         if viewer:
             env = TrainingViewerWrapper(env, viewer_scale, viewer_fps, viewer_speed, action_repeat, viewer_hitboxes)

@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <cstdarg>
 #include <cstdio>
@@ -28,6 +29,7 @@ using retro_set_audio_sample_t = void (*)(retro_audio_sample_t);
 using retro_set_audio_sample_batch_t = void (*)(retro_audio_sample_batch_t);
 using retro_set_input_poll_t = void (*)(retro_input_poll_t);
 using retro_set_input_state_t = void (*)(retro_input_state_t);
+using retro_set_controller_port_device_t = void (*)(unsigned, unsigned);
 using retro_init_t = void (*)();
 using retro_deinit_t = void (*)();
 using retro_reset_t = void (*)();
@@ -98,6 +100,11 @@ struct InputFrame {
     kof_env_joypad_state state {};
     int32_t frames = 0;
 };
+
+constexpr size_t P1_PORT = 0;
+constexpr size_t P2_PORT = 1;
+constexpr size_t PLAYER_PORT_COUNT = 2;
+constexpr int32_t KYO_ONIYAKI_ACTION_ID = 17;
 
 enum class CharacterID {
     Kyo,
@@ -371,6 +378,11 @@ public:
             initialized_ = true;
         }
 
+        if (retro_set_controller_port_device_) {
+            retro_set_controller_port_device_(static_cast<unsigned>(P1_PORT), RETRO_DEVICE_JOYPAD);
+            retro_set_controller_port_device_(static_cast<unsigned>(P2_PORT), RETRO_DEVICE_JOYPAD);
+        }
+
         retro_game_info info {};
         info.path = game_path_utf8_.c_str();
         info.data = nullptr;
@@ -388,8 +400,10 @@ public:
         if (!game_loaded_ || !retro_reset_)
             return fail("No loaded game to reset.");
 
-        joypad_ = {};
+        joypads_[P1_PORT] = {};
+        joypads_[P2_PORT] = {};
         clearActionScript();
+        clearP2RandomAiScript();
         retro_reset_();
         return true;
     }
@@ -410,8 +424,10 @@ public:
         if (!retro_unserialize_(data.data(), data.size()))
             return fail("Core rejected state data.");
 
-        joypad_ = {};
+        joypads_[P1_PORT] = {};
+        joypads_[P2_PORT] = {};
         clearActionScript();
+        clearP2RandomAiScript();
         return true;
     }
 
@@ -436,13 +452,26 @@ public:
         return static_cast<bool>(file);
     }
 
+    void setJoypadForPort(unsigned port, const kof_env_joypad_state *state) {
+        if (port >= PLAYER_PORT_COUNT)
+            return;
+
+        joypads_[port] = state ? *state : kof_env_joypad_state {};
+    }
+
     void setJoypad(const kof_env_joypad_state *state) {
-        joypad_ = state ? *state : kof_env_joypad_state {};
+        setJoypadForPort(static_cast<unsigned>(P1_PORT), state);
     }
 
     void setVideoRefresh(kof_env_video_refresh_t callback, void *user_data) {
         video_refresh_callback_ = callback;
         video_refresh_user_data_ = user_data;
+    }
+
+    void setP2RandomAiEnabled(bool enabled) {
+        p2_random_ai_enabled_ = enabled;
+        clearP2RandomAiScript();
+        joypads_[P2_PORT] = {};
     }
 
     void clearActionScript() {
@@ -458,7 +487,7 @@ public:
         active_script_ = std::move(script);
         active_script_index_ = 0;
         active_script_remaining_frames_ = active_script_[0].frames;
-        joypad_ = active_script_[0].state;
+        joypads_[P1_PORT] = active_script_[0].state;
         return true;
     }
 
@@ -470,7 +499,7 @@ public:
             ++active_script_index_;
             if (active_script_index_ >= active_script_.size()) {
                 clearActionScript();
-                joypad_ = {};
+                joypads_[P1_PORT] = {};
                 return;
             }
 
@@ -480,7 +509,7 @@ public:
         if (active_script_remaining_frames_ <= 0)
             return;
 
-        joypad_ = active_script_[active_script_index_].state;
+        joypads_[P1_PORT] = active_script_[active_script_index_].state;
         --active_script_remaining_frames_;
     }
 
@@ -491,8 +520,70 @@ public:
         if (active_script_remaining_frames_ <= 0 &&
             active_script_index_ + 1 >= active_script_.size()) {
             clearActionScript();
-            joypad_ = {};
+            joypads_[P1_PORT] = {};
         }
+    }
+
+    void clearP2RandomAiScript() {
+        p2_random_script_.clear();
+        p2_random_script_index_ = 0;
+        p2_random_script_remaining_frames_ = 0;
+    }
+
+    bool startP2RandomAiScript(std::vector<InputFrame> script) {
+        if (script.empty())
+            return false;
+
+        p2_random_script_ = std::move(script);
+        p2_random_script_index_ = 0;
+        p2_random_script_remaining_frames_ = p2_random_script_[0].frames;
+        joypads_[P2_PORT] = p2_random_script_[0].state;
+        return true;
+    }
+
+    bool startP2TrainingAction() {
+        kof_env_observation observation {};
+        const bool has_observation = getObservation(&observation);
+        const bool forward_is_right = !has_observation || observation.p1_x >= observation.p2_x;
+        const CharacterActionTable *actions = action_lut_.getAction(forward_is_right);
+        if (!actions || actions->empty())
+            return false;
+
+        const auto action_it = actions->find(KYO_ONIYAKI_ACTION_ID);
+        if (action_it == actions->cend())
+            return false;
+
+        return startP2RandomAiScript(action_it->second);
+    }
+
+    void advanceP2RandomAiFrame() {
+        if (!p2_random_ai_enabled_) {
+            clearP2RandomAiScript();
+            return;
+        }
+
+        if (p2_random_script_.empty()) {
+            if (!startP2TrainingAction())
+                joypads_[P2_PORT] = {};
+            return;
+        }
+
+        if (p2_random_script_remaining_frames_ <= 0) {
+            ++p2_random_script_index_;
+            if (p2_random_script_index_ >= p2_random_script_.size()) {
+                clearP2RandomAiScript();
+                joypads_[P2_PORT] = {};
+                return;
+            }
+
+            p2_random_script_remaining_frames_ = p2_random_script_[p2_random_script_index_].frames;
+        }
+
+        if (p2_random_script_remaining_frames_ <= 0)
+            return;
+
+        joypads_[P2_PORT] = p2_random_script_[p2_random_script_index_].state;
+        --p2_random_script_remaining_frames_;
     }
 
     bool setAction(int32_t action_id) {
@@ -532,6 +623,7 @@ public:
         g_active_runtime = this;
         for (int32_t frame = 0; frame < frame_count; ++frame) {
             advanceActionScriptFrame();
+            advanceP2RandomAiFrame();
             retro_run_();
             finishActionScriptFrame();
         }
@@ -752,30 +844,38 @@ public:
     }
 
     int16_t inputState(unsigned port, unsigned device, unsigned, unsigned id) const {
-        if (port != 0 || device != RETRO_DEVICE_JOYPAD)
+        if (device != RETRO_DEVICE_JOYPAD)
+            return 0;
+
+        const kof_env_joypad_state *state = nullptr;
+        if (port == P1_PORT)
+            state = &joypads_[P1_PORT];
+        else if (port == P2_PORT)
+            state = &joypads_[P2_PORT];
+        else
             return 0;
 
         switch (id) {
         case RETRO_DEVICE_ID_JOYPAD_UP:
-            return joypad_.up ? 1 : 0;
+            return state->up ? 1 : 0;
         case RETRO_DEVICE_ID_JOYPAD_DOWN:
-            return joypad_.down ? 1 : 0;
+            return state->down ? 1 : 0;
         case RETRO_DEVICE_ID_JOYPAD_LEFT:
-            return joypad_.left ? 1 : 0;
+            return state->left ? 1 : 0;
         case RETRO_DEVICE_ID_JOYPAD_RIGHT:
-            return joypad_.right ? 1 : 0;
+            return state->right ? 1 : 0;
         case RETRO_DEVICE_ID_JOYPAD_B:
-            return joypad_.a ? 1 : 0;
+            return state->a ? 1 : 0;
         case RETRO_DEVICE_ID_JOYPAD_A:
-            return joypad_.b ? 1 : 0;
+            return state->b ? 1 : 0;
         case RETRO_DEVICE_ID_JOYPAD_Y:
-            return joypad_.c ? 1 : 0;
+            return state->c ? 1 : 0;
         case RETRO_DEVICE_ID_JOYPAD_X:
-            return joypad_.d ? 1 : 0;
+            return state->d ? 1 : 0;
         case RETRO_DEVICE_ID_JOYPAD_START:
-            return joypad_.start ? 1 : 0;
+            return state->start ? 1 : 0;
         case RETRO_DEVICE_ID_JOYPAD_SELECT:
-            return joypad_.coin ? 1 : 0;
+            return state->coin ? 1 : 0;
         default:
             return 0;
         }
@@ -807,7 +907,10 @@ private:
         if (game_loaded_ && retro_unload_game_)
             retro_unload_game_();
         game_loaded_ = false;
-        joypad_ = {};
+        joypads_[P1_PORT] = {};
+        joypads_[P2_PORT] = {};
+        clearActionScript();
+        clearP2RandomAiScript();
     }
 
     void installCallbacks() {
@@ -841,6 +944,8 @@ private:
         retro_set_audio_sample_batch_ = resolveSymbol<retro_set_audio_sample_batch_t>("retro_set_audio_sample_batch");
         retro_set_input_poll_ = resolveSymbol<retro_set_input_poll_t>("retro_set_input_poll");
         retro_set_input_state_ = resolveSymbol<retro_set_input_state_t>("retro_set_input_state");
+        retro_set_controller_port_device_ =
+            resolveSymbol<retro_set_controller_port_device_t>("retro_set_controller_port_device");
         retro_init_ = resolveSymbol<retro_init_t>("retro_init");
         retro_deinit_ = resolveSymbol<retro_deinit_t>("retro_deinit");
         retro_reset_ = resolveSymbol<retro_reset_t>("retro_reset");
@@ -863,6 +968,7 @@ private:
         retro_set_audio_sample_batch_ = nullptr;
         retro_set_input_poll_ = nullptr;
         retro_set_input_state_ = nullptr;
+        retro_set_controller_port_device_ = nullptr;
         retro_init_ = nullptr;
         retro_deinit_ = nullptr;
         retro_reset_ = nullptr;
@@ -917,10 +1023,14 @@ private:
     HMODULE library_ = nullptr;
     bool initialized_ = false;
     bool game_loaded_ = false;
-    kof_env_joypad_state joypad_ {};
+    std::array<kof_env_joypad_state, PLAYER_PORT_COUNT> joypads_ {};
     std::vector<InputFrame> active_script_;
     size_t active_script_index_ = 0;
     int32_t active_script_remaining_frames_ = 0;
+    std::vector<InputFrame> p2_random_script_;
+    size_t p2_random_script_index_ = 0;
+    int32_t p2_random_script_remaining_frames_ = 0;
+    bool p2_random_ai_enabled_ = false;
     CharacterActionMapLut action_lut_;
     std::string game_path_utf8_;
     std::string system_directory_utf8_;
@@ -935,6 +1045,7 @@ private:
     retro_set_audio_sample_batch_t retro_set_audio_sample_batch_ = nullptr;
     retro_set_input_poll_t retro_set_input_poll_ = nullptr;
     retro_set_input_state_t retro_set_input_state_ = nullptr;
+    retro_set_controller_port_device_t retro_set_controller_port_device_ = nullptr;
     retro_init_t retro_init_ = nullptr;
     retro_deinit_t retro_deinit_ = nullptr;
     retro_reset_t retro_reset_ = nullptr;
@@ -999,11 +1110,23 @@ void kof_env_set_joypad(kof_env_handle handle, const kof_env_joypad_state *state
         runtime->setJoypad(state);
 }
 
+void kof_env_set_joypad_for_port(kof_env_handle handle,
+                                 unsigned port,
+                                 const kof_env_joypad_state *state) {
+    if (auto *runtime = runtimeFromHandle(handle))
+        runtime->setJoypadForPort(port, state);
+}
+
 void kof_env_set_video_refresh(kof_env_handle handle,
                                kof_env_video_refresh_t callback,
                                void *user_data) {
     if (auto *runtime = runtimeFromHandle(handle))
         runtime->setVideoRefresh(callback, user_data);
+}
+
+void kof_env_set_p2_random_ai(kof_env_handle handle, int enabled) {
+    if (auto *runtime = runtimeFromHandle(handle))
+        runtime->setP2RandomAiEnabled(enabled != 0);
 }
 
 int kof_env_set_action(kof_env_handle handle, int32_t action_id) {

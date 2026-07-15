@@ -197,6 +197,9 @@ class KofEnvClient:
             None,
         )
 
+    def set_p2_training_ai(self, enabled: bool) -> None:
+        self.dll.kof_env_set_p2_random_ai(self.handle, 1 if enabled else 0)
+
     def step(self, action_id: int, frames: int = 6) -> Kof98Observation:
         observation = Kof98Observation()
         self._check(self.dll.kof_env_step(self.handle, action_id, frames, ctypes.byref(observation)))
@@ -281,6 +284,8 @@ class KofEnvClient:
             ctypes.c_void_p,
             ctypes.c_void_p,
         ]
+
+        self.dll.kof_env_set_p2_random_ai.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
         self.dll.kof_env_step.argtypes = [
             ctypes.c_void_p,
@@ -417,6 +422,7 @@ class Kof98Env(gym.Env if gym else object):
         state_path: Optional[str | Path] = None,
         action_repeat: int = 6,
         hitbox_reward: bool = True,
+        p2_training_ai: bool = False,
     ):
         if gym is None or spaces is None:
             raise RuntimeError("Install gymnasium before using Kof98Env")
@@ -428,6 +434,7 @@ class Kof98Env(gym.Env if gym else object):
         self.state_path = Path(state_path) if state_path else None
         self.action_repeat = action_repeat
         self.hitbox_reward = hitbox_reward
+        self.p2_training_ai = p2_training_ai
         self.previous_observation: Optional[Kof98Observation] = None
         self.pending_attack_risk: Optional[dict[str, float]] = None
 
@@ -447,6 +454,7 @@ class Kof98Env(gym.Env if gym else object):
         else:
             self.client.reset()
 
+        self.client.set_p2_training_ai(self.p2_training_ai)
         observation = self.client.observation()
         self.previous_observation = observation
         self.pending_attack_risk = None
