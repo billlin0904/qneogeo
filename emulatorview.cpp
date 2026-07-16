@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QFile>
+#include <QFont>
 #include <QMatrix4x4>
 #include <QMetaObject>
 #include <QPainter>
@@ -109,6 +110,170 @@ private:
     QSize source_size_;
 };
 
+class InputHistoryOverlayWidget final : public QWidget {
+public:
+    explicit InputHistoryOverlayWidget(QWidget *parent = nullptr)
+        : QWidget(parent) {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_NoSystemBackground);
+        setAttribute(Qt::WA_TranslucentBackground);
+    }
+
+    void appendInput(const EmulatorView::JoypadInput &input, uint64_t frameNumber) {
+        if (frameNumber == 0)
+            return;
+
+        if (!history_.isEmpty() && frameNumber <= history_.constLast().last_frame)
+            history_.clear();
+
+        if (!history_.isEmpty() &&
+            history_.constLast().input == input &&
+            frameNumber == history_.constLast().last_frame + 1) {
+            history_.last().last_frame = frameNumber;
+        } else {
+            history_.push_back({ input, frameNumber, frameNumber });
+            while (history_.size() > MAX_HISTORY_ENTRIES)
+                history_.remove(0);
+        }
+
+        update();
+    }
+
+    void clearHistory() {
+        history_.clear();
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override {
+        if (history_.isEmpty())
+            return;
+
+        constexpr int32_t PANEL_X = 12;
+        constexpr int32_t PANEL_TOP = 52;
+        constexpr int32_t PANEL_WIDTH = 252;
+        constexpr int32_t HEADER_HEIGHT = 24;
+        constexpr int32_t ROW_HEIGHT = 22;
+        constexpr int32_t PANEL_MARGIN_BOTTOM = 12;
+
+        const int32_t available_height = height() - PANEL_TOP - HEADER_HEIGHT - PANEL_MARGIN_BOTTOM;
+        const int32_t visible_count = std::min<int32_t>(
+            static_cast<int32_t>(history_.size()),
+            std::max<int32_t>(1, available_height / ROW_HEIGHT));
+        const int32_t first_visible = static_cast<int32_t>(history_.size()) - visible_count;
+        const QRect panel_rect(PANEL_X,
+                               PANEL_TOP,
+                               PANEL_WIDTH,
+                               HEADER_HEIGHT + visible_count * ROW_HEIGHT);
+
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, false);
+        painter.fillRect(panel_rect, QColor(0, 0, 0, 176));
+        painter.setPen(QPen(QColor(255, 255, 255, 100), 1));
+        painter.drawRect(panel_rect.adjusted(0, 0, -1, -1));
+
+        QFont font(QStringLiteral("SF Mono"));
+        font.setStyleHint(QFont::Monospace);
+        font.setPixelSize(12);
+        font.setBold(true);
+        painter.setFont(font);
+        painter.setPen(Qt::white);
+        painter.drawText(QRect(PANEL_X + 8, PANEL_TOP, PANEL_WIDTH - 16, HEADER_HEIGHT),
+                         Qt::AlignVCenter | Qt::AlignLeft,
+                         QStringLiteral("P1 INPUT / FRAME"));
+
+        for (int32_t row = 0; row < visible_count; ++row) {
+            const Entry &entry = history_.at(first_visible + row);
+            const int32_t row_y = PANEL_TOP + HEADER_HEIGHT + row * ROW_HEIGHT;
+            if ((row & 1) != 0)
+                painter.fillRect(QRect(PANEL_X + 1, row_y, PANEL_WIDTH - 2, ROW_HEIGHT),
+                                 QColor(255, 255, 255, 12));
+
+            painter.setPen(QColor(225, 225, 225));
+            painter.drawText(QRect(PANEL_X + 8, row_y, 108, ROW_HEIGHT),
+                             Qt::AlignVCenter | Qt::AlignLeft,
+                             frameText(entry));
+            painter.setPen(Qt::white);
+            painter.drawText(QRect(PANEL_X + 116, row_y, 30, ROW_HEIGHT),
+                             Qt::AlignCenter,
+                             directionText(entry.input));
+
+            drawButton(painter, PANEL_X + 150, row_y + 2, QStringLiteral("A"), entry.input.a,
+                       QColor(225, 56, 54), Qt::white);
+            drawButton(painter, PANEL_X + 173, row_y + 2, QStringLiteral("B"), entry.input.b,
+                       QColor(250, 193, 31), Qt::black);
+            drawButton(painter, PANEL_X + 196, row_y + 2, QStringLiteral("C"), entry.input.c,
+                       QColor(30, 196, 91), Qt::black);
+            drawButton(painter, PANEL_X + 219, row_y + 2, QStringLiteral("D"), entry.input.d,
+                       QColor(55, 125, 230), Qt::white);
+        }
+    }
+
+private:
+    struct Entry {
+        EmulatorView::JoypadInput input;
+        uint64_t first_frame = 0;
+        uint64_t last_frame = 0;
+    };
+
+    static constexpr int32_t MAX_HISTORY_ENTRIES = 18;
+
+    static QString frameText(const Entry &entry) {
+        const QString first = QStringLiteral("%1")
+                                  .arg(static_cast<qulonglong>(entry.first_frame), 6, 10, QLatin1Char('0'));
+        if (entry.first_frame == entry.last_frame)
+            return QStringLiteral("F%1").arg(first);
+
+        const QString last = QStringLiteral("%1")
+                                 .arg(static_cast<qulonglong>(entry.last_frame), 6, 10, QLatin1Char('0'));
+        return QStringLiteral("F%1-%2").arg(first, last);
+    }
+
+    static QString directionText(const EmulatorView::JoypadInput &input) {
+        if (input.left && input.right)
+            return QStringLiteral("L+R");
+        if (input.up && input.down)
+            return QStringLiteral("U+D");
+        if (input.up && input.left)
+            return QStringLiteral("↖");
+        if (input.up && input.right)
+            return QStringLiteral("↗");
+        if (input.down && input.left)
+            return QStringLiteral("↙");
+        if (input.down && input.right)
+            return QStringLiteral("↘");
+        if (input.up)
+            return QStringLiteral("↑");
+        if (input.down)
+            return QStringLiteral("↓");
+        if (input.left)
+            return QStringLiteral("←");
+        if (input.right)
+            return QStringLiteral("→");
+        return QStringLiteral("-");
+    }
+
+    static void drawButton(QPainter &painter,
+                           int32_t x,
+                           int32_t y,
+                           const QString &label,
+                           bool active,
+                           const QColor &fill,
+                           const QColor &textColor) {
+        if (!active)
+            return;
+
+        const QRect rect(x, y, 19, 18);
+        painter.fillRect(rect, fill);
+        painter.setPen(QPen(fill.lighter(135), 1));
+        painter.drawRect(rect.adjusted(0, 0, -1, -1));
+        painter.setPen(textColor);
+        painter.drawText(rect, Qt::AlignCenter, label);
+    }
+
+    QVector<Entry> history_;
+};
+
 } // namespace
 
 EmulatorView::EmulatorView(QWidget *parent)
@@ -120,6 +285,10 @@ EmulatorView::EmulatorView(QWidget *parent)
     hitbox_overlay_widget_->setGeometry(rect());
     hitbox_overlay_widget_->raise();
     hitbox_overlay_widget_->hide();
+    input_overlay_widget_ = new InputHistoryOverlayWidget(this);
+    input_overlay_widget_->setGeometry(rect());
+    input_overlay_widget_->raise();
+    input_overlay_widget_->show();
     fps_timer_.start();
 }
 
@@ -179,12 +348,61 @@ bool EmulatorView::hitboxOverlayEnabled() const {
     return hitbox_overlay_enabled_;
 }
 
+void EmulatorView::setInputOverlayEnabled(bool enabled) {
+    if (input_overlay_enabled_ == enabled)
+        return;
+
+    input_overlay_enabled_ = enabled;
+    if (input_overlay_widget_) {
+        input_overlay_widget_->setVisible(enabled);
+        if (enabled)
+            input_overlay_widget_->raise();
+    }
+}
+
+bool EmulatorView::inputOverlayEnabled() const {
+    return input_overlay_enabled_;
+}
+
 void EmulatorView::setHitboxOverlay(QVector<HitboxRect> boxes, QVector<HitboxAxis> axes) {
     hitbox_boxes_ = std::move(boxes);
     hitbox_axes_ = std::move(axes);
     updateHitboxOverlayWidget();
     if (hitbox_overlay_enabled_)
         update();
+}
+
+bool EmulatorView::JoypadInput::operator==(const JoypadInput &other) const {
+    return up == other.up &&
+           down == other.down &&
+           left == other.left &&
+           right == other.right &&
+           a == other.a &&
+           b == other.b &&
+           c == other.c &&
+           d == other.d;
+}
+
+bool EmulatorView::JoypadInput::isNeutral() const {
+    return !up && !down && !left && !right && !a && !b && !c && !d;
+}
+
+void EmulatorView::submitInputFrame(const JoypadInput &input, uint64_t frameNumber) {
+    auto *overlay = static_cast<InputHistoryOverlayWidget *>(input_overlay_widget_);
+    if (!overlay)
+        return;
+
+    overlay->appendInput(input, frameNumber);
+    if (input_overlay_enabled_) {
+        overlay->show();
+        overlay->raise();
+    }
+}
+
+void EmulatorView::clearInputHistory() {
+    auto *overlay = static_cast<InputHistoryOverlayWidget *>(input_overlay_widget_);
+    if (overlay)
+        overlay->clearHistory();
 }
 
 void EmulatorView::setScalingFilter(ScalingFilter filter) {
@@ -255,6 +473,7 @@ void EmulatorView::clearFrame() {
     fps_ = 0.0;
     fps_timer_.restart();
     emit fpsChanged(0.0);
+    clearInputHistory();
     update();
 }
 
@@ -345,6 +564,8 @@ void EmulatorView::resizeGL(int width, int height) {
     glViewport(0, 0, width, height);
     if (hitbox_overlay_widget_)
         hitbox_overlay_widget_->setGeometry(rect());
+    if (input_overlay_widget_)
+        input_overlay_widget_->setGeometry(rect());
 }
 
 void EmulatorView::paintGL() {
@@ -524,6 +745,9 @@ void EmulatorView::updateHitboxOverlayWidget() {
         overlay->raise();
     }
     overlay->setOverlay(hitbox_boxes_, hitbox_axes_, source_size);
+
+    if (input_overlay_enabled_ && input_overlay_widget_)
+        input_overlay_widget_->raise();
 }
 
 void EmulatorView::updateFpsCounter() {

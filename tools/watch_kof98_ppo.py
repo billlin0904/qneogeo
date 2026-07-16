@@ -9,11 +9,22 @@ from typing import Optional
 
 import numpy as np
 
-from kof98_env import Kof98Env
+from kof98_env import Kof98Env, TrainingProfile
 
 
 def default_project_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def parse_fixed_actions(value: str) -> tuple[int, ...]:
+    try:
+        actions = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Fixed actions must be comma-separated integers.") from error
+
+    if not actions:
+        raise argparse.ArgumentTypeError("Fixed actions cannot be empty.")
+    return actions
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,23 +37,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale", type=int, default=3, help="Initial window scale.")
     parser.add_argument("--fps", type=int, default=60, help="Viewer frame limit.")
     parser.add_argument("--frames", type=int, default=0, help="Auto-close after this many viewer frames. 0 means forever.")
+    parser.add_argument(
+        "--terminal-tail-frames",
+        type=int,
+        default=90,
+        help="Continue emulation for this many frames after an episode ends before resetting.",
+    )
     parser.add_argument("--random", action="store_true", help="Use random actions when no model is supplied.")
     parser.add_argument("--fixed-action", type=int, default=None, help="Always send this action id, ignoring model/random.")
+    parser.add_argument(
+        "--fixed-actions",
+        type=parse_fixed_actions,
+        default=None,
+        help="Send a comma-separated action sequence once, e.g. 23,24,25.",
+    )
     parser.add_argument("--fixed-action-once", action="store_true", help="Send --fixed-action once after reset, then idle.")
     parser.add_argument("--fixed-action-ignore-ready", action="store_true", help="Send --fixed-action even while P1 is not in normal object state.")
-    parser.add_argument(
-        "--p2-training-ai",
-        dest="p2_training_ai",
-        action="store_true",
-        default=True,
-        help="Make P2 repeatedly run the built-in training action. Enabled by default for the viewer.",
-    )
-    parser.add_argument(
-        "--no-p2-training-ai",
-        dest="p2_training_ai",
-        action="store_false",
-        help="Disable the built-in P2 training action.",
-    )
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic model actions.")
     parser.add_argument("--show-paths", action="store_true", help="Print Python/OpenGL/runtime paths before launching.")
     parser.add_argument("--hitboxes", action="store_true", help="Draw KOF98 hitboxes from FBNeo system RAM.")
@@ -79,6 +89,70 @@ class HitboxOverlay:
     axes: list[HitboxAxis]
 
 
+@dataclass(frozen=True)
+class InputDisplayState:
+    up: bool
+    down: bool
+    left: bool
+    right: bool
+    a: bool
+    b: bool
+    c: bool
+    d: bool
+
+    @classmethod
+    def from_joypad(cls, state) -> "InputDisplayState":
+        return cls(
+            bool(state.up),
+            bool(state.down),
+            bool(state.left),
+            bool(state.right),
+            bool(state.a),
+            bool(state.b),
+            bool(state.c),
+            bool(state.d),
+        )
+
+    def active(self) -> bool:
+        return any((self.up, self.down, self.left, self.right, self.a, self.b, self.c, self.d))
+
+
+@dataclass
+class InputHistoryEntry:
+    state: InputDisplayState
+    first_frame: int
+    last_frame: int
+
+
+class InputHistory:
+    def __init__(self, capacity: int = 10):
+        self.capacity = max(1, capacity)
+        self.entries: list[InputHistoryEntry] = []
+
+    def clear(self) -> None:
+        self.entries.clear()
+
+    def push(self, state, frame_number: int) -> None:
+        if frame_number <= 0:
+            return
+
+        display_state = InputDisplayState.from_joypad(state)
+        if self.entries and frame_number <= self.entries[-1].last_frame:
+            self.clear()
+
+        if (
+            self.entries
+            and self.entries[-1].state == display_state
+            and frame_number == self.entries[-1].last_frame + 1
+        ):
+            self.entries[-1].last_frame = frame_number
+            return
+
+        self.entries.append(InputHistoryEntry(display_state, frame_number, frame_number))
+        if len(self.entries) > self.capacity:
+            del self.entries[:-self.capacity]
+
+
 class FrameSink:
     def __init__(self):
         self.frame: Optional[Frame] = None
@@ -111,6 +185,7 @@ class OpenGlViewer:
             GL_ONE_MINUS_SRC_ALPHA,
             GL_QUADS,
             GL_RGB,
+            GL_RGBA,
             GL_SRC_ALPHA,
             GL_TEXTURE_2D,
             GL_TEXTURE_MAG_FILTER,
@@ -119,6 +194,7 @@ class OpenGlViewer:
             GL_TEXTURE_WRAP_T,
             GL_TRIANGLE_STRIP,
             GL_UNPACK_ALIGNMENT,
+            GL_UNSIGNED_BYTE,
             GL_UNSIGNED_SHORT_5_6_5,
             glBlendFunc,
             glBegin,
@@ -149,6 +225,7 @@ class OpenGlViewer:
             "GL_ONE_MINUS_SRC_ALPHA": GL_ONE_MINUS_SRC_ALPHA,
             "GL_QUADS": GL_QUADS,
             "GL_RGB": GL_RGB,
+            "GL_RGBA": GL_RGBA,
             "GL_SRC_ALPHA": GL_SRC_ALPHA,
             "GL_TEXTURE_2D": GL_TEXTURE_2D,
             "GL_TEXTURE_MAG_FILTER": GL_TEXTURE_MAG_FILTER,
@@ -158,6 +235,7 @@ class OpenGlViewer:
             "GL_CLAMP_TO_EDGE": GL_CLAMP_TO_EDGE,
             "GL_TRIANGLE_STRIP": GL_TRIANGLE_STRIP,
             "GL_UNPACK_ALIGNMENT": GL_UNPACK_ALIGNMENT,
+            "GL_UNSIGNED_BYTE": GL_UNSIGNED_BYTE,
             "GL_UNSIGNED_SHORT_5_6_5": GL_UNSIGNED_SHORT_5_6_5,
             "glBlendFunc": glBlendFunc,
             "glBegin": glBegin,
@@ -194,12 +272,53 @@ class OpenGlViewer:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
 
-    def draw(self, frame: Frame, overlay: Optional[HitboxOverlay] = None) -> None:
+        self.input_font_path = pygame.font.match_font("SF Mono", bold=True)
+        input_font = pygame.font.Font(self.input_font_path, 10)
+        self.frame_font = pygame.font.Font(self.input_font_path, 7)
+        self.frame_textures = []
+        for _ in range(10):
+            texture = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, texture)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            self.frame_textures.append(texture)
+
+        self.input_label_textures = {}
+        for label in "ABCD":
+            surface = input_font.render(label, True, (13, 13, 13))
+            texture = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, texture)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGBA,
+                surface.get_width(),
+                surface.get_height(),
+                0,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                pygame.image.tobytes(surface, "RGBA", True),
+            )
+            self.input_label_textures[label] = (texture, surface.get_width(), surface.get_height())
+
+    def draw(
+        self,
+        frame: Frame,
+        overlay: Optional[HitboxOverlay] = None,
+        input_history: Optional[list[InputHistoryEntry]] = None,
+    ) -> None:
         gl = self.gl
         window_width, window_height = self.pygame.display.get_surface().get_size()
         gl["glViewport"](0, 0, window_width, window_height)
         gl["glClear"](gl["GL_COLOR_BUFFER_BIT"])
 
+        gl["glColor4f"](1.0, 1.0, 1.0, 1.0)
         gl["glBindTexture"](gl["GL_TEXTURE_2D"], self.texture)
         gl["glTexImage2D"](
             gl["GL_TEXTURE_2D"],
@@ -226,6 +345,8 @@ class OpenGlViewer:
 
         if overlay is not None:
             self.draw_overlay(frame, overlay)
+        if input_history:
+            self.draw_input_history(frame, input_history)
 
         self.pygame.display.flip()
 
@@ -280,6 +401,152 @@ class OpenGlViewer:
             gl["glEnd"]()
 
         gl["glDisable"](0x0BE2)  # GL_BLEND
+        gl["glColor4f"](1.0, 1.0, 1.0, 1.0)
+        gl["glEnable"](gl["GL_TEXTURE_2D"])
+
+    def draw_input_history(self, frame: Frame, history: list[InputHistoryEntry]) -> None:
+        gl = self.gl
+
+        def px(x: float) -> float:
+            return x / max(1, frame.width) * 2.0 - 1.0
+
+        def py(y: float) -> float:
+            return 1.0 - y / max(1, frame.height) * 2.0
+
+        def vertex(x: float, y: float) -> None:
+            gl["glVertex2f"](px(x), py(y))
+
+        visible = history[-10:]
+        if not visible:
+            return
+
+        gl["glDisable"](gl["GL_TEXTURE_2D"])
+        gl["glEnable"](0x0BE2)  # GL_BLEND
+        gl["glBlendFunc"](gl["GL_SRC_ALPHA"], gl["GL_ONE_MINUS_SRC_ALPHA"])
+
+        panel_top = 38.0
+        panel_bottom = 216.0
+        gl["glColor4f"](0.0, 0.0, 0.0, 0.42)
+        gl["glBegin"](gl["GL_QUADS"])
+        vertex(5.0, panel_top)
+        vertex(160.0, panel_top)
+        vertex(160.0, panel_bottom)
+        vertex(5.0, panel_bottom)
+        gl["glEnd"]()
+
+        first_y = 198.0 - (len(visible) - 1) * 16.0
+        button_colors = (
+            (0.95, 0.12, 0.10, 0.95),
+            (1.0, 0.78, 0.08, 0.95),
+            (0.12, 0.78, 0.26, 0.95),
+            (0.12, 0.42, 1.0, 0.95),
+        )
+        for row, entry in enumerate(visible):
+            state = entry.state
+            center_y = first_y + row * 16.0
+            dx = int(state.right) - int(state.left)
+            dy = int(state.down) - int(state.up)
+
+            if entry.first_frame == entry.last_frame:
+                frame_text = f"F{entry.first_frame:06d}"
+            else:
+                frame_text = f"F{entry.first_frame:06d}-{entry.last_frame:06d}"
+
+            frame_surface = self.frame_font.render(frame_text, True, (235, 235, 235))
+            frame_texture = self.frame_textures[row]
+            frame_width = frame_surface.get_width()
+            frame_height = frame_surface.get_height()
+            gl["glEnable"](gl["GL_TEXTURE_2D"])
+            gl["glBindTexture"](gl["GL_TEXTURE_2D"], frame_texture)
+            gl["glTexImage2D"](
+                gl["GL_TEXTURE_2D"],
+                0,
+                gl["GL_RGBA"],
+                frame_width,
+                frame_height,
+                0,
+                gl["GL_RGBA"],
+                gl["GL_UNSIGNED_BYTE"],
+                self.pygame.image.tobytes(frame_surface, "RGBA", True),
+            )
+            gl["glColor4f"](1.0, 1.0, 1.0, 1.0)
+            gl["glBegin"](gl["GL_QUADS"])
+            gl["glTexCoord2f"](0.0, 1.0)
+            vertex(8.0, center_y - frame_height * 0.5)
+            gl["glTexCoord2f"](1.0, 1.0)
+            vertex(8.0 + frame_width, center_y - frame_height * 0.5)
+            gl["glTexCoord2f"](1.0, 0.0)
+            vertex(8.0 + frame_width, center_y + frame_height * 0.5)
+            gl["glTexCoord2f"](0.0, 0.0)
+            vertex(8.0, center_y + frame_height * 0.5)
+            gl["glEnd"]()
+            gl["glDisable"](gl["GL_TEXTURE_2D"])
+
+            gl["glLineWidth"](2.5)
+            gl["glColor4f"](1.0, 1.0, 1.0, 1.0)
+            if dx or dy:
+                length = max(1.0, (dx * dx + dy * dy) ** 0.5)
+                ux = dx / length
+                uy = dy / length
+                tip_x = 92.0 + ux * 7.0
+                tip_y = center_y + uy * 7.0
+                tail_x = 92.0 - ux * 7.0
+                tail_y = center_y - uy * 7.0
+                perp_x = -uy
+                perp_y = ux
+                head_x = tip_x - ux * 4.0
+                head_y = tip_y - uy * 4.0
+                gl["glBegin"](gl["GL_LINES"])
+                vertex(tail_x, tail_y)
+                vertex(tip_x, tip_y)
+                vertex(tip_x, tip_y)
+                vertex(head_x + perp_x * 3.0, head_y + perp_y * 3.0)
+                vertex(tip_x, tip_y)
+                vertex(head_x - perp_x * 3.0, head_y - perp_y * 3.0)
+                gl["glEnd"]()
+            else:
+                gl["glBegin"](gl["GL_QUADS"])
+                vertex(90.5, center_y - 1.5)
+                vertex(93.5, center_y - 1.5)
+                vertex(93.5, center_y + 1.5)
+                vertex(90.5, center_y + 1.5)
+                gl["glEnd"]()
+
+            for index, (active, label) in enumerate(zip((state.a, state.b, state.c, state.d), "ABCD")):
+                if not active:
+                    continue
+
+                center_x = 109.0 + index * 13.0
+                gl["glColor4f"](*button_colors[index])
+                gl["glBegin"](gl["GL_QUADS"])
+                vertex(center_x - 5.0, center_y - 5.0)
+                vertex(center_x + 5.0, center_y - 5.0)
+                vertex(center_x + 5.0, center_y + 5.0)
+                vertex(center_x - 5.0, center_y + 5.0)
+                gl["glEnd"]()
+
+                texture, label_width, label_height = self.input_label_textures[label]
+                label_left = center_x - label_width * 0.5
+                label_right = center_x + label_width * 0.5
+                label_top = center_y - label_height * 0.5
+                label_bottom = center_y + label_height * 0.5
+                gl["glEnable"](gl["GL_TEXTURE_2D"])
+                gl["glBindTexture"](gl["GL_TEXTURE_2D"], texture)
+                gl["glColor4f"](1.0, 1.0, 1.0, 1.0)
+                gl["glBegin"](gl["GL_QUADS"])
+                gl["glTexCoord2f"](0.0, 1.0)
+                vertex(label_left, label_top)
+                gl["glTexCoord2f"](1.0, 1.0)
+                vertex(label_right, label_top)
+                gl["glTexCoord2f"](1.0, 0.0)
+                vertex(label_right, label_bottom)
+                gl["glTexCoord2f"](0.0, 0.0)
+                vertex(label_left, label_bottom)
+                gl["glEnd"]()
+                gl["glDisable"](gl["GL_TEXTURE_2D"])
+
+        gl["glDisable"](0x0BE2)  # GL_BLEND
+        gl["glColor4f"](1.0, 1.0, 1.0, 1.0)
         gl["glEnable"](gl["GL_TEXTURE_2D"])
 
 
@@ -353,8 +620,11 @@ def main() -> int:
         print(f"  game: {root / 'roms' / 'fbneo' / 'kof98.zip'}", flush=True)
         print(f"  state: {state_path if state_path else '(none)'}", flush=True)
         print(f"  model: {model_path if model_path else '(none)'}", flush=True)
+        if args.fixed_actions is not None:
+            print(f"  fixed actions: {','.join(str(action) for action in args.fixed_actions)}", flush=True)
 
     sink = FrameSink()
+    input_history = InputHistory()
     startup_frame = Frame(pixels=bytes(320 * 224 * 2), width=320, height=224)
     viewer = OpenGlViewer(startup_frame.width, startup_frame.height, max(1, args.scale))
     viewer.draw(startup_frame)
@@ -367,20 +637,27 @@ def main() -> int:
         game_path=root / "roms" / "fbneo" / "kof98.zip",
         system_dir=root / "system",
         save_dir=root / "saves",
-        state_path=state_path,
+        combo_state_path=state_path,
+        training_profile=TrainingProfile.COMBO,
         action_repeat=args.action_repeat,
-        p2_training_ai=args.p2_training_ai,
     )
     env.client.set_video_refresh_callback(sink.receive)
 
+    if args.fixed_actions is not None:
+        invalid_actions = [action for action in args.fixed_actions if not env.action_space.contains(action)]
+        if invalid_actions:
+            raise ValueError(f"Fixed action ids are out of range: {invalid_actions}")
+
     model = None
     if args.model:
-        from stable_baselines3 import PPO
+        from sb3_contrib import MaskablePPO
 
-        model = PPO.load(str(model_path), device=args.device)
+        model = MaskablePPO.load(str(model_path), device=args.device)
 
     obs, _ = env.reset()
     env.step(0)
+    emulated_frame = env.action_repeat
+    input_history.push(env.client.last_joypad(), emulated_frame)
     if sink.frame is None:
         print("Warning: no frame received from fbneo_training video callback yet.", flush=True)
 
@@ -388,8 +665,10 @@ def main() -> int:
     running = True
     rendered_frames = 0
     deterministic = not args.stochastic
-    step_fps = max(1.0, float(args.fps) / max(1, args.action_repeat))
+    step_fps = max(1.0, float(args.fps) / max(1, env.action_repeat))
     fixed_action_sent = False
+    fixed_action_index = 0
+    terminal_tail_remaining = 0
 
     while running:
         for event in pygame.event.get():
@@ -402,34 +681,75 @@ def main() -> int:
                     paused = not paused
                 elif event.key == pygame.K_r:
                     obs, _ = env.reset()
+                    input_history.clear()
+                    emulated_frame = 0
                     fixed_action_sent = False
+                    fixed_action_index = 0
+                    terminal_tail_remaining = 0
 
         if not paused:
-            if args.fixed_action is not None:
-                if not args.fixed_action_ignore_ready and not p1_is_ready_for_fixed_action(env):
-                    action_id = 0
-                elif args.fixed_action_once and fixed_action_sent:
-                    action_id = 0
-                else:
-                    action_id = int(args.fixed_action)
-                    fixed_action_sent = True
-            elif model is not None:
-                action, _ = model.predict(obs, deterministic=deterministic)
-                action_id = int(np.asarray(action).item())
-            elif args.random:
-                action_id = int(env.action_space.sample())
-            else:
+            if args.fixed_actions is not None:
                 action_id = 0
+                if fixed_action_index < len(args.fixed_actions):
+                    next_action_id = args.fixed_actions[fixed_action_index]
+                    can_send_action = (
+                        env.client.input_ready()
+                        or env.client.can_queue_action(next_action_id)
+                    )
+                    if can_send_action:
+                        action_id = next_action_id
+                        fixed_action_index += 1
+                env.client.step(action_id, env.action_repeat)
+                emulated_frame += env.action_repeat
+                input_history.push(env.client.last_joypad(), emulated_frame)
+            elif terminal_tail_remaining > 0:
+                env.client.step(0, env.action_repeat)
+                emulated_frame += env.action_repeat
+                input_history.push(env.client.last_joypad(), emulated_frame)
+                terminal_tail_remaining -= env.action_repeat
+                if terminal_tail_remaining <= 0:
+                    obs, _ = env.reset()
+                    input_history.clear()
+                    emulated_frame = 0
+                    fixed_action_sent = False
+                    fixed_action_index = 0
+            else:
+                if args.fixed_action is not None:
+                    if not args.fixed_action_ignore_ready and not p1_is_ready_for_fixed_action(env):
+                        action_id = 0
+                    elif args.fixed_action_once and fixed_action_sent:
+                        action_id = 0
+                    else:
+                        action_id = int(args.fixed_action)
+                        fixed_action_sent = True
+                elif model is not None:
+                    action, _ = model.predict(
+                        obs,
+                        deterministic=deterministic,
+                        action_masks=env.action_masks(),
+                    )
+                    action_id = int(np.asarray(action).item())
+                elif args.random:
+                    action_id = int(env.action_space.sample())
+                else:
+                    action_id = 0
 
-            obs, _reward, terminated, truncated, _info = env.step(action_id)
-            if terminated or truncated:
-                obs, _ = env.reset()
+                obs, _reward, terminated, truncated, _info = env.step(action_id)
+                emulated_frame += env.action_repeat
+                input_history.push(env.client.last_joypad(), emulated_frame)
+                if terminated or truncated:
+                    terminal_tail_remaining = max(0, args.terminal_tail_frames)
+                    if terminal_tail_remaining == 0:
+                        obs, _ = env.reset()
+                        input_history.clear()
+                        emulated_frame = 0
+                        fixed_action_sent = False
 
         frame = sink.frame if sink.frame is not None else startup_frame
         overlay = None
         if args.hitboxes:
             overlay = build_hitbox_overlay_from_client(env.client, frame.width, frame.height)
-        viewer.draw(frame, overlay)
+        viewer.draw(frame, overlay, input_history.entries)
         rendered_frames += 1
         if args.frames > 0 and rendered_frames >= args.frames:
             running = False

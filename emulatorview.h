@@ -13,6 +13,8 @@
 #include <QRectF>
 #include <QVector>
 
+#include <cstdint>
+
 class EmulatorView final : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
 
@@ -45,6 +47,8 @@ public:
     bool smoothScaling() const;
     void setHitboxOverlayEnabled(bool enabled);
     bool hitboxOverlayEnabled() const;
+    void setInputOverlayEnabled(bool enabled);
+    bool inputOverlayEnabled() const;
 
     struct HitboxRect {
         QRectF rect;
@@ -57,7 +61,23 @@ public:
         QColor color;
     };
 
+    struct JoypadInput {
+        bool up = false;
+        bool down = false;
+        bool left = false;
+        bool right = false;
+        bool a = false;
+        bool b = false;
+        bool c = false;
+        bool d = false;
+
+        bool operator==(const JoypadInput &other) const;
+        bool isNeutral() const;
+    };
+
     void setHitboxOverlay(QVector<HitboxRect> boxes, QVector<HitboxAxis> axes);
+    void submitInputFrame(const JoypadInput &input, uint64_t frameNumber);
+    void clearInputHistory();
 
 signals:
     void fpsChanged(double fps);
@@ -105,9 +125,11 @@ private:
     int fps_frame_count_ = 0;
     double fps_ = 0.0;
     bool hitbox_overlay_enabled_ = false;
+    bool input_overlay_enabled_ = true;
     QVector<HitboxRect> hitbox_boxes_;
     QVector<HitboxAxis> hitbox_axes_;
     QWidget *hitbox_overlay_widget_ = nullptr;
+    QWidget *input_overlay_widget_ = nullptr;
 
     QOpenGLShaderProgram program_;
     QOpenGLShaderProgram libretro_xbrz_freescale_program_;

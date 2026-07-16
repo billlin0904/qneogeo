@@ -101,16 +101,34 @@ struct InputFrame {
     int32_t frames = 0;
 };
 
+struct FollowUpRule {
+    int32_t parent_action_id = -1;
+    int32_t child_action_id = -1;
+    int32_t queue_open_frame = 0;
+    int32_t queue_close_frame_exclusive = 0;
+    int32_t execute_frame = 0;
+};
+
 constexpr size_t P1_PORT = 0;
 constexpr size_t P2_PORT = 1;
 constexpr size_t PLAYER_PORT_COUNT = 2;
-constexpr int32_t KYO_ONIYAKI_ACTION_ID = 17;
+constexpr int32_t KYO_ARAGAMI_ACTION_ID = 14;
+constexpr int32_t KYO_KOTOTSUKI_YOU_ACTION_ID = 15;
+constexpr int32_t KYO_ONIYAKI_ACTION_ID = 16;
+constexpr int32_t KYO_RED_KICK_ACTION_ID = 17;
+constexpr int32_t KYO_OROCHINAGI_ACTION_ID = 18;
+constexpr int32_t KYO_FORWARD_B_ACTION_ID = 22;
+constexpr int32_t IDLE_ACTION_ID = 0;
+constexpr int32_t KYO_TSUMI_YOMI_ACTION_ID = 24;
+constexpr int32_t KYO_BATSU_YOMI_ACTION_ID = 25;
+constexpr int32_t KYO_BATSU_YOMI_TRIGGER_FRAME = 34;
 
 enum class CharacterID {
     Kyo,
 };
 
 using CharacterActionTable = std::map<int32_t, std::vector<InputFrame>>;
+using FollowUpRuleTable = std::vector<FollowUpRule>;
 
 void setForwardOn(kof_env_joypad_state &input, bool forward_is_right) {
     if (forward_is_right)
@@ -147,6 +165,11 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
     auto down = [] {
         kof_env_joypad_state input {};
         input.down = 1;
+        return input;
+    };
+    auto up = [] {
+        kof_env_joypad_state input {};
+        input.up = 1;
         return input;
     };
     auto up_forward = [forward_is_right] {
@@ -186,12 +209,16 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
     kof_env_joypad_state crouch_d = down();
     crouch_d.d = 1;
 
-    kof_env_joypad_state qcf_a = down_forward();
+    kof_env_joypad_state qcf_a = forward();
     qcf_a.a = 1;
-    kof_env_joypad_state qcf_c = down_forward();
-    qcf_c.c = 1;
-    kof_env_joypad_state hcb_c = back();
-    hcb_c.c = 1;
+    kof_env_joypad_state poison_bite = forward();
+    poison_bite.c = 1;
+    kof_env_joypad_state zai_ei = back();
+    zai_ei.c = 1;
+    kof_env_joypad_state zai_ei_transition_up = up();
+    zai_ei_transition_up.c = 1;
+    kof_env_joypad_state zai_ei_transition_up_forward = up_forward();
+    zai_ei_transition_up_forward.c = 1;
     kof_env_joypad_state hcb_d = back();
     hcb_d.d = 1;
     kof_env_joypad_state dp_a = down_forward();
@@ -200,15 +227,19 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
     red_kick_b.b = 1;
     kof_env_joypad_state super_a = forward();
     super_a.a = 1;
+    kof_env_joypad_state orochinagi_c = forward();
+    orochinagi_c.c = 1;
     kof_env_joypad_state jump_forward_c = forward();
     jump_forward_c.c = 1;
     kof_env_joypad_state jump_forward_d = forward();
     jump_forward_d.d = 1;
     kof_env_joypad_state forward_b = forward();
     forward_b.b = 1;
+    kof_env_joypad_state zai_ei_followup = forward();
+    zai_ei_followup.c = 1;
 
     CharacterActionTable kyo {
-        { 0, { { {}, 6 } } },
+        { 0, { { {}, 1 } } },
         { 1, simpleAction(forward()) },
         { 2, simpleAction(back()) },
         { 3, simpleAction(crouch_back) },
@@ -225,25 +256,10 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
         { 14, {
             { down(), 2 },
             { down_forward(), 2 },
-            { qcf_a, 2 },
+            { qcf_a, 4 },
             { {}, 4 },
         } },
         { 15, {
-            { {}, 9 },
-            { down(), 2 },
-            { down_forward(), 2 },
-            { qcf_c, 4 },
-            { {}, 18 },
-            { forward(), 2 },
-            { down_forward(), 2 },
-            { down(), 2 },
-            { down_back(), 2 },
-            { hcb_c, 4 },
-            { {}, 16 },
-            { qcf_c, 4 },
-            { {}, 10 },
-        } },
-        { 16, {
             { {}, 9 },
             { forward(), 2 },
             { down_forward(), 2 },
@@ -252,51 +268,73 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
             { hcb_d, 4 },
             { {}, 12 },
         } },
-        { 17, {
+        { 16, {
             { forward(), 2 },
             { down(), 2 },
             { dp_a, 4 },
             { {}, 8 },
         } },
-        { 18, {
+        { 17, {
             { back(), 2 },
             { down(), 2 },
             { red_kick_b, 4 },
             { {}, 8 },
         } },
-        { 19, {
+        { 18, {
             { down(), 2 },
             { down_back(), 2 },
             { back(), 2 },
             { down_back(), 2 },
+            { down(), 2 },
+            { down_forward(), 2 },
+            { orochinagi_c, 5 },
+            { {}, 12 },
+        } },
+        { 19, {
+            { down(), 2 },
+            { down_forward(), 2 },
+            { forward(), 2 },
             { down(), 2 },
             { down_forward(), 2 },
             { super_a, 5 },
             { {}, 12 },
         } },
         { 20, {
-            { down(), 2 },
-            { down_forward(), 2 },
-            { forward(), 2 },
-            { down(), 2 },
-            { down_forward(), 2 },
-            { super_a, 5 },
-            { {}, 12 },
-        } },
-        { 21, {
             { up_forward(), 2 },
             { forward(), 12 },
             { jump_forward_c, 5 },
             { {}, 18 },
         } },
-        { 22, {
+        { 21, {
             { up_forward(), 2 },
             { forward(), 12 },
             { jump_forward_d, 5 },
             { {}, 10 },
         } },
-        { 23, {
+        { 22, {
             { forward_b, 5 },
+            { {}, 12 },
+        } },
+        { 23, {
+            { down(), 2 },
+            { down_forward(), 2 },
+            { poison_bite, 4 },
+            { {}, 8 },
+        } },
+        { 24, {
+            { forward(), 2 },
+            { down_forward(), 2 },
+            { down(), 2 },
+            { down_back(), 2 },
+            { back(), 1 },
+            { zai_ei, 2 },
+            { zai_ei_transition_up, 1 },
+            { zai_ei_transition_up_forward, 4 },
+            { zai_ei_followup, 2 },
+            { forward(), KYO_BATSU_YOMI_TRIGGER_FRAME - 18 },
+        } },
+        { 25, {
+            { zai_ei_followup, 13 },
             { {}, 8 },
         } },
     };
@@ -311,6 +349,45 @@ public:
         lut_.insert(std::make_pair(
             CharacterID::Kyo,
             std::make_pair(buildCharacterActions(true), buildCharacterActions(false))));
+        follow_up_lut_.insert(std::make_pair(
+            CharacterID::Kyo,
+            FollowUpRuleTable {
+                {
+                    KYO_FORWARD_B_ACTION_ID,
+                    KYO_ARAGAMI_ACTION_ID,
+                    0,
+                    35,
+                    35,
+                },
+                {
+                    KYO_FORWARD_B_ACTION_ID,
+                    KYO_KOTOTSUKI_YOU_ACTION_ID,
+                    0,
+                    6,
+                    6,
+                },
+                {
+                    KYO_FORWARD_B_ACTION_ID,
+                    KYO_OROCHINAGI_ACTION_ID,
+                    0,
+                    35,
+                    35,
+                },
+                {
+                    KYO_FORWARD_B_ACTION_ID,
+                    KYO_RED_KICK_ACTION_ID,
+                    0,
+                    35,
+                    35,
+                },
+                {
+                    KYO_TSUMI_YOMI_ACTION_ID,
+                    KYO_BATSU_YOMI_ACTION_ID,
+                    0,
+                    KYO_BATSU_YOMI_TRIGGER_FRAME,
+                    KYO_BATSU_YOMI_TRIGGER_FRAME,
+                },
+            }));
     }
 
     void setCharacter(CharacterID id) {
@@ -325,9 +402,43 @@ public:
         return nullptr;
     }
 
+    const FollowUpRule *findFollowUpRule(
+        int32_t parent_action_id,
+        int32_t child_action_id) const {
+        const auto table_it = follow_up_lut_.find(current_character_);
+        if (table_it == follow_up_lut_.cend())
+            return nullptr;
+
+        const auto rule_it = std::find_if(
+            table_it->second.cbegin(),
+            table_it->second.cend(),
+            [parent_action_id, child_action_id](const FollowUpRule &rule) {
+                return rule.parent_action_id == parent_action_id &&
+                       rule.child_action_id == child_action_id;
+            });
+        return rule_it != table_it->second.cend() ? &*rule_it : nullptr;
+    }
+
+    bool hasPendingFollowUpWindow(
+        int32_t parent_action_id,
+        int32_t elapsed_frames) const {
+        const auto table_it = follow_up_lut_.find(current_character_);
+        if (table_it == follow_up_lut_.cend())
+            return false;
+
+        return std::any_of(
+            table_it->second.cbegin(),
+            table_it->second.cend(),
+            [parent_action_id, elapsed_frames](const FollowUpRule &rule) {
+                return rule.parent_action_id == parent_action_id &&
+                       elapsed_frames < rule.queue_close_frame_exclusive;
+            });
+    }
+
 private:
 	CharacterID current_character_ = CharacterID::Kyo;
 	std::map<CharacterID, std::pair<CharacterActionTable, CharacterActionTable>> lut_;
+	std::map<CharacterID, FollowUpRuleTable> follow_up_lut_;
 };
 
 class FbneoTrainingRuntime {
@@ -402,7 +513,8 @@ public:
 
         joypads_[P1_PORT] = {};
         joypads_[P2_PORT] = {};
-        clearActionScript();
+        last_frame_joypads_ = {};
+        clearActionState();
         clearP2RandomAiScript();
         retro_reset_();
         return true;
@@ -426,7 +538,8 @@ public:
 
         joypads_[P1_PORT] = {};
         joypads_[P2_PORT] = {};
-        clearActionScript();
+        last_frame_joypads_ = {};
+        clearActionState();
         clearP2RandomAiScript();
         return true;
     }
@@ -463,6 +576,14 @@ public:
         setJoypadForPort(static_cast<unsigned>(P1_PORT), state);
     }
 
+    bool getLastJoypadForPort(unsigned port, kof_env_joypad_state *state) const {
+        if (port >= PLAYER_PORT_COUNT || !state)
+            return false;
+
+        *state = last_frame_joypads_[port];
+        return true;
+    }
+
     void setVideoRefresh(kof_env_video_refresh_t callback, void *user_data) {
         video_refresh_callback_ = callback;
         video_refresh_user_data_ = user_data;
@@ -474,19 +595,59 @@ public:
         joypads_[P2_PORT] = {};
     }
 
+    bool inputReady() const {
+        return active_action_id_ < 0;
+    }
+
+    bool canQueueAction(int32_t action_id) const {
+        if (active_action_id_ < 0 || queued_action_id_ >= 0)
+            return false;
+
+        const FollowUpRule *rule = action_lut_.findFollowUpRule(
+            active_action_id_,
+            action_id);
+        return rule &&
+               active_action_elapsed_frames_ >= rule->queue_open_frame &&
+               active_action_elapsed_frames_ < rule->queue_close_frame_exclusive;
+    }
+
+    bool getActionStatus(kof_env_action_status *status) const {
+        if (!status)
+            return false;
+
+        status->active_action_id = active_action_id_;
+        status->queued_action_id = queued_action_id_;
+        status->last_started_action_id = last_started_action_id_;
+        status->action_accepted = last_action_accepted_ ? 1 : 0;
+        return true;
+    }
+
     void clearActionScript() {
         active_script_.clear();
         active_script_index_ = 0;
         active_script_remaining_frames_ = 0;
     }
 
-    bool startActionScript(std::vector<InputFrame> script) {
+    void clearActionState() {
+        clearActionScript();
+        active_action_id_ = -1;
+        queued_action_id_ = -1;
+        last_started_action_id_ = -1;
+        active_action_elapsed_frames_ = 0;
+        last_action_accepted_ = false;
+    }
+
+    bool startActionScript(int32_t action_id, std::vector<InputFrame> script) {
         if (script.empty())
             return fail("Action script is empty.");
 
         active_script_ = std::move(script);
         active_script_index_ = 0;
         active_script_remaining_frames_ = active_script_[0].frames;
+        active_action_id_ = action_id;
+        active_action_elapsed_frames_ = 0;
+        if (action_id != IDLE_ACTION_ID)
+            last_started_action_id_ = action_id;
         joypads_[P1_PORT] = active_script_[0].state;
         return true;
     }
@@ -521,6 +682,39 @@ public:
             active_script_index_ + 1 >= active_script_.size()) {
             clearActionScript();
             joypads_[P1_PORT] = {};
+        }
+    }
+
+    void advanceActionLifecycleFrame() {
+        if (active_action_id_ < 0)
+            return;
+
+        ++active_action_elapsed_frames_;
+        if (queued_action_id_ >= 0) {
+            const FollowUpRule *rule = action_lut_.findFollowUpRule(
+                active_action_id_,
+                queued_action_id_);
+            if (!rule) {
+                clearActionState();
+                return;
+            }
+
+            if (active_action_elapsed_frames_ >= rule->execute_frame) {
+                const int32_t queued_action_id = queued_action_id_;
+                queued_action_id_ = -1;
+                if (!startActionById(queued_action_id)) {
+                    clearActionState();
+                }
+            }
+            return;
+        }
+
+        if (active_script_.empty() &&
+            !action_lut_.hasPendingFollowUpWindow(
+                active_action_id_,
+                active_action_elapsed_frames_)) {
+            active_action_id_ = -1;
+            active_action_elapsed_frames_ = 0;
         }
     }
 
@@ -586,10 +780,7 @@ public:
         --p2_random_script_remaining_frames_;
     }
 
-    bool setAction(int32_t action_id) {
-        if (!active_script_.empty())
-            return true;
-
+    bool startActionById(int32_t action_id) {
         kof_env_observation observation {};
         const bool has_observation = getObservation(&observation);
         bool facing_left = false;
@@ -611,7 +802,29 @@ public:
         if (action_it == actions->cend())
             return fail("Action id is out of range.");
 
-        return startActionScript(action_it->second);
+        return startActionScript(action_id, action_it->second);
+    }
+
+    bool setAction(int32_t action_id) {
+        last_action_accepted_ = false;
+        if (active_action_id_ >= 0) {
+            if (action_id == IDLE_ACTION_ID) {
+                last_action_accepted_ = true;
+                return true;
+            }
+
+            if (canQueueAction(action_id)) {
+                queued_action_id_ = action_id;
+                last_action_accepted_ = true;
+                return true;
+            }
+
+            // Keep emulation running while reporting that this action was ignored.
+            return true;
+        }
+
+        last_action_accepted_ = startActionById(action_id);
+        return last_action_accepted_;
     }
 
     bool runFrames(int32_t frame_count) {
@@ -624,8 +837,10 @@ public:
         for (int32_t frame = 0; frame < frame_count; ++frame) {
             advanceActionScriptFrame();
             advanceP2RandomAiFrame();
+            last_frame_joypads_ = joypads_;
             retro_run_();
             finishActionScriptFrame();
+            advanceActionLifecycleFrame();
         }
 
         return true;
@@ -909,7 +1124,7 @@ private:
         game_loaded_ = false;
         joypads_[P1_PORT] = {};
         joypads_[P2_PORT] = {};
-        clearActionScript();
+        clearActionState();
         clearP2RandomAiScript();
     }
 
@@ -1024,9 +1239,15 @@ private:
     bool initialized_ = false;
     bool game_loaded_ = false;
     std::array<kof_env_joypad_state, PLAYER_PORT_COUNT> joypads_ {};
+    std::array<kof_env_joypad_state, PLAYER_PORT_COUNT> last_frame_joypads_ {};
     std::vector<InputFrame> active_script_;
     size_t active_script_index_ = 0;
     int32_t active_script_remaining_frames_ = 0;
+    int32_t active_action_id_ = -1;
+    int32_t queued_action_id_ = -1;
+    int32_t last_started_action_id_ = -1;
+    int32_t active_action_elapsed_frames_ = 0;
+    bool last_action_accepted_ = false;
     std::vector<InputFrame> p2_random_script_;
     size_t p2_random_script_index_ = 0;
     int32_t p2_random_script_remaining_frames_ = 0;
@@ -1117,6 +1338,13 @@ void kof_env_set_joypad_for_port(kof_env_handle handle,
         runtime->setJoypadForPort(port, state);
 }
 
+int kof_env_get_last_joypad_for_port(kof_env_handle handle,
+                                     unsigned port,
+                                     kof_env_joypad_state *state) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->getLastJoypadForPort(port, state) ? 1 : 0;
+}
+
 void kof_env_set_video_refresh(kof_env_handle handle,
                                kof_env_video_refresh_t callback,
                                void *user_data) {
@@ -1132,6 +1360,17 @@ void kof_env_set_p2_random_ai(kof_env_handle handle, int enabled) {
 int kof_env_set_action(kof_env_handle handle, int32_t action_id) {
     auto *runtime = runtimeFromHandle(handle);
     return runtime && runtime->setAction(action_id) ? 1 : 0;
+}
+
+int kof_env_can_queue_action(kof_env_handle handle, int32_t action_id) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->canQueueAction(action_id) ? 1 : 0;
+}
+
+int kof_env_get_action_status(kof_env_handle handle,
+                              kof_env_action_status *status) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->getActionStatus(status) ? 1 : 0;
 }
 
 int kof_env_run_frames(kof_env_handle handle, int32_t frame_count) {
@@ -1150,6 +1389,11 @@ int kof_env_step(kof_env_handle handle,
 int kof_env_get_observation(kof_env_handle handle, kof_env_observation *observation) {
     auto *runtime = runtimeFromHandle(handle);
     return runtime && runtime->getObservation(observation) ? 1 : 0;
+}
+
+int kof_env_input_ready(kof_env_handle handle) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->inputReady() ? 1 : 0;
 }
 
 int kof_env_p1_ready_for_action(kof_env_handle handle) {

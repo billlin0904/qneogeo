@@ -64,6 +64,7 @@ private:
     void saveState(int32_t slot = 1);
     void loadState(int32_t slot = 1);
     void updateFpsOverlay(double fps);
+    void updateInputOverlay();
     void updateKof98Overlay();
     void updateOverlayLabelPositions();
 
@@ -77,6 +78,7 @@ private:
     QAction *pause_when_inactive_action_;
     QAction *gameplay_with_ai_p2_action_;
     QAction *show_fps_action_;
+    QAction *show_input_history_action_;
     QAction *show_hitboxes_action_;
     QAction *neocd_core_action_;
     QAction *fbneo_core_action_;

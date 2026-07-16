@@ -57,6 +57,8 @@ public:
     bool loadState(const QString &statePath) override;
     virtual bool readSystemRam(QByteArray &ram) const;
     virtual bool readSystemRamByte(uint32_t address, uint8_t &value) const;
+    EmulatorView::JoypadInput lastP1Input() const;
+    uint64_t emulatedFrameCount() const;
 
     int keyBinding(unsigned retroButtonId) const;
     void setKeyBinding(unsigned retroButtonId, int key);
@@ -103,6 +105,9 @@ protected:
     int16_t inputState(unsigned port, unsigned device, unsigned index, unsigned id) const;
     void finishKeyboardMotionAssist();
     void finishXInputMotionAssist();
+    EmulatorView::JoypadInput currentP1Input() const;
+    void recordP1InputFrame(const EmulatorView::JoypadInput &input);
+    void resetInputFrameTracking();
 
     std::string selected_bios_;
     std::string system_region_option_ = "Japan";
@@ -191,6 +196,8 @@ private:
     std::array<int, 16> key_bindings_ {};
     std::array<int, 16> xinput_bindings_ {};
     unsigned xinput_user_index_ = 0;
+    EmulatorView::JoypadInput last_p1_input_;
+    uint64_t emulated_frame_count_ = 0;
 
     retro_set_environment_t retro_set_environment_ = nullptr;
     retro_set_video_refresh_t retro_set_video_refresh_ = nullptr;

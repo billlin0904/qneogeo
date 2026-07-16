@@ -70,6 +70,7 @@ bool FbneoTrainingCore::startGame(const QString &contentPath,
 
     game_loaded_ = true;
     paused_ = false;
+    resetInputFrameTracking();
     frame_timer_.start(16);
     emit pausedChanged(false);
     return true;
@@ -79,6 +80,7 @@ void FbneoTrainingCore::stop() {
     frame_timer_.stop();
     destroyRuntime();
     game_loaded_ = false;
+    resetInputFrameTracking();
 
     if (videoOutput())
         videoOutput()->clearFrame();
@@ -101,6 +103,8 @@ bool FbneoTrainingCore::reset() {
 
     if (!kof_env_reset_(handle_))
         return failFromRuntime(QStringLiteral("fbneo_training reset failed"));
+
+    resetInputFrameTracking();
 
     if (resume_after_reset)
         frame_timer_.start(16);
@@ -156,6 +160,8 @@ bool FbneoTrainingCore::loadState(const QString &statePath) {
 
     const std::wstring state_path_w = QFileInfo(statePath).absoluteFilePath().toStdWString();
     const bool loaded = kof_env_load_state_(handle_, state_path_w.c_str()) != 0;
+    if (loaded)
+        resetInputFrameTracking();
 
     if (timer_was_active && !paused_)
         frame_timer_.start(16);
@@ -324,6 +330,7 @@ void FbneoTrainingCore::advanceFrame() {
 
     pollXInput();
     updateJoypad();
+    const EmulatorView::JoypadInput p1_input = currentP1Input();
 
     if (!kof_env_run_frames_(handle_, 1)) {
         failFromRuntime(QStringLiteral("fbneo_training frame failed"));
@@ -331,6 +338,7 @@ void FbneoTrainingCore::advanceFrame() {
         return;
     }
 
+    recordP1InputFrame(p1_input);
     finishKeyboardMotionAssist();
     finishXInputMotionAssist();
     emit frameAdvanced();

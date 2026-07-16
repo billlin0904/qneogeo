@@ -64,6 +64,13 @@ typedef struct kof_env_observation {
     uint8_t p2_has_position;
 } kof_env_observation;
 
+typedef struct kof_env_action_status {
+    int32_t active_action_id;
+    int32_t queued_action_id;
+    int32_t last_started_action_id;
+    uint8_t action_accepted;
+} kof_env_action_status;
+
 typedef enum kof_env_hitbox_type {
     KOF_ENV_HITBOX_UNDEFINED = 0,
     KOF_ENV_HITBOX_ATTACK = 1,
@@ -104,11 +111,17 @@ KOF_ENV_API void kof_env_set_joypad(kof_env_handle handle, const kof_env_joypad_
 KOF_ENV_API void kof_env_set_joypad_for_port(kof_env_handle handle,
                                              unsigned port,
                                              const kof_env_joypad_state *state);
+KOF_ENV_API int kof_env_get_last_joypad_for_port(kof_env_handle handle,
+                                                 unsigned port,
+                                                 kof_env_joypad_state *state);
 KOF_ENV_API void kof_env_set_video_refresh(kof_env_handle handle,
                                            kof_env_video_refresh_t callback,
                                            void *user_data);
 KOF_ENV_API void kof_env_set_p2_random_ai(kof_env_handle handle, int enabled);
 KOF_ENV_API int kof_env_set_action(kof_env_handle handle, int32_t action_id);
+KOF_ENV_API int kof_env_can_queue_action(kof_env_handle handle, int32_t action_id);
+KOF_ENV_API int kof_env_get_action_status(kof_env_handle handle,
+                                          kof_env_action_status *status);
 KOF_ENV_API int kof_env_run_frames(kof_env_handle handle, int32_t frame_count);
 KOF_ENV_API int kof_env_step(kof_env_handle handle,
                              int32_t action_id,
@@ -117,6 +130,7 @@ KOF_ENV_API int kof_env_step(kof_env_handle handle,
 
 KOF_ENV_API int kof_env_get_observation(kof_env_handle handle,
                                         kof_env_observation *observation);
+KOF_ENV_API int kof_env_input_ready(kof_env_handle handle);
 KOF_ENV_API int kof_env_p1_ready_for_action(kof_env_handle handle);
 KOF_ENV_API uint32_t kof_env_system_ram_size(kof_env_handle handle);
 KOF_ENV_API int kof_env_copy_system_ram(kof_env_handle handle,

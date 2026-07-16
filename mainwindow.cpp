@@ -52,6 +52,7 @@ MainWindow::MainWindow(QWidget *parent)
     , pause_when_inactive_action_(nullptr)
     , gameplay_with_ai_p2_action_(nullptr)
     , show_fps_action_(nullptr)
+    , show_input_history_action_(nullptr)
     , show_hitboxes_action_(nullptr)
     , neocd_core_action_(nullptr)
     , fbneo_core_action_(nullptr)
@@ -245,6 +246,9 @@ MainWindow::MainWindow(QWidget *parent)
     show_fps_action_ = video_menu->addAction(QStringLiteral("Show FPS"));
     show_fps_action_->setCheckable(true);
     show_fps_action_->setChecked(true);
+    show_input_history_action_ = video_menu->addAction(QStringLiteral("Show Input History"));
+    show_input_history_action_->setCheckable(true);
+    show_input_history_action_->setChecked(true);
     show_hitboxes_action_ = video_menu->addAction(QStringLiteral("Show Hitboxes"));
     show_hitboxes_action_->setCheckable(true);
     show_hitboxes_action_->setChecked(true);
@@ -362,6 +366,8 @@ MainWindow::MainWindow(QWidget *parent)
     connect(show_fps_action_, &QAction::toggled, health_label_, &QLabel::setVisible);
     connect(show_fps_action_, &QAction::toggled, combo_label_, &QLabel::setVisible);
     connect(show_fps_action_, &QAction::toggled, power_label_, &QLabel::setVisible);
+    connect(show_input_history_action_, &QAction::toggled,
+            emulator_view_, &EmulatorView::setInputOverlayEnabled);
     connect(show_hitboxes_action_, &QAction::toggled, emulator_view_, &EmulatorView::setHitboxOverlayEnabled);
     connect(emulator_view_, &EmulatorView::fpsChanged, this, &MainWindow::updateFpsOverlay);
 
@@ -565,6 +571,7 @@ void MainWindow::connectCoreSignals() {
             pause_action_->setChecked(paused);
     });
     connect(core_, &LibretroCore::frameAdvanced, this, &MainWindow::updateKof98Overlay);
+    connect(core_, &LibretroCore::frameAdvanced, this, &MainWindow::updateInputOverlay);
 }
 
 void MainWindow::updateCoreActions() {
@@ -941,6 +948,13 @@ void MainWindow::updateFpsOverlay(double fps) {
 
     fps_label_->adjustSize();
     updateOverlayLabelPositions();
+}
+
+void MainWindow::updateInputOverlay() {
+    if (!emulator_view_ || !core_ || !core_->isGameLoaded())
+        return;
+
+    emulator_view_->submitInputFrame(core_->lastP1Input(), core_->emulatedFrameCount());
 }
 
 void MainWindow::updateKof98Overlay() {

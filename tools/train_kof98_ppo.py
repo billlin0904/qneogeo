@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Callable, Optional
 from importlib.metadata import PackageNotFoundError, version
 
-from kof98_env import Kof98Env
+from kof98_env import (
+    COMBO_SCENARIOS,
+    DEFAULT_COMBO_SCENARIO_NAME,
+    IDLE_ACTION_ID,
+    Kof98Env,
+    TrainingProfile,
+)
 
 
 def default_project_root() -> Path:
@@ -19,15 +25,20 @@ def default_project_root() -> Path:
 
 def make_env(
     root: Path,
-    state_path: Optional[Path],
+    combo_state_path: Optional[Path],
+    fight_state_path: Optional[Path],
+    training_profile: TrainingProfile,
+    combo_scenario: str,
     action_repeat: int,
     seed: int,
+    p2_training_ai: bool = False,
     hitbox_reward: bool = True,
     viewer: bool = False,
     viewer_scale: int = 3,
     viewer_fps: int = 30,
     viewer_speed: float = 1.0,
     viewer_hitboxes: bool = False,
+    viewer_terminal_tail_frames: int = 90,
 ) -> Callable[[], Kof98Env]:
     def _init() -> Kof98Env:
         env = Kof98Env(
@@ -36,13 +47,24 @@ def make_env(
             game_path=root / "roms" / "fbneo" / "kof98.zip",
             system_dir=root / "system",
             save_dir=root / "saves",
-            state_path=state_path,
+            combo_state_path=combo_state_path,
+            fight_state_path=fight_state_path,
             action_repeat=action_repeat,
             hitbox_reward=hitbox_reward,
-            p2_training_ai=True,
+            p2_training_ai=p2_training_ai,
+            training_profile=training_profile,
+            combo_scenario=combo_scenario,
         )
         if viewer:
-            env = TrainingViewerWrapper(env, viewer_scale, viewer_fps, viewer_speed, action_repeat, viewer_hitboxes)
+            env = TrainingViewerWrapper(
+                env,
+                viewer_scale,
+                viewer_fps,
+                viewer_speed,
+                env.action_repeat,
+                viewer_hitboxes,
+                viewer_terminal_tail_frames,
+            )
         env.reset(seed=seed)
         return env
 
@@ -50,11 +72,21 @@ def make_env(
 
 
 class TrainingViewerWrapper:
-    def __init__(self, env: Kof98Env, scale: int, fps: int, speed: float, action_repeat: int, hitboxes: bool):
-        from watch_kof98_ppo import Frame, FrameSink, OpenGlViewer
+    def __init__(
+        self,
+        env: Kof98Env,
+        scale: int,
+        fps: int,
+        speed: float,
+        action_repeat: int,
+        hitboxes: bool,
+        terminal_tail_frames: int,
+    ):
+        from watch_kof98_ppo import Frame, FrameSink, InputHistory, OpenGlViewer
 
         self.env = env
         self.sink = FrameSink()
+        self.input_history = InputHistory()
         self.startup_frame = Frame(pixels=bytes(320 * 224 * 2), width=320, height=224)
         self.viewer = OpenGlViewer(self.startup_frame.width, self.startup_frame.height, max(1, scale))
         self.viewer.draw(self.startup_frame)
@@ -63,6 +95,7 @@ class TrainingViewerWrapper:
         self.fps = max(1, fps)
         self.step_fps = max(1.0, self.fps * max(0.01, speed) / max(1, action_repeat))
         self.hitboxes = hitboxes
+        self.terminal_tail_frames = max(0, terminal_tail_frames)
         self.enabled = True
         self.env.client.set_video_refresh_callback(self.sink.receive)
 
@@ -71,12 +104,15 @@ class TrainingViewerWrapper:
 
     def reset(self, *args, **kwargs):
         result = self.env.reset(*args, **kwargs)
+        self.input_history.clear()
         self._pump_viewer()
         return result
 
     def step(self, action):
         result = self.env.step(action)
         self._pump_viewer()
+        if (result[2] or result[3]) and self.enabled:
+            self._play_terminal_tail()
         return result
 
     def close(self) -> None:
@@ -105,8 +141,17 @@ class TrainingViewerWrapper:
             from watch_kof98_ppo import build_hitbox_overlay_from_client
 
             overlay = build_hitbox_overlay_from_client(self.env.client, frame.width, frame.height)
-        self.viewer.draw(frame, overlay)
+        self.input_history.push(self.env.client.last_joypad())
+        self.viewer.draw(frame, overlay, self.input_history.entries)
         self.clock.tick(self.step_fps)
+
+    def _play_terminal_tail(self) -> None:
+        for _ in range(self.terminal_tail_frames):
+            if not self.enabled:
+                return
+
+            self.env.client.step(IDLE_ACTION_ID, 1)
+            self._pump_viewer()
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,10 +163,43 @@ def parse_args() -> argparse.Namespace:
         help="qneogeo project root.",
     )
     parser.add_argument(
-        "--state",
+        "--combo-state",
         type=Path,
         default=None,
-        help="Initial save state. Defaults to saves/states/kof98.slot1.state if it exists.",
+        help="Combo training save state. Defaults to saves/states/kof98.slot1.state.",
+    )
+    parser.add_argument(
+        "--combo-scenario",
+        action="append",
+        default=None,
+        metavar="NAME=STATE",
+        help=(
+            "Combo scenario and state assignment. Repeat to distribute Combo "
+            "environments across multiple scenarios."
+        ),
+    )
+    parser.add_argument(
+        "--fight-state",
+        type=Path,
+        default=None,
+        help="Fight training save state. Defaults to saves/states/kof98.slot2.state.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("combo", "fight", "mixed"),
+        default="combo",
+        help="Training environment composition.",
+    )
+    parser.add_argument(
+        "--combo-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of parallel environments assigned to Combo in mixed mode.",
+    )
+    parser.add_argument(
+        "--p2-training-ai",
+        action="store_true",
+        help="Enable the DLL P2 training AI in Fight environments.",
     )
     parser.add_argument(
         "--timesteps",
@@ -139,7 +217,7 @@ def parse_args() -> argparse.Namespace:
         "--action-repeat",
         type=int,
         default=6,
-        help="Frames to run for each action.",
+        help="Fight profile setting retained for later. Combo training always uses its profile value of 1.",
     )
     parser.add_argument(
         "--device",
@@ -166,8 +244,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--save-name",
-        default="kof98_ppo",
-        help="Model file prefix.",
+        default=None,
+        help="Model file prefix. Defaults to kof98_<profile>_ppo.",
     )
     parser.add_argument(
         "--viewer",
@@ -198,6 +276,12 @@ def parse_args() -> argparse.Namespace:
         help="Draw KOF98 hitboxes in the training OpenGL viewer.",
     )
     parser.add_argument(
+        "--viewer-terminal-tail-frames",
+        type=int,
+        default=90,
+        help="Play this many extra frames after terminal before the viewer resets.",
+    )
+    parser.add_argument(
         "--tensorboard",
         action="store_true",
         help="Start TensorBoard together with training.",
@@ -211,7 +295,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-hitbox-reward",
         action="store_true",
-        help="Disable per-step hitbox reward shaping for faster training.",
+        help="Ignored by the Combo profile, which always disables hitbox reward shaping.",
     )
     return parser.parse_args()
 
@@ -219,6 +303,63 @@ def parse_args() -> argparse.Namespace:
 def validate_file(path: Path, label: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"{label} not found: {path}")
+
+
+def build_training_profiles(
+    mode: str,
+    num_envs: int,
+    combo_ratio: float,
+) -> list[TrainingProfile]:
+    if num_envs < 1:
+        raise ValueError("--num-envs must be at least 1")
+
+    if mode == "combo":
+        return [TrainingProfile.COMBO] * num_envs
+    if mode == "fight":
+        return [TrainingProfile.FIGHT] * num_envs
+    if mode != "mixed":
+        raise ValueError(f"Unknown training profile: {mode}")
+    if num_envs < 2:
+        raise ValueError("Mixed training requires --num-envs 2 or greater")
+    if not 0.0 < combo_ratio < 1.0:
+        raise ValueError("Mixed training requires --combo-ratio between 0 and 1")
+
+    combo_env_count = int(num_envs * combo_ratio + 0.5)
+    combo_env_count = max(1, min(num_envs - 1, combo_env_count))
+    fight_env_count = num_envs - combo_env_count
+    return (
+        [TrainingProfile.COMBO] * combo_env_count
+        + [TrainingProfile.FIGHT] * fight_env_count
+    )
+
+
+def resolve_combo_scenario_specs(
+    root: Path,
+    values: Optional[list[str]],
+    default_state_path: Path,
+) -> list[tuple[str, Path]]:
+    if not values:
+        return [(DEFAULT_COMBO_SCENARIO_NAME, default_state_path)]
+
+    specs: list[tuple[str, Path]] = []
+    for value in values:
+        name, separator, state_text = value.partition("=")
+        if not separator or not name or not state_text:
+            raise ValueError(
+                f"Invalid --combo-scenario '{value}'. Expected NAME=STATE."
+            )
+        if name not in COMBO_SCENARIOS:
+            available = ", ".join(sorted(COMBO_SCENARIOS))
+            raise ValueError(
+                f"Unknown combo scenario '{name}'. Available: {available}"
+            )
+
+        state_path = Path(state_text)
+        if not state_path.is_absolute():
+            state_path = root / state_path
+        specs.append((name, state_path))
+
+    return specs
 
 
 def stable_baselines3_major_version() -> int:
@@ -265,25 +406,66 @@ def start_tensorboard(log_dir: Path, port: int) -> None:
     print(f"TensorBoard started: http://localhost:{port}/")
 
 
+def close_vec_env_safely(env) -> None:
+    try:
+        env.close()
+        return
+    except (BrokenPipeError, EOFError, OSError) as error:
+        processes = list(getattr(env, "processes", []))
+        exit_codes = [process.exitcode for process in processes]
+        print(
+            f"Warning: vector environment was already closing ({error}). "
+            f"Worker exit codes: {exit_codes}",
+            file=sys.stderr,
+        )
+
+        for remote in getattr(env, "remotes", []):
+            try:
+                remote.close()
+            except OSError:
+                pass
+
+        for process in processes:
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
+
+        env.closed = True
+
+
 def main() -> int:
     args = parse_args()
 
     try:
-        from stable_baselines3 import PPO
+        from sb3_contrib import MaskablePPO
         from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
         from stable_baselines3.common.monitor import Monitor
         from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
     except ImportError as error:
         print("Install training dependencies first:", file=sys.stderr)
-        print("  pip install stable-baselines3 gymnasium tensorboard", file=sys.stderr)
+        print("  pip install stable-baselines3 sb3-contrib gymnasium tensorboard", file=sys.stderr)
         print(f"Import error: {error}", file=sys.stderr)
         return 1
 
     if stable_baselines3_major_version() < 2:
         print("stable-baselines3 2.x is required because Kof98Env uses the Gymnasium API.", file=sys.stderr)
         print("Upgrade in your KofAI environment:", file=sys.stderr)
-        print("  python -m pip install -U \"stable-baselines3[extra]>=2.3.0\" gymnasium tensorboard", file=sys.stderr)
+        print("  python -m pip install -U \"stable-baselines3[extra]>=2.3.0\" \"sb3-contrib>=2.3.0\" gymnasium tensorboard", file=sys.stderr)
         return 1
+
+    class MaskableSubprocVecEnv(SubprocVecEnv):
+        def get_attr(self, attr_name, indices=None):
+            if attr_name == "action_masks":
+                # sb3-contrib 2.3 probes support with get_attr(), which tries to
+                # pickle the bound method and its ctypes.CDLL-backed environment.
+                return [True] * len(self._get_target_remotes(indices))
+
+            return super().get_attr(attr_name, indices)
+
+    class MaskableMonitor(Monitor):
+        def action_masks(self):
+            return self.env.action_masks()
 
     class TrainingMetricsCallback(BaseCallback):
         def __init__(self):
@@ -292,6 +474,8 @@ def main() -> int:
 
         def reset_rollout_metrics(self) -> None:
             self.step_count = 0
+            self.combo_step_count = 0
+            self.fight_step_count = 0
             self.p1_damage = 0.0
             self.p2_damage = 0.0
             self.p1_attack_overlap = 0.0
@@ -333,6 +517,10 @@ def main() -> int:
             self.action_22_hit = 0.0
             self.action_23 = 0.0
             self.action_23_hit = 0.0
+            self.action_24 = 0.0
+            self.action_24_hit = 0.0
+            self.action_25 = 0.0
+            self.action_25_hit = 0.0
             self.distance_x_abs = 0.0
             self.reward_hp = 0.0
             self.reward_hitbox = 0.0
@@ -344,10 +532,41 @@ def main() -> int:
             self.reward_safety = 0.0
             self.reward_fast_win = 0.0
             self.reward_time = 0.0
+            self.combo_episodes = 0.0
+            self.combo_successes = 0.0
+            self.combo_episode_max_total = 0.0
+            self.combo_scenario_metrics: dict[str, dict[str, float]] = {}
+            self.reward_damage = 0.0
+            self.reward_combo_milestone = 0.0
+            self.reward_combo_target = 0.0
+            self.reward_timeout = 0.0
+            self.reward_ko_without_combo = 0.0
+            self.input_ready = 0.0
+            self.combo_phase = 0.0
+            self.reward_phase = 0.0
+            self.reward_complete = 0.0
+            self.reward_phase_reset = 0.0
 
         def _on_step(self) -> bool:
-            for info in self.locals.get("infos", []):
+            infos = self.locals.get("infos", [])
+            dones = self.locals.get("dones", [])
+            for index, info in enumerate(infos):
                 self.step_count += 1
+                training_profile = info.get("training_profile")
+                is_combo_profile = training_profile == TrainingProfile.COMBO.value
+                if is_combo_profile:
+                    self.combo_step_count += 1
+                    scenario_name = str(info.get("combo_scenario", "unknown"))
+                    scenario_metrics = self.combo_scenario_metrics.setdefault(
+                        scenario_name,
+                        {
+                            "episodes": 0.0,
+                            "successes": 0.0,
+                            "episode_max_total": 0.0,
+                        },
+                    )
+                elif training_profile == TrainingProfile.FIGHT.value:
+                    self.fight_step_count += 1
                 self.p1_damage += float(info.get("p1_damage", 0.0))
                 self.p2_damage += float(info.get("p2_damage", 0.0))
                 self.p1_attack_overlap += float(info.get("p1_attack_overlap", 0.0))
@@ -390,6 +609,10 @@ def main() -> int:
                 self.action_22_hit += float(info.get("action_22_hit", 0.0))
                 self.action_23 += float(info.get("action_23", 0.0))
                 self.action_23_hit += float(info.get("action_23_hit", 0.0))
+                self.action_24 += float(info.get("action_24", 0.0))
+                self.action_24_hit += float(info.get("action_24_hit", 0.0))
+                self.action_25 += float(info.get("action_25", 0.0))
+                self.action_25_hit += float(info.get("action_25_hit", 0.0))
                 self.distance_x_abs += float(info.get("distance_x_abs", 0.0))
                 self.reward_hp += float(info.get("reward_hp", 0.0))
                 self.reward_hitbox += float(info.get("reward_hitbox", 0.0))
@@ -401,11 +624,33 @@ def main() -> int:
                 self.reward_safety += float(info.get("reward_safety", 0.0))
                 self.reward_fast_win += float(info.get("reward_fast_win", 0.0))
                 self.reward_time += float(info.get("reward_time", 0.0))
+                self.reward_damage += float(info.get("reward_damage", 0.0))
+                self.reward_combo_milestone += float(info.get("reward_combo_milestone", 0.0))
+                self.reward_combo_target += float(info.get("reward_combo_target", 0.0))
+                self.reward_timeout += float(info.get("reward_timeout", 0.0))
+                self.reward_ko_without_combo += float(info.get("reward_ko_without_combo", 0.0))
+                if is_combo_profile:
+                    self.input_ready += float(info.get("input_ready", 0.0))
+                    self.combo_phase += float(info.get("combo_phase", 0.0))
+                    self.reward_phase += float(info.get("reward_phase", 0.0))
+                    self.reward_complete += float(info.get("reward_complete", 0.0))
+                    self.reward_phase_reset += float(info.get("reward_phase_reset", 0.0))
+
+                if is_combo_profile and index < len(dones) and dones[index]:
+                    self.combo_episodes += 1.0
+                    self.combo_successes += float(info.get("combo_success", 0.0))
+                    self.combo_episode_max_total += float(info.get("episode_max_combo", 0.0))
+                    scenario_metrics["episodes"] += 1.0
+                    scenario_metrics["successes"] += float(info.get("combo_success", 0.0))
+                    scenario_metrics["episode_max_total"] += float(info.get("episode_max_combo", 0.0))
 
             return True
 
         def _on_rollout_end(self) -> None:
             count = max(1, self.step_count)
+            combo_count = max(1, self.combo_step_count)
+            self.logger.record("kof/profile_combo_step_rate", self.combo_step_count / count)
+            self.logger.record("kof/profile_fight_step_rate", self.fight_step_count / count)
             self.logger.record("kof/p1_damage_total", self.p1_damage)
             self.logger.record("kof/p2_damage_total", self.p2_damage)
             self.logger.record("kof/p1_attack_overlap_rate", self.p1_attack_overlap / count)
@@ -458,6 +703,12 @@ def main() -> int:
             self.logger.record("kof/action_23_rate", self.action_23 / count)
             self.logger.record("kof/action_23_hit_total", self.action_23_hit)
             self.logger.record("kof/action_23_hit_rate", self.action_23_hit / max(1.0, self.action_23))
+            self.logger.record("kof/action_24_rate", self.action_24 / count)
+            self.logger.record("kof/action_24_hit_total", self.action_24_hit)
+            self.logger.record("kof/action_24_hit_rate", self.action_24_hit / max(1.0, self.action_24))
+            self.logger.record("kof/action_25_rate", self.action_25 / count)
+            self.logger.record("kof/action_25_hit_total", self.action_25_hit)
+            self.logger.record("kof/action_25_hit_rate", self.action_25_hit / max(1.0, self.action_25))
             self.logger.record("kof/mean_distance_x_abs", self.distance_x_abs / count)
             self.logger.record("kof/reward_hp_total", self.reward_hp)
             self.logger.record("kof/reward_hitbox_total", self.reward_hitbox)
@@ -469,25 +720,85 @@ def main() -> int:
             self.logger.record("kof/reward_safety_total", self.reward_safety)
             self.logger.record("kof/reward_fast_win_total", self.reward_fast_win)
             self.logger.record("kof/reward_time_total", self.reward_time)
+            self.logger.record("kof/combo_episodes_total", self.combo_episodes)
+            self.logger.record("kof/combo_success_rate", self.combo_successes / max(1.0, self.combo_episodes))
+            self.logger.record("kof/combo_episode_max_mean", self.combo_episode_max_total / max(1.0, self.combo_episodes))
+            for scenario_name, metrics in self.combo_scenario_metrics.items():
+                episode_count = max(1.0, metrics["episodes"])
+                self.logger.record(
+                    f"kof_combo/{scenario_name}/success_rate",
+                    metrics["successes"] / episode_count,
+                )
+                self.logger.record(
+                    f"kof_combo/{scenario_name}/episode_max_mean",
+                    metrics["episode_max_total"] / episode_count,
+                )
+            self.logger.record("kof/reward_damage_total", self.reward_damage)
+            self.logger.record("kof/reward_combo_milestone_total", self.reward_combo_milestone)
+            self.logger.record("kof/reward_combo_target_total", self.reward_combo_target)
+            self.logger.record("kof/reward_timeout_total", self.reward_timeout)
+            self.logger.record("kof/reward_ko_without_combo_total", self.reward_ko_without_combo)
+            self.logger.record("kof/input_ready_rate", self.input_ready / combo_count)
+            self.logger.record("kof/mean_combo_phase", self.combo_phase / combo_count)
+            self.logger.record("kof/reward_phase_total", self.reward_phase)
+            self.logger.record("kof/reward_complete_total", self.reward_complete)
+            self.logger.record("kof/reward_phase_reset_total", self.reward_phase_reset)
             self.reset_rollout_metrics()
 
     root = args.root.resolve()
-    state_path = args.state
-    if state_path is None:
-        default_state = root / "saves" / "states" / "kof98.slot1.state"
-        state_path = default_state if default_state.exists() else None
-    elif not state_path.is_absolute():
-        state_path = root / state_path
+    if args.viewer and args.profile == "mixed":
+        print("--viewer cannot display mixed parallel environments. Use combo or fight.", file=sys.stderr)
+        return 2
+    if args.viewer and args.num_envs != 1:
+        print("--viewer requires --num-envs 1. Forcing num-envs to 1.", file=sys.stderr)
+        args.num_envs = 1
+
+    try:
+        training_profiles = build_training_profiles(
+            args.profile,
+            args.num_envs,
+            args.combo_ratio,
+        )
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+
+    combo_state_path = args.combo_state
+    if combo_state_path is None:
+        combo_state_path = root / "saves" / "states" / "kof98.slot1.state"
+    elif not combo_state_path.is_absolute():
+        combo_state_path = root / combo_state_path
+    try:
+        combo_scenario_specs = resolve_combo_scenario_specs(
+            root,
+            args.combo_scenario,
+            combo_state_path,
+        )
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+    fight_state_path = args.fight_state
+    if fight_state_path is None:
+        fight_state_path = root / "saves" / "states" / "kof98.slot2.state"
+    elif not fight_state_path.is_absolute():
+        fight_state_path = root / fight_state_path
 
     validate_file(root / "build-vs2026-x64" / "Release" / "fbneo_training.dll", "fbneo_training.dll")
     validate_file(root / "downloads" / "fbneo_libretro" / "fbneo_libretro.dll", "fbneo_libretro.dll")
     validate_file(root / "roms" / "fbneo" / "kof98.zip", "kof98.zip")
-    if state_path is not None:
-        validate_file(state_path, "Initial save state")
+    combo_env_count = training_profiles.count(TrainingProfile.COMBO)
+    fight_env_count = training_profiles.count(TrainingProfile.FIGHT)
+    if combo_env_count:
+        for scenario_name, scenario_state_path in combo_scenario_specs:
+            validate_file(scenario_state_path, f"Combo state for {scenario_name}")
+            print(f"Combo scenario: {scenario_name} => {scenario_state_path}")
+    if fight_env_count:
+        validate_file(fight_state_path, "Fight save state")
+        print(f"Fight profile state: {fight_state_path}")
+    print(f"Training environments: Combo={combo_env_count}, Fight={fight_env_count}")
 
-    if args.viewer and args.num_envs != 1:
-        print("--viewer requires --num-envs 1. Forcing num-envs to 1.", file=sys.stderr)
-        args.num_envs = 1
+    if args.save_name is None:
+        args.save_name = f"kof98_{args.profile}_ppo"
 
     log_dir = (args.log_dir or root / "ai_logs").resolve()
     save_dir = (args.save_dir or root / "trained_models").resolve()
@@ -497,28 +808,56 @@ def main() -> int:
     if args.tensorboard:
         start_tensorboard(log_dir, args.tensorboard_port)
 
-    def monitored_env(seed: int) -> Callable:
+    environment_specs: list[tuple[TrainingProfile, str, Path]] = []
+    combo_spec_index = 0
+    for training_profile in training_profiles:
+        if training_profile is TrainingProfile.COMBO:
+            scenario_name, scenario_state_path = combo_scenario_specs[
+                combo_spec_index % len(combo_scenario_specs)
+            ]
+            combo_spec_index += 1
+        else:
+            scenario_name, scenario_state_path = combo_scenario_specs[0]
+        environment_specs.append(
+            (training_profile, scenario_name, scenario_state_path)
+        )
+
+    def monitored_env(
+        seed: int,
+        training_profile: TrainingProfile,
+        combo_scenario: str,
+        scenario_state_path: Path,
+    ) -> Callable:
         def _init():
-            return Monitor(make_env(
-                root,
-                state_path,
-                args.action_repeat,
-                seed,
-                not args.no_hitbox_reward,
-                args.viewer,
-                args.viewer_scale,
-                args.viewer_fps,
-                args.viewer_speed,
-                args.viewer_hitboxes,
+            return MaskableMonitor(make_env(
+                root=root,
+                combo_state_path=scenario_state_path,
+                fight_state_path=fight_state_path,
+                training_profile=training_profile,
+                combo_scenario=combo_scenario,
+                action_repeat=args.action_repeat,
+                seed=seed,
+                p2_training_ai=args.p2_training_ai,
+                hitbox_reward=not args.no_hitbox_reward,
+                viewer=args.viewer,
+                viewer_scale=args.viewer_scale,
+                viewer_fps=args.viewer_fps,
+                viewer_speed=args.viewer_speed,
+                viewer_hitboxes=args.viewer_hitboxes,
+                viewer_terminal_tail_frames=args.viewer_terminal_tail_frames,
             )())
 
         return _init
 
-    env_fns = [monitored_env(seed) for seed in range(max(1, args.num_envs))]
+    env_fns = [
+        monitored_env(seed, training_profile, combo_scenario, scenario_state_path)
+        for seed, (training_profile, combo_scenario, scenario_state_path)
+        in enumerate(environment_specs)
+    ]
     if len(env_fns) == 1:
         env = DummyVecEnv(env_fns)
     else:
-        env = SubprocVecEnv(env_fns, start_method="spawn")
+        env = MaskableSubprocVecEnv(env_fns, start_method="spawn")
 
     checkpoint_callback = CheckpointCallback(
         save_freq=max(1, 31_250 // max(1, len(env_fns))),
@@ -530,29 +869,42 @@ def main() -> int:
     if args.resume:
         resume_path = args.resume if args.resume.is_absolute() else root / args.resume
         validate_file(resume_path, "Resume model")
-        model = PPO.load(str(resume_path), env=env, device=args.device)
+        model = MaskablePPO.load(
+            str(resume_path),
+            env=env,
+            device=args.device,
+            tensorboard_log=str(log_dir),
+        )
     else:
-        model = PPO(
+        model = MaskablePPO(
             "MlpPolicy",
             env,
             device=args.device,
             verbose=1,
             n_steps=1024,
             batch_size=128,
-            n_epochs=4,
-            gamma=0.97,
+            n_epochs=6,
+            gamma=0.99,
             gae_lambda=0.95,
             learning_rate=2.5e-4,
+            ent_coef=0.01,
+            clip_range=0.2,
+            target_kl=0.03,
             tensorboard_log=str(log_dir),
         )
 
     try:
-        model.learn(total_timesteps=args.timesteps, callback=callback)
+        model.learn(
+            total_timesteps=args.timesteps,
+            callback=callback,
+            reset_num_timesteps=args.resume is None,
+            tb_log_name=args.save_name,
+        )
         final_path = save_dir / f"{args.save_name}_final.zip"
         model.save(str(final_path))
         print(f"Saved final model: {final_path}")
     finally:
-        env.close()
+        close_vec_env_safely(env)
 
     return 0
 

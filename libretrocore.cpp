@@ -213,6 +213,7 @@ bool LibretroCore::startGame(const QString &contentPath, const QString &systemDi
     pending_xinput_direction_bits_ = 0;
     motion_assist_polls_remaining_ = 0;
     xinput_motion_assist_polls_remaining_ = 0;
+    resetInputFrameTracking();
     frame_timer_.start(16);
     emit pausedChanged(false);
     return true;
@@ -244,6 +245,7 @@ void LibretroCore::stop() {
     pending_xinput_direction_bits_ = 0;
     motion_assist_polls_remaining_ = 0;
     xinput_motion_assist_polls_remaining_ = 0;
+    resetInputFrameTracking();
 
     if (paused_) {
         paused_ = false;
@@ -271,6 +273,7 @@ bool LibretroCore::reset() {
     pending_xinput_direction_bits_ = 0;
     motion_assist_polls_remaining_ = 0;
     xinput_motion_assist_polls_remaining_ = 0;
+    resetInputFrameTracking();
 
     if (video_output_)
         video_output_->clearFrame();
@@ -434,6 +437,7 @@ bool LibretroCore::loadState(const QString &statePath) {
         return false;
     }
 
+    resetInputFrameTracking();
     return true;
 }
 
@@ -733,6 +737,7 @@ bool LibretroCore::eventFilter(QObject *watched, QEvent *event) {
 void LibretroCore::runFrame() {
     if (game_loaded_ && !paused_ && retro_run_) {
         retro_run_();
+        recordP1InputFrame(currentP1Input());
         finishKeyboardMotionAssist();
         finishXInputMotionAssist();
         emit frameAdvanced();
@@ -889,6 +894,56 @@ int16_t LibretroCore::inputState(unsigned port, unsigned device, unsigned, unsig
 
     const auto index = static_cast<size_t>(id);
     return (keyboard_joypad_state_[index] || xinput_joypad_state_[index]) ? 1 : 0;
+}
+
+EmulatorView::JoypadInput LibretroCore::lastP1Input() const {
+    return last_p1_input_;
+}
+
+uint64_t LibretroCore::emulatedFrameCount() const {
+    return emulated_frame_count_;
+}
+
+EmulatorView::JoypadInput LibretroCore::currentP1Input() const {
+    auto pressed = [this](unsigned id) {
+        return inputState(0, RETRO_DEVICE_JOYPAD, 0, id) != 0;
+    };
+
+    EmulatorView::JoypadInput input;
+    input.up = pressed(RETRO_DEVICE_ID_JOYPAD_UP);
+    input.down = pressed(RETRO_DEVICE_ID_JOYPAD_DOWN);
+    input.left = pressed(RETRO_DEVICE_ID_JOYPAD_LEFT);
+    input.right = pressed(RETRO_DEVICE_ID_JOYPAD_RIGHT);
+    input.a = pressed(RETRO_DEVICE_ID_JOYPAD_B);
+    input.b = pressed(RETRO_DEVICE_ID_JOYPAD_A);
+    input.c = pressed(RETRO_DEVICE_ID_JOYPAD_Y);
+    input.d = pressed(RETRO_DEVICE_ID_JOYPAD_X);
+
+    if (pressed(RETRO_DEVICE_ID_JOYPAD_L)) {
+        input.b = true;
+        input.c = true;
+    }
+    if (pressed(RETRO_DEVICE_ID_JOYPAD_L2)) {
+        input.a = true;
+        input.b = true;
+    }
+    if (pressed(RETRO_DEVICE_ID_JOYPAD_R2)) {
+        input.a = true;
+        input.b = true;
+        input.c = true;
+    }
+
+    return input;
+}
+
+void LibretroCore::recordP1InputFrame(const EmulatorView::JoypadInput &input) {
+    last_p1_input_ = input;
+    ++emulated_frame_count_;
+}
+
+void LibretroCore::resetInputFrameTracking() {
+    last_p1_input_ = {};
+    emulated_frame_count_ = 0;
 }
 
 uint8_t LibretroCore::rawKeyboardDirectionBits() const {
