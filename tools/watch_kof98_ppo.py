@@ -51,6 +51,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Send a comma-separated action sequence once, e.g. 23,24,25.",
     )
+    parser.add_argument(
+        "--fixed-actions-loop",
+        action="store_true",
+        help="Reload the initial state and repeat --fixed-actions.",
+    )
+    parser.add_argument(
+        "--fixed-actions-loop-delay",
+        type=int,
+        default=180,
+        help="Frames to keep running after the final fixed action starts before reloading the state.",
+    )
     parser.add_argument("--fixed-action-once", action="store_true", help="Send --fixed-action once after reset, then idle.")
     parser.add_argument("--fixed-action-ignore-ready", action="store_true", help="Send --fixed-action even while P1 is not in normal object state.")
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic model actions.")
@@ -601,6 +612,11 @@ def resolve_state_path(root: Path, state: Optional[Path]) -> Optional[Path]:
 
 def main() -> int:
     args = parse_args()
+    if args.fixed_actions_loop and args.fixed_actions is None:
+        raise ValueError("--fixed-actions-loop requires --fixed-actions.")
+    if args.fixed_actions_loop_delay < 0:
+        raise ValueError("--fixed-actions-loop-delay cannot be negative.")
+
     root = args.root.resolve()
     state_path = resolve_state_path(root, args.state)
     model_path = args.model if args.model is None or args.model.is_absolute() else root / args.model
@@ -622,6 +638,8 @@ def main() -> int:
         print(f"  model: {model_path if model_path else '(none)'}", flush=True)
         if args.fixed_actions is not None:
             print(f"  fixed actions: {','.join(str(action) for action in args.fixed_actions)}", flush=True)
+            if args.fixed_actions_loop:
+                print(f"  fixed actions loop delay: {args.fixed_actions_loop_delay} frames", flush=True)
 
     sink = FrameSink()
     input_history = InputHistory()
@@ -668,6 +686,8 @@ def main() -> int:
     step_fps = max(1.0, float(args.fps) / max(1, env.action_repeat))
     fixed_action_sent = False
     fixed_action_index = 0
+    fixed_sequence_last_action_started = False
+    fixed_sequence_tail_remaining = 0
     terminal_tail_remaining = 0
 
     while running:
@@ -685,6 +705,8 @@ def main() -> int:
                     emulated_frame = 0
                     fixed_action_sent = False
                     fixed_action_index = 0
+                    fixed_sequence_last_action_started = False
+                    fixed_sequence_tail_remaining = 0
                     terminal_tail_remaining = 0
 
         if not paused:
@@ -702,6 +724,25 @@ def main() -> int:
                 env.client.step(action_id, env.action_repeat)
                 emulated_frame += env.action_repeat
                 input_history.push(env.client.last_joypad(), emulated_frame)
+                if (
+                    args.fixed_actions_loop
+                    and fixed_action_index >= len(args.fixed_actions)
+                    and not fixed_sequence_last_action_started
+                ):
+                    action_status = env.client.action_status()
+                    if action_status.last_started_action_id == args.fixed_actions[-1]:
+                        fixed_sequence_last_action_started = True
+                        fixed_sequence_tail_remaining = args.fixed_actions_loop_delay
+
+                if fixed_sequence_last_action_started:
+                    fixed_sequence_tail_remaining -= env.action_repeat
+                    if fixed_sequence_tail_remaining <= 0 and env.client.input_ready():
+                        obs, _ = env.reset()
+                        input_history.clear()
+                        emulated_frame = 0
+                        fixed_action_index = 0
+                        fixed_sequence_last_action_started = False
+                        fixed_sequence_tail_remaining = 0
             elif terminal_tail_remaining > 0:
                 env.client.step(0, env.action_repeat)
                 emulated_frame += env.action_repeat

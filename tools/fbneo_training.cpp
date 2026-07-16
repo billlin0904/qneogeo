@@ -107,11 +107,13 @@ struct FollowUpRule {
     int32_t queue_open_frame = 0;
     int32_t queue_close_frame_exclusive = 0;
     int32_t execute_frame = 0;
+    int32_t script_action_id = -1;
 };
 
 constexpr size_t P1_PORT = 0;
 constexpr size_t P2_PORT = 1;
 constexpr size_t PLAYER_PORT_COUNT = 2;
+constexpr int32_t KYO_CLOSE_C_ACTION_ID = 8;
 constexpr int32_t KYO_ARAGAMI_ACTION_ID = 14;
 constexpr int32_t KYO_KOTOTSUKI_YOU_ACTION_ID = 15;
 constexpr int32_t KYO_ONIYAKI_ACTION_ID = 16;
@@ -123,9 +125,14 @@ constexpr int32_t IDLE_ACTION_ID = 0;
 constexpr int32_t KYO_TSUMI_YOMI_ACTION_ID = 24;
 constexpr int32_t KYO_BATSU_YOMI_ACTION_ID = 25;
 constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID = 26;
+constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_COMBO_SCRIPT_ID = 27;
+constexpr int32_t KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_TRIGGER_FRAME = 5;
 constexpr int32_t KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME = 37;
+constexpr int32_t KYO_FORWARD_B_OROCHINAGI_TRIGGER_FRAME = 19;
 constexpr int32_t KYO_KOTOTSUKI_YOU_BUFFER_TRIGGER_FRAME = 24;
 constexpr int32_t KYO_BATSU_YOMI_TRIGGER_FRAME = 34;
+constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_RECOVERY_FRAMES = 58;
+constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_OROCHINAGI_TRIGGER_FRAME = 63;
 
 enum class CharacterID {
     Kyo,
@@ -204,6 +211,8 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
     neutral_c.c = 1;
     kof_env_joypad_state neutral_d {};
     neutral_d.d = 1;
+    kof_env_joypad_state forward_d = forward();
+    forward_d.d = 1;
     kof_env_joypad_state crouch_a = down();
     crouch_a.a = 1;
     kof_env_joypad_state crouch_b = down();
@@ -286,12 +295,14 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
         } },
         { 18, {
             { down(), 2 },
-            { down_back(), 2 },
-            { back(), 2 },
-            { down_back(), 2 },
-            { down(), 2 },
-            { down_forward(), 2 },
-            { orochinagi_c, 5 },
+            { down_back(), 4 },
+            { back(), 8 },
+            { down_back(), 3 },
+            { down(), 1 },
+            { down_forward(), 4 },
+            { forward(), 1 },
+            { orochinagi_c, 1 },
+            { neutral_c, 29 },
             { {}, 12 },
         } },
         { 19, {
@@ -349,7 +360,15 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
             { neutral_d, 8 },
             { {}, 22 },
             { neutral_d, 13 },
-            { {}, 12 },
+            { {}, KYO_SEVENTY_FIVE_SHIKI_KAI_RECOVERY_FRAMES },
+        } },
+        { KYO_SEVENTY_FIVE_SHIKI_KAI_COMBO_SCRIPT_ID, {
+            { down(), 2 },
+            { down_forward(), 2 },
+            { forward_d, 4 },
+            { {}, 18 },
+            { neutral_d, 8 },
+            { {}, 28 },
         } },
     };
 
@@ -367,6 +386,14 @@ public:
         follow_up_lut_.insert(std::make_pair(
             CharacterID::Kyo,
             FollowUpRuleTable {
+                {
+                    KYO_CLOSE_C_ACTION_ID,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+                    0,
+                    KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_TRIGGER_FRAME,
+                    KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_TRIGGER_FRAME,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_COMBO_SCRIPT_ID,
+                },
                 {
                     KYO_FORWARD_B_ACTION_ID,
                     KYO_ARAGAMI_ACTION_ID,
@@ -392,8 +419,8 @@ public:
                     KYO_FORWARD_B_ACTION_ID,
                     KYO_OROCHINAGI_ACTION_ID,
                     0,
-                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
-                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
+                    KYO_FORWARD_B_OROCHINAGI_TRIGGER_FRAME,
+                    KYO_FORWARD_B_OROCHINAGI_TRIGGER_FRAME,
                 },
                 {
                     KYO_FORWARD_B_ACTION_ID,
@@ -415,6 +442,13 @@ public:
                     0,
                     KYO_BATSU_YOMI_TRIGGER_FRAME,
                     KYO_BATSU_YOMI_TRIGGER_FRAME,
+                },
+                {
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+                    KYO_OROCHINAGI_ACTION_ID,
+                    0,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_OROCHINAGI_TRIGGER_FRAME,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_OROCHINAGI_TRIGGER_FRAME,
                 },
             }));
     }
@@ -731,7 +765,7 @@ public:
             if (active_action_elapsed_frames_ >= rule->execute_frame) {
                 const int32_t queued_action_id = queued_action_id_;
                 queued_action_id_ = -1;
-                if (!startActionById(queued_action_id)) {
+                if (!startActionById(queued_action_id, rule->script_action_id)) {
                     clearActionState();
                 }
             }
@@ -809,7 +843,7 @@ public:
         --p2_random_script_remaining_frames_;
     }
 
-    bool startActionById(int32_t action_id) {
+    bool startActionById(int32_t action_id, int32_t script_action_id = -1) {
         kof_env_observation observation {};
         const bool has_observation = getObservation(&observation);
         bool facing_left = false;
@@ -827,7 +861,9 @@ public:
         if (!actions)
             return fail("Character action table is missing.");
 
-        const auto action_it = actions->find(action_id);
+        const int32_t resolved_script_action_id =
+            script_action_id >= 0 ? script_action_id : action_id;
+        const auto action_it = actions->find(resolved_script_action_id);
         if (action_it == actions->cend())
             return fail("Action id is out of range.");
 
