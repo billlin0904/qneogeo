@@ -121,6 +121,8 @@ constexpr int32_t KYO_FORWARD_B_ACTION_ID = 22;
 constexpr int32_t IDLE_ACTION_ID = 0;
 constexpr int32_t KYO_TSUMI_YOMI_ACTION_ID = 24;
 constexpr int32_t KYO_BATSU_YOMI_ACTION_ID = 25;
+constexpr int32_t KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME = 35;
+constexpr int32_t KYO_KOTOTSUKI_YOU_BUFFER_TRIGGER_FRAME = 24;
 constexpr int32_t KYO_BATSU_YOMI_TRIGGER_FRAME = 34;
 
 enum class CharacterID {
@@ -356,29 +358,29 @@ public:
                     KYO_FORWARD_B_ACTION_ID,
                     KYO_ARAGAMI_ACTION_ID,
                     0,
-                    35,
-                    35,
+                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
+                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
                 },
                 {
                     KYO_FORWARD_B_ACTION_ID,
                     KYO_KOTOTSUKI_YOU_ACTION_ID,
                     0,
-                    6,
-                    6,
+                    KYO_KOTOTSUKI_YOU_BUFFER_TRIGGER_FRAME,
+                    KYO_KOTOTSUKI_YOU_BUFFER_TRIGGER_FRAME,
                 },
                 {
                     KYO_FORWARD_B_ACTION_ID,
                     KYO_OROCHINAGI_ACTION_ID,
                     0,
-                    35,
-                    35,
+                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
+                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
                 },
                 {
                     KYO_FORWARD_B_ACTION_ID,
                     KYO_RED_KICK_ACTION_ID,
                     0,
-                    35,
-                    35,
+                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
+                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
                 },
                 {
                     KYO_TSUMI_YOMI_ACTION_ID,

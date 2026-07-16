@@ -160,6 +160,7 @@ class ComboPhase:
     queue_during_previous: bool = False
     require_combo_increment: bool = False
     require_power_stock_spent: bool = False
+    require_damage: bool = True
     hit_timeout_frames: Optional[int] = None
 
 
@@ -199,10 +200,13 @@ KYO_FORWARD_B_KOTOTSUKI_SCENARIO = ComboScenario(
         ComboPhase(FORWARD_B_ACTION_ID, 2, 3.0),
         ComboPhase(
             KOTOTSUKI_YOU_ACTION_ID,
-            3,
+            5,
             15.0,
             queue_during_previous=True,
             require_combo_increment=True,
+            # The second hit increments the combo before its delayed explosion updates HP.
+            require_damage=False,
+            hit_timeout_frames=120,
         ),
     ),
 )
@@ -1024,7 +1028,7 @@ class Kof98Env(gym.Env if gym else object):
         )
         pending_action_hit = (
             phase is not None
-            and p2_damage > 0.0
+            and (p2_damage > 0.0 or not phase.require_damage)
             and self.pending_chain_action == expected_action
             and self.pending_action_age <= phase_hit_timeout
             and (
