@@ -521,6 +521,8 @@ def main() -> int:
             self.action_24_hit = 0.0
             self.action_25 = 0.0
             self.action_25_hit = 0.0
+            self.action_26 = 0.0
+            self.action_26_hit = 0.0
             self.distance_x_abs = 0.0
             self.reward_hp = 0.0
             self.reward_hitbox = 0.0
@@ -613,6 +615,8 @@ def main() -> int:
                 self.action_24_hit += float(info.get("action_24_hit", 0.0))
                 self.action_25 += float(info.get("action_25", 0.0))
                 self.action_25_hit += float(info.get("action_25_hit", 0.0))
+                self.action_26 += float(info.get("action_26", 0.0))
+                self.action_26_hit += float(info.get("action_26_hit", 0.0))
                 self.distance_x_abs += float(info.get("distance_x_abs", 0.0))
                 self.reward_hp += float(info.get("reward_hp", 0.0))
                 self.reward_hitbox += float(info.get("reward_hitbox", 0.0))
@@ -709,6 +713,9 @@ def main() -> int:
             self.logger.record("kof/action_25_rate", self.action_25 / count)
             self.logger.record("kof/action_25_hit_total", self.action_25_hit)
             self.logger.record("kof/action_25_hit_rate", self.action_25_hit / max(1.0, self.action_25))
+            self.logger.record("kof/action_26_rate", self.action_26 / count)
+            self.logger.record("kof/action_26_hit_total", self.action_26_hit)
+            self.logger.record("kof/action_26_hit_rate", self.action_26_hit / max(1.0, self.action_26))
             self.logger.record("kof/mean_distance_x_abs", self.distance_x_abs / count)
             self.logger.record("kof/reward_hp_total", self.reward_hp)
             self.logger.record("kof/reward_hitbox_total", self.reward_hitbox)

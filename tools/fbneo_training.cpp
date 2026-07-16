@@ -118,10 +118,12 @@ constexpr int32_t KYO_ONIYAKI_ACTION_ID = 16;
 constexpr int32_t KYO_RED_KICK_ACTION_ID = 17;
 constexpr int32_t KYO_OROCHINAGI_ACTION_ID = 18;
 constexpr int32_t KYO_FORWARD_B_ACTION_ID = 22;
+constexpr int32_t KYO_POISON_BITE_ACTION_ID = 23;
 constexpr int32_t IDLE_ACTION_ID = 0;
 constexpr int32_t KYO_TSUMI_YOMI_ACTION_ID = 24;
 constexpr int32_t KYO_BATSU_YOMI_ACTION_ID = 25;
-constexpr int32_t KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME = 35;
+constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID = 26;
+constexpr int32_t KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME = 37;
 constexpr int32_t KYO_KOTOTSUKI_YOU_BUFFER_TRIGGER_FRAME = 24;
 constexpr int32_t KYO_BATSU_YOMI_TRIGGER_FRAME = 34;
 
@@ -317,7 +319,7 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
             { forward_b, 5 },
             { {}, 12 },
         } },
-        { 23, {
+        { KYO_POISON_BITE_ACTION_ID, {
             { down(), 2 },
             { down_forward(), 2 },
             { poison_bite, 4 },
@@ -339,6 +341,16 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
             { zai_ei_followup, 13 },
             { {}, 8 },
         } },
+        { KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID, {
+            { down(), 7 },
+            { down_forward(), 6 },
+            { forward(), 4 },
+            { {}, 2 },
+            { neutral_d, 8 },
+            { {}, 22 },
+            { neutral_d, 13 },
+            { {}, 12 },
+        } },
     };
 
     return kyo;
@@ -351,6 +363,7 @@ public:
         lut_.insert(std::make_pair(
             CharacterID::Kyo,
             std::make_pair(buildCharacterActions(true), buildCharacterActions(false))));
+        // Forward B's second hit can cancel into these queued follow-up actions.
         follow_up_lut_.insert(std::make_pair(
             CharacterID::Kyo,
             FollowUpRuleTable {
@@ -358,8 +371,15 @@ public:
                     KYO_FORWARD_B_ACTION_ID,
                     KYO_ARAGAMI_ACTION_ID,
                     0,
-                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
-                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
+                },
+                {
+                    KYO_FORWARD_B_ACTION_ID,
+                    KYO_ONIYAKI_ACTION_ID,
+                    0,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
                 },
                 {
                     KYO_FORWARD_B_ACTION_ID,
@@ -372,15 +392,22 @@ public:
                     KYO_FORWARD_B_ACTION_ID,
                     KYO_OROCHINAGI_ACTION_ID,
                     0,
-                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
-                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
                 },
                 {
                     KYO_FORWARD_B_ACTION_ID,
                     KYO_RED_KICK_ACTION_ID,
                     0,
-                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
-                    KYO_FORWARD_B_SECOND_HIT_TRIGGER_FRAME,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
+                },
+                {
+                    KYO_FORWARD_B_ACTION_ID,
+                    KYO_POISON_BITE_ACTION_ID,
+                    0,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
+                    KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME,
                 },
                 {
                     KYO_TSUMI_YOMI_ACTION_ID,

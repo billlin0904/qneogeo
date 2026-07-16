@@ -112,6 +112,7 @@ DISTANCE_TOO_FAR_START = 110
 DISTANCE_MAX_PENALTY_AT = 180
 DISTANCE_IN_RANGE_REWARD = 0.02
 DISTANCE_FAR_PENALTY = 0.04
+ACTION_COUNT = 27
 GUARD_ACTION_IDS = {2, 3, 4}
 DEFENSE_PRESSURE_MARGIN = 28
 DEFENSE_GUARD_REWARD = 0.08
@@ -126,7 +127,7 @@ SUPER_NO_STOCK_PENALTY = 0.5
 ONIYAKI_ACTION_ID = 16
 P2_AIRBORNE_Y_THRESHOLD = 185
 ONIYAKI_ANTI_AIR_BONUS = 1.0
-ATTACK_RISK_ACTION_IDS = set(range(14, 26))
+ATTACK_RISK_ACTION_IDS = set(range(14, ACTION_COUNT))
 ATTACK_RISK_WINDOW_STEPS = 4
 ATTACK_RISK_CLOSE_DISTANCE = 55
 ATTACK_RISK_PUNISH_PENALTY = 4.0
@@ -145,9 +146,9 @@ FORWARD_B_ACTION_ID = 22
 POISON_BITE_ACTION_ID = 23
 TSUMI_YOMI_ACTION_ID = 24
 BATSU_YOMI_ACTION_ID = 25
+SEVENTY_FIVE_SHIKI_KAI_ACTION_ID = 26
 
 COMBO_CLOSE_DISTANCE = 45
-FORWARD_B_TO_POISON_BITE_DELAY_FRAMES = 14
 COMBO_PHASE_AGE_SCALE_FRAMES = 30.0
 
 
@@ -175,13 +176,14 @@ KYO_CORNER_DOKUGAMI_SCENARIO = ComboScenario(
     name="kyo_corner_dokugami",
     phases=(
         ComboPhase(CLOSE_C_ACTION_ID, 1, 1.0),
+        ComboPhase(FORWARD_B_ACTION_ID, 2, 3.0),
         ComboPhase(
-            FORWARD_B_ACTION_ID,
-            2,
-            3.0,
-            wait_after_hit_frames=FORWARD_B_TO_POISON_BITE_DELAY_FRAMES,
+            POISON_BITE_ACTION_ID,
+            4,
+            10.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
         ),
-        ComboPhase(POISON_BITE_ACTION_ID, 4, 10.0),
         ComboPhase(TSUMI_YOMI_ACTION_ID, 5, 20.0),
         ComboPhase(
             BATSU_YOMI_ACTION_ID,
@@ -676,7 +678,7 @@ class Kof98Env(gym.Env if gym else object):
         self.frames_since_chain_hit = 0
         self.phase_wait_remaining = 0
 
-        self.action_space = spaces.Discrete(26)
+        self.action_space = spaces.Discrete(ACTION_COUNT)
         self.observation_space = spaces.Box(
             low=-10.0,
             high=10.0,
@@ -845,6 +847,8 @@ class Kof98Env(gym.Env if gym else object):
             "action_24_hit": float(phase_advanced and advanced_action == TSUMI_YOMI_ACTION_ID),
             "action_25": float(action_id == BATSU_YOMI_ACTION_ID and action_accepted),
             "action_25_hit": float(phase_advanced and advanced_action == BATSU_YOMI_ACTION_ID),
+            "action_26": float(action_id == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID and action_accepted),
+            "action_26_hit": float(phase_advanced and advanced_action == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID),
             "reward_damage": reward_parts["damage"],
             "reward_phase": reward_parts["phase"],
             "reward_complete": reward_parts["complete"],
@@ -975,6 +979,8 @@ class Kof98Env(gym.Env if gym else object):
             "action_24_hit": float(action_id == 24 and p2_damage > 0),
             "action_25": float(action_id == 25),
             "action_25_hit": float(action_id == 25 and p2_damage > 0),
+            "action_26": float(action_id == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID),
+            "action_26_hit": float(action_id == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID and p2_damage > 0),
             "distance_x_abs": float(abs(observation.distance_x)),
             "reward_hp": reward_parts["hp"],
             "reward_hitbox": reward_parts["hitbox"],
