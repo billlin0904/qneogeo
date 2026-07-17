@@ -706,6 +706,8 @@ def main() -> int:
             self.reward_complete = 0.0
             self.reward_phase_reset = 0.0
             self.reward_wrong_action = 0.0
+            self.reward_alternate = 0.0
+            self.combo_alternate_successes = 0.0
 
         def _on_step(self) -> bool:
             infos = self.locals.get("infos", [])
@@ -725,6 +727,7 @@ def main() -> int:
                         {
                             "episodes": 0.0,
                             "successes": 0.0,
+                            "alternate_successes": 0.0,
                             "episode_max_total": 0.0,
                         },
                     )
@@ -850,6 +853,7 @@ def main() -> int:
                     self.reward_complete += float(info.get("reward_complete", 0.0))
                     self.reward_phase_reset += float(info.get("reward_phase_reset", 0.0))
                     self.reward_wrong_action += float(info.get("reward_wrong_action", 0.0))
+                    self.reward_alternate += float(info.get("reward_alternate", 0.0))
 
                 if is_combo_profile and index < len(dones) and dones[index]:
                     self.combo_episodes += 1.0
@@ -857,7 +861,9 @@ def main() -> int:
                     self.combo_episode_max_total += float(info.get("episode_max_combo", 0.0))
                     scenario_metrics["episodes"] += 1.0
                     scenario_metrics["successes"] += float(info.get("combo_success", 0.0))
+                    scenario_metrics["alternate_successes"] += float(info.get("combo_alternate_success", 0.0))
                     scenario_metrics["episode_max_total"] += float(info.get("episode_max_combo", 0.0))
+                    self.combo_alternate_successes += float(info.get("combo_alternate_success", 0.0))
 
             return True
 
@@ -955,6 +961,11 @@ def main() -> int:
                     exclude="stdout",
                 )
                 self.logger.record(
+                    f"kof_combo/{scenario_name}/alternate_rate",
+                    metrics.get("alternate_successes", 0.0) / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
                     f"kof_combo/{scenario_name}/episode_max_mean",
                     metrics["episode_max_total"] / episode_count,
                     exclude="stdout",
@@ -970,6 +981,8 @@ def main() -> int:
             self.logger.record("kof/reward_complete_total", self.reward_complete)
             self.logger.record("kof/reward_phase_reset_total", self.reward_phase_reset)
             self.logger.record("kof/reward_wrong_action_total", self.reward_wrong_action)
+            self.logger.record("kof/reward_alternate_total", self.reward_alternate)
+            self.logger.record("kof/combo_alternate_success_total", self.combo_alternate_successes)
             self.logger.record("kof/emulated_frames", self.frames_total)
             self.logger.record("kof/emulated_frames_cumulative", self.cumulative_frames)
 

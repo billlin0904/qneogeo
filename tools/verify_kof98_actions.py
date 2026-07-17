@@ -22,6 +22,15 @@ class ActionCase:
     combo_frames: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class PhysicalRewardCase:
+    scenario: str
+    state_file: str
+    actions: tuple[int, ...]
+    expected_designated: bool = False
+    expected_alternate: bool = False
+
+
 CASES = {
     "crouch_b_crouch_a_mushiki": ActionCase(
         (11, 10, 19),
@@ -41,6 +50,50 @@ CASES = {
         (7, 36, 57, 111, 152, 190),
     ),
     "75_kai_orochinagi": ActionCase((26, 18), (39, 61, 142)),
+}
+
+PHYSICAL_REWARD_CASES = {
+    "alternate_aragami": PhysicalRewardCase(
+        "kyo_close_c_seventy_five_shiki_kai_orochinagi",
+        "kof98.slot1.state",
+        (8, 26, 14),
+        expected_alternate=True,
+    ),
+    "alternate_kototsuki": PhysicalRewardCase(
+        "kyo_close_c_seventy_five_shiki_kai_orochinagi",
+        "kof98.slot1.state",
+        (8, 26, 15),
+        expected_alternate=True,
+    ),
+    "alternate_red_kick": PhysicalRewardCase(
+        "kyo_close_c_seventy_five_shiki_kai_orochinagi",
+        "kof98.slot1.state",
+        (8, 26, 17),
+        expected_alternate=True,
+    ),
+    "designated_orochinagi": PhysicalRewardCase(
+        "kyo_close_c_seventy_five_shiki_kai_orochinagi",
+        "kof98.slot1.state",
+        (8, 26, 18),
+        expected_designated=True,
+    ),
+    "designated_kototsuki_no_meter": PhysicalRewardCase(
+        "kyo_close_c_seventy_five_shiki_kai_kototsuki",
+        "kof98.slot3.state",
+        (8, 26, 15),
+        expected_designated=True,
+    ),
+    "alternate_orochinagi_with_meter": PhysicalRewardCase(
+        "kyo_close_c_seventy_five_shiki_kai_red_kick",
+        "kof98.slot1.state",
+        (8, 26, 18),
+        expected_alternate=True,
+    ),
+    "reject_orochinagi_without_meter": PhysicalRewardCase(
+        "kyo_close_c_seventy_five_shiki_kai_kototsuki",
+        "kof98.slot3.state",
+        (8, 26, 18),
+    ),
 }
 
 
@@ -115,6 +168,54 @@ def verify_combo_scenarios(root: Path, state_path: Path) -> bool:
     return not failed
 
 
+def verify_physical_reward_cases(root: Path) -> bool:
+    failed = False
+    for name, case in PHYSICAL_REWARD_CASES.items():
+        env = Kof98Env(
+            root / "build-vs2026-x64" / "Release" / "fbneo_training.dll",
+            root / "downloads" / "fbneo_libretro" / "fbneo_libretro.dll",
+            root / "roms" / "fbneo" / "kof98.zip",
+            root / "roms" / "fbneo",
+            root / "saves",
+            combo_state_path=root / "saves" / "states" / case.state_file,
+            training_profile=TrainingProfile.COMBO,
+            combo_scenario=case.scenario,
+            action_mask_level=ActionMaskLevel.PHYSICAL,
+        )
+        try:
+            env.reset()
+            pending_actions = list(case.actions)
+            info = {}
+            for frame in range(480):
+                mask = env.action_masks()
+                action_id = 0
+                if pending_actions and mask[pending_actions[0]]:
+                    action_id = pending_actions.pop(0)
+
+                _observation, _reward, terminated, truncated, info = env.step(action_id)
+                if terminated or truncated:
+                    break
+
+            designated = bool(info.get("combo_success", 0.0))
+            alternate = bool(info.get("combo_alternate_success", 0.0))
+            passed = (
+                not pending_actions
+                and designated == case.expected_designated
+                and alternate == case.expected_alternate
+            )
+            status = "PASS" if passed else "FAIL"
+            print(
+                f"[{status}] physical {name}: frame={frame} "
+                f"max_combo={int(info.get('episode_max_combo', 0.0))} "
+                f"designated={int(designated)} alternate={int(alternate)}"
+            )
+            failed = failed or not passed
+        finally:
+            env.close()
+
+    return not failed
+
+
 def main() -> int:
     args = parse_args()
     root = args.root.resolve()
@@ -146,6 +247,7 @@ def main() -> int:
 
     if not args.skip_scenarios:
         failed = not verify_combo_scenarios(root, state_path) or failed
+        failed = not verify_physical_reward_cases(root) or failed
 
     return 1 if failed else 0
 

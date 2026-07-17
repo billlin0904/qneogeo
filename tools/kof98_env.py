@@ -162,6 +162,28 @@ COMBO_PHASE_AGE_SCALE_FRAMES = 30.0
 COMBO_WRONG_ACTION_PENALTY = 0.1
 GUIDED_DISTRACTOR_COUNT = 2
 
+SEVENTY_FIVE_KAI_FINISHER_ACTION_IDS = (
+    ARAGAMI_ACTION_ID,
+    KOTOTSUKI_YOU_ACTION_ID,
+    RED_KICK_ACTION_ID,
+    OROCHINAGI_ACTION_ID,
+)
+SEVENTY_FIVE_KAI_FINISHER_HIT_TIMEOUTS = {
+    ARAGAMI_ACTION_ID: 130,
+    KOTOTSUKI_YOU_ACTION_ID: 150,
+    RED_KICK_ACTION_ID: 120,
+    OROCHINAGI_ACTION_ID: 160,
+}
+SEVENTY_FIVE_KAI_ALTERNATE_REWARD = 8.0
+
+
+def seventy_five_kai_alternates(designated_action_id: int) -> tuple[tuple[int, float], ...]:
+    return tuple(
+        (action_id, SEVENTY_FIVE_KAI_ALTERNATE_REWARD)
+        for action_id in SEVENTY_FIVE_KAI_FINISHER_ACTION_IDS
+        if action_id != designated_action_id
+    )
+
 
 @dataclass(frozen=True)
 class ComboPhase:
@@ -175,6 +197,11 @@ class ComboPhase:
     require_damage: bool = True
     hit_timeout_frames: Optional[int] = None
     allow_started_followup_on_hit: bool = False
+    # Sibling finishers that legitimately combo from the same opener. Landing
+    # one ends the episode with its (smaller) reward instead of a wrong-action
+    # penalty, so scenarios sharing an opener stop emitting contradictory
+    # gradients against real combos.
+    alternate_actions: tuple[tuple[int, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -291,6 +318,7 @@ KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_OROCHINAGI_SCENARIO = ComboScenario(
             require_combo_increment=True,
             require_power_stock_spent=True,
             hit_timeout_frames=160,
+            alternate_actions=seventy_five_kai_alternates(OROCHINAGI_ACTION_ID),
         ),
     ),
 )
@@ -313,6 +341,7 @@ KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_SCENARIO = ComboScenario(
             queue_during_previous=True,
             require_combo_increment=True,
             hit_timeout_frames=120,
+            alternate_actions=seventy_five_kai_alternates(RED_KICK_ACTION_ID),
         ),
     ),
 )
@@ -336,6 +365,7 @@ KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_KOTOTSUKI_SCENARIO = ComboScenario(
             require_combo_increment=True,
             require_damage=False,
             hit_timeout_frames=150,
+            alternate_actions=seventy_five_kai_alternates(KOTOTSUKI_YOU_ACTION_ID),
         ),
     ),
 )
@@ -358,6 +388,7 @@ KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_ARAGAMI_SCENARIO = ComboScenario(
             queue_during_previous=True,
             require_combo_increment=True,
             hit_timeout_frames=130,
+            alternate_actions=seventy_five_kai_alternates(ARAGAMI_ACTION_ID),
         ),
     ),
 )
@@ -857,8 +888,13 @@ class Kof98Env(gym.Env if gym else object):
         self.pending_chain_action: Optional[int] = None
         self.pending_action_age = 0
         self.pending_action_power_stocks: Optional[int] = None
-        self.pending_followup_action: Optional[int] = None
-        self.pending_followup_age = 0
+        self.pending_followups: dict[int, int] = {}
+        self.pending_alternate_action: Optional[int] = None
+        self.pending_alternate_reward = 0.0
+        self.pending_alternate_age = 0
+        self.pending_alternate_min_combo = 0
+        self.pending_alternate_power_stocks: Optional[int] = None
+        self.pending_alternate_hit_timeout = COMBO_PROFILE.action_hit_timeout
         self.frames_since_chain_hit = 0
         self.phase_wait_remaining = 0
 
@@ -891,8 +927,13 @@ class Kof98Env(gym.Env if gym else object):
         self.pending_chain_action = None
         self.pending_action_age = 0
         self.pending_action_power_stocks = None
-        self.pending_followup_action = None
-        self.pending_followup_age = 0
+        self.pending_followups = {}
+        self.pending_alternate_action = None
+        self.pending_alternate_reward = 0.0
+        self.pending_alternate_age = 0
+        self.pending_alternate_min_combo = 0
+        self.pending_alternate_power_stocks = None
+        self.pending_alternate_hit_timeout = COMBO_PROFILE.action_hit_timeout
         self.frames_since_chain_hit = 0
         self.phase_wait_remaining = 0
         return self._make_observation(observation), {
@@ -918,7 +959,11 @@ class Kof98Env(gym.Env if gym else object):
         return self._combo_phase_at(self.combo_phase)
 
     def _queueable_followup_phase(self) -> Optional[ComboPhase]:
-        for phase_index in (self.combo_phase, self.combo_phase + 1):
+        # Scan every remaining phase: at repeat=1 a follow-up window can open
+        # before the previous phase's hit registers (e.g. 75 Kai fires on
+        # frame 5 while Close C's hit lands on frame 7), so the queueable
+        # phase may sit more than one step past combo_phase.
+        for phase_index in range(self.combo_phase, len(self.combo_scenario.phases)):
             phase = self._combo_phase_at(phase_index)
             if (
                 phase is not None
@@ -945,6 +990,29 @@ class Kof98Env(gym.Env if gym else object):
             input_ready_before_step,
             action_accepted,
         )
+        # Alternates from every remaining phase: an early queue can target a
+        # phase more than one step ahead while combo_phase lags the DLL state.
+        expected_alternates: dict[int, float] = {}
+        alternate_min_combo: dict[int, int] = {}
+        alternate_hit_timeouts: dict[int, int] = {}
+        for phase_index in range(self.combo_phase, len(self.combo_scenario.phases)):
+            future_phase = self.combo_scenario.phases[phase_index]
+            previous_required = (
+                self.combo_scenario.phases[phase_index - 1].required_combo
+                if phase_index > 0
+                else 0
+            )
+            for alternate_id, alternate_reward in future_phase.alternate_actions:
+                if alternate_id not in expected_alternates:
+                    expected_alternates[alternate_id] = alternate_reward
+                    alternate_min_combo[alternate_id] = previous_required + 1
+                    alternate_hit_timeouts[alternate_id] = (
+                        SEVENTY_FIVE_KAI_FINISHER_HIT_TIMEOUTS.get(
+                            alternate_id,
+                            future_phase.hit_timeout_frames
+                            or COMBO_PROFILE.action_hit_timeout,
+                        )
+                    )
         if (
             not input_ready_before_step
             and queueable_followup_phase is not None
@@ -956,19 +1024,40 @@ class Kof98Env(gym.Env if gym else object):
                 or action_status.last_started_action_id == action_id
             )
         ):
-            self.pending_followup_action = action_id
-            self.pending_followup_age = 0
+            self.pending_followups[action_id] = 0
             if previous is not None:
                 self.pending_action_power_stocks = max(
                     0,
                     previous.p1_advanced_power_stocks,
                 )
+        elif (
+            not input_ready_before_step
+            and action_id in expected_alternates
+            and action_accepted
+            and (
+                action_status.queued_action_id == action_id
+                or action_status.active_action_id == action_id
+                or action_status.last_started_action_id == action_id
+            )
+        ):
+            self.pending_alternate_action = action_id
+            self.pending_alternate_reward = expected_alternates[action_id]
+            self.pending_alternate_age = 0
+            self.pending_alternate_min_combo = alternate_min_combo[action_id]
+            self.pending_alternate_power_stocks = (
+                max(0, previous.p1_advanced_power_stocks)
+                if previous is not None
+                else None
+            )
+            self.pending_alternate_hit_timeout = alternate_hit_timeouts[action_id]
         self.episode_steps += 1
 
         if self.pending_chain_action is not None:
             self.pending_action_age += COMBO_PROFILE.action_repeat
-        if self.pending_followup_action is not None:
-            self.pending_followup_age += COMBO_PROFILE.action_repeat
+        for pending_followup_action in self.pending_followups:
+            self.pending_followups[pending_followup_action] += COMBO_PROFILE.action_repeat
+        if self.pending_alternate_action is not None:
+            self.pending_alternate_age += COMBO_PROFILE.action_repeat
 
         p1_damage = 0.0
         p2_damage = 0.0
@@ -979,7 +1068,7 @@ class Kof98Env(gym.Env if gym else object):
                 p2_damage = float(max(0, previous.p2_health - observation.p2_health))
 
         phase_before_reward = self.combo_phase
-        reward, reward_parts, combo_success = self._combo_reward(
+        reward, reward_parts, combo_success, alternate_success = self._combo_reward(
             previous,
             observation,
             p1_damage,
@@ -989,6 +1078,7 @@ class Kof98Env(gym.Env if gym else object):
         wrong_action = (
             action_accepted
             and action_id != IDLE_ACTION_ID
+            and action_id not in expected_alternates
             and (
                 expected_phase_before_step is None
                 or action_id != expected_phase_before_step.action_id
@@ -1004,7 +1094,7 @@ class Kof98Env(gym.Env if gym else object):
         p1_ko = 0 <= observation.p1_health <= 0
         p2_ko = 0 <= observation.p2_health <= 0
         round_finished = observation.round_time == 0
-        terminated = combo_success or p1_ko or p2_ko or round_finished
+        terminated = combo_success or alternate_success or p1_ko or p2_ko or round_finished
         truncated = not terminated and self.episode_steps >= COMBO_PROFILE.max_episode_steps
 
         self.previous_observation = observation
@@ -1024,10 +1114,16 @@ class Kof98Env(gym.Env if gym else object):
             "episode_max_combo": float(self.episode_max_combo),
             "combo_phase": float(self.combo_phase),
             "combo_success": float(combo_success),
+            "combo_alternate_success": float(alternate_success),
+            "combo_alternate_action": float(
+                self.pending_alternate_action
+                if self.pending_alternate_action is not None
+                else -1
+            ),
             "input_ready": float(self._combo_input_ready()),
             "input_accepted": float(action_accepted),
             "pending_chain_action": float(self.pending_chain_action if self.pending_chain_action is not None else -1),
-            "pending_followup_action": float(self.pending_followup_action if self.pending_followup_action is not None else -1),
+            "pending_followup_count": float(len(self.pending_followups)),
             "phase_wait_remaining": float(self.phase_wait_remaining),
             "active_action_id": float(action_status.active_action_id),
             "queued_action_id": float(action_status.queued_action_id),
@@ -1059,6 +1155,7 @@ class Kof98Env(gym.Env if gym else object):
             "reward_damage": reward_parts["damage"],
             "reward_phase": reward_parts["phase"],
             "reward_complete": reward_parts["complete"],
+            "reward_alternate": reward_parts["alternate"],
             "reward_phase_reset": reward_parts["phase_reset"],
             "reward_timeout": reward_parts["timeout"],
             "reward_ko_without_combo": reward_parts["ko_without_combo"],
@@ -1293,18 +1390,19 @@ class Kof98Env(gym.Env if gym else object):
         p1_damage: float,
         p2_damage: float,
         action_status: ActionStatus,
-    ) -> tuple[float, dict[str, float], bool]:
+    ) -> tuple[float, dict[str, float], bool, bool]:
         reward_parts = {
             "damage": 0.0,
             "phase": 0.0,
             "complete": 0.0,
+            "alternate": 0.0,
             "phase_reset": 0.0,
             "timeout": 0.0,
             "ko_without_combo": 0.0,
             "time": -COMBO_PROFILE.time_penalty,
         }
         if previous is None:
-            return 0.0, reward_parts, False
+            return 0.0, reward_parts, False, False
 
         if p2_damage > 0.0:
             reward_parts["damage"] += min(
@@ -1361,10 +1459,15 @@ class Kof98Env(gym.Env if gym else object):
             self.combo_phase += 1
             self.phase_wait_remaining = phase.wait_after_hit_frames
             next_phase = self._current_combo_phase()
+            followup_age = (
+                self.pending_followups.get(next_phase.action_id)
+                if next_phase is not None
+                else None
+            )
             followup_is_queued_or_started = (
                 next_phase is not None
                 and next_phase.queue_during_previous
-                and self.pending_followup_action == next_phase.action_id
+                and followup_age is not None
                 and (
                     action_status.queued_action_id == next_phase.action_id
                     or action_status.active_action_id == next_phase.action_id
@@ -1373,13 +1476,31 @@ class Kof98Env(gym.Env if gym else object):
             )
             if followup_is_queued_or_started:
                 self.pending_chain_action = next_phase.action_id
-                self.pending_action_age = self.pending_followup_age
+                self.pending_action_age = followup_age
+                del self.pending_followups[next_phase.action_id]
             else:
                 self.pending_chain_action = None
                 self.pending_action_age = 0
                 self.pending_action_power_stocks = None
-            self.pending_followup_action = None
-            self.pending_followup_age = 0
+            remaining_phases = self.combo_scenario.phases[self.combo_phase:]
+            remaining_actions = {phase.action_id for phase in remaining_phases}
+            self.pending_followups = {
+                pending_action: pending_age
+                for pending_action, pending_age in self.pending_followups.items()
+                if pending_action in remaining_actions
+            }
+            remaining_alternates = {
+                alternate_id
+                for phase in remaining_phases
+                for alternate_id, _ in phase.alternate_actions
+            }
+            if self.pending_alternate_action not in remaining_alternates:
+                self.pending_alternate_action = None
+                self.pending_alternate_reward = 0.0
+                self.pending_alternate_age = 0
+                self.pending_alternate_min_combo = 0
+                self.pending_alternate_power_stocks = None
+                self.pending_alternate_hit_timeout = COMBO_PROFILE.action_hit_timeout
             self.frames_since_chain_hit = 0
         elif self.combo_phase > 0:
             self.frames_since_chain_hit += COMBO_PROFILE.action_repeat
@@ -1387,7 +1508,33 @@ class Kof98Env(gym.Env if gym else object):
         combo_success = self.combo_phase >= len(self.combo_scenario.phases)
         if combo_success:
             reward_parts["complete"] += self.combo_scenario.complete_reward
-            return float(sum(reward_parts.values())), reward_parts, True
+            return float(sum(reward_parts.values())), reward_parts, True, False
+
+        alternate_power_valid = (
+            self.pending_alternate_action not in SUPER_ACTION_IDS
+            or (
+                self.pending_alternate_power_stocks is not None
+                and 0 <= current.p1_advanced_power_stocks
+                < self.pending_alternate_power_stocks
+            )
+        )
+        alternate_hit = (
+            not phase_advanced
+            and self.pending_alternate_action is not None
+            and current_combo > previous_combo
+            and current_combo >= self.pending_alternate_min_combo
+            and self.pending_alternate_age <= self.pending_alternate_hit_timeout
+            and alternate_power_valid
+            # The queued sibling must actually have fired; otherwise hits from
+            # the still-active opener would bank the alternate reward early.
+            and (
+                action_status.active_action_id == self.pending_alternate_action
+                or action_status.last_started_action_id == self.pending_alternate_action
+            )
+        )
+        if alternate_hit:
+            reward_parts["alternate"] += self.pending_alternate_reward
+            return float(sum(reward_parts.values())), reward_parts, False, True
 
         p2_ko = previous.p2_health > 0 and 0 <= current.p2_health <= 0
         if p2_ko:
@@ -1414,6 +1561,16 @@ class Kof98Env(gym.Env if gym else object):
             self.pending_chain_action = None
             self.pending_action_age = 0
             self.pending_action_power_stocks = None
+        if (
+            self.pending_alternate_action is not None
+            and self.pending_alternate_age > self.pending_alternate_hit_timeout
+        ):
+            self.pending_alternate_action = None
+            self.pending_alternate_reward = 0.0
+            self.pending_alternate_age = 0
+            self.pending_alternate_min_combo = 0
+            self.pending_alternate_power_stocks = None
+            self.pending_alternate_hit_timeout = COMBO_PROFILE.action_hit_timeout
 
         if chain_expired:
             reward_parts["phase_reset"] -= COMBO_PROFILE.phase_reset_penalty
@@ -1421,8 +1578,13 @@ class Kof98Env(gym.Env if gym else object):
             self.pending_chain_action = None
             self.pending_action_age = 0
             self.pending_action_power_stocks = None
-            self.pending_followup_action = None
-            self.pending_followup_age = 0
+            self.pending_followups = {}
+            self.pending_alternate_action = None
+            self.pending_alternate_reward = 0.0
+            self.pending_alternate_age = 0
+            self.pending_alternate_min_combo = 0
+            self.pending_alternate_power_stocks = None
+            self.pending_alternate_hit_timeout = COMBO_PROFILE.action_hit_timeout
             self.frames_since_chain_hit = 0
             self.phase_wait_remaining = 0
 
@@ -1430,7 +1592,7 @@ class Kof98Env(gym.Env if gym else object):
         if timeout:
             reward_parts["timeout"] -= COMBO_PROFILE.episode_timeout_penalty
 
-        return float(sum(reward_parts.values())), reward_parts, combo_success
+        return float(sum(reward_parts.values())), reward_parts, combo_success, False
 
     def _track_pending_chain_action(
         self,
@@ -1443,6 +1605,7 @@ class Kof98Env(gym.Env if gym else object):
 
         phase = self._current_combo_phase()
         expected_action = phase.action_id if phase is not None else None
+        alternate_rewards = dict(phase.alternate_actions) if phase is not None else {}
         if action_id == expected_action:
             self.pending_chain_action = action_id
             self.pending_action_age = 0
@@ -1451,10 +1614,45 @@ class Kof98Env(gym.Env if gym else object):
                     0,
                     self.previous_observation.p1_advanced_power_stocks,
                 )
+            self.pending_alternate_action = None
+            self.pending_alternate_reward = 0.0
+            self.pending_alternate_age = 0
+            self.pending_alternate_min_combo = 0
+            self.pending_alternate_power_stocks = None
+            self.pending_alternate_hit_timeout = COMBO_PROFILE.action_hit_timeout
+        elif action_id in alternate_rewards:
+            self.pending_alternate_action = action_id
+            self.pending_alternate_reward = alternate_rewards[action_id]
+            self.pending_alternate_age = 0
+            self.pending_alternate_min_combo = (
+                self.combo_scenario.phases[self.combo_phase - 1].required_combo + 1
+                if self.combo_phase > 0
+                else 1
+            )
+            self.pending_alternate_power_stocks = (
+                max(0, self.previous_observation.p1_advanced_power_stocks)
+                if self.previous_observation is not None
+                else None
+            )
+            self.pending_alternate_hit_timeout = (
+                SEVENTY_FIVE_KAI_FINISHER_HIT_TIMEOUTS.get(
+                    action_id,
+                    phase.hit_timeout_frames or COMBO_PROFILE.action_hit_timeout,
+                )
+            )
+            self.pending_chain_action = None
+            self.pending_action_age = 0
+            self.pending_action_power_stocks = None
         elif action_id != IDLE_ACTION_ID:
             self.pending_chain_action = None
             self.pending_action_age = 0
             self.pending_action_power_stocks = None
+            self.pending_alternate_action = None
+            self.pending_alternate_reward = 0.0
+            self.pending_alternate_age = 0
+            self.pending_alternate_min_combo = 0
+            self.pending_alternate_power_stocks = None
+            self.pending_alternate_hit_timeout = COMBO_PROFILE.action_hit_timeout
 
     def _combo_input_ready(self) -> bool:
         if (
