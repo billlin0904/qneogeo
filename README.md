@@ -323,3 +323,39 @@ Neo Geo 68K RAM 位址，例如：
 - Debug build 保留 console，方便查看 shader、libretro 與音訊 log。
 - Release build 不會開 console。
 - `config/`、`roms/`、`saves/`、`system/` 是本機資料，不會進入 git。
+
+## KOF98 PPO Training
+
+`fbneo_training.dll` 提供無音訊的 FBNeo 訓練 runtime。Python 透過 ctypes 使用
+29 個高階 Action，C++ 負責角色朝向、逐 frame 輸入腳本與派生技 queue。
+
+訓練 state：
+
+```text
+saves/states/kof98.slot1.state  Combo profile
+saves/states/kof98.slot2.state  Fight profile
+```
+
+Combo mask curriculum：
+
+```text
+strict    Idle + 正確 phase Action
+guided    strict + 兩個物理合法干擾 Action
+physical  空閒時開放全部 Action，忙碌時只允許 Idle 與合法 queued follow-up
+```
+
+目前 Combo scenarios 可用 `--combo-scenario NAME=STATE` 重複指定，包含毒咬三段、
+前 B 接琴月陽／大蛇薙／R.E.D. Kick／荒咬，以及
+`Close C -> 七十五式改 -> 大蛇薙／R.E.D. Kick／琴月陽／荒咬`，以及角落限定的
+`Close C -> 七十五式改 -> 荒咬 -> 八錆 -> 砌穿`，也包含
+`蹲 B -> 蹲 A -> 無式` 的 7 Hit 低段確認連段。
+
+修改 Action frame 後先執行 deterministic 驗證：
+
+```powershell
+C:\Users\User\anaconda3\envs\KofAI\python.exe tools\verify_kof98_actions.py
+```
+
+新的 Action space 是 `Discrete(29)`。舊 `Discrete(26)`／`Discrete(27)` 模型只能用
+Viewer 觀看，不能接續訓練 Action 27、28。建議依序訓練 strict、guided、physical Combo，最後使用
+`--profile mixed --mask-level physical` 混入 Fight environments。

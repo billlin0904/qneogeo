@@ -113,19 +113,27 @@ struct FollowUpRule {
 constexpr size_t P1_PORT = 0;
 constexpr size_t P2_PORT = 1;
 constexpr size_t PLAYER_PORT_COUNT = 2;
+constexpr int32_t KYO_CROUCH_A_ACTION_ID = 10;
+constexpr int32_t KYO_CROUCH_B_ACTION_ID = 11;
 constexpr int32_t KYO_CLOSE_C_ACTION_ID = 8;
 constexpr int32_t KYO_ARAGAMI_ACTION_ID = 14;
 constexpr int32_t KYO_KOTOTSUKI_YOU_ACTION_ID = 15;
 constexpr int32_t KYO_ONIYAKI_ACTION_ID = 16;
 constexpr int32_t KYO_RED_KICK_ACTION_ID = 17;
 constexpr int32_t KYO_OROCHINAGI_ACTION_ID = 18;
+constexpr int32_t KYO_MUSHIKI_ACTION_ID = 19;
 constexpr int32_t KYO_FORWARD_B_ACTION_ID = 22;
 constexpr int32_t KYO_POISON_BITE_ACTION_ID = 23;
 constexpr int32_t IDLE_ACTION_ID = 0;
 constexpr int32_t KYO_TSUMI_YOMI_ACTION_ID = 24;
 constexpr int32_t KYO_BATSU_YOMI_ACTION_ID = 25;
 constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID = 26;
-constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_COMBO_SCRIPT_ID = 27;
+constexpr int32_t KYO_YANO_SABI_ACTION_ID = 27;
+constexpr int32_t KYO_MIGIRI_UGACHI_ACTION_ID = 28;
+constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_COMBO_SCRIPT_ID = 1000;
+constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_SCRIPT_ID = 1001;
+constexpr int32_t KYO_CROUCH_A_MUSHIKI_BUFFER_SCRIPT_ID = 1002;
+constexpr int32_t KYO_MUSHIKI_FINISH_SCRIPT_ID = 1003;
 constexpr int32_t KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_TRIGGER_FRAME = 5;
 constexpr int32_t KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME = 37;
 constexpr int32_t KYO_FORWARD_B_OROCHINAGI_TRIGGER_FRAME = 19;
@@ -133,6 +141,13 @@ constexpr int32_t KYO_KOTOTSUKI_YOU_BUFFER_TRIGGER_FRAME = 24;
 constexpr int32_t KYO_BATSU_YOMI_TRIGGER_FRAME = 34;
 constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_RECOVERY_FRAMES = 58;
 constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_OROCHINAGI_TRIGGER_FRAME = 63;
+constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_TRIGGER_FRAME = 75;
+constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_KOTOTSUKI_TRIGGER_FRAME = 75;
+constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_ARAGAMI_TRIGGER_FRAME = 85;
+constexpr int32_t KYO_ARAGAMI_YANO_SABI_TRIGGER_FRAME = 10;
+constexpr int32_t KYO_YANO_SABI_MIGIRI_UGACHI_TRIGGER_FRAME = 29;
+constexpr int32_t KYO_CROUCH_B_CROUCH_A_TRIGGER_FRAME = 17;
+constexpr int32_t KYO_CROUCH_A_MUSHIKI_TRIGGER_FRAME = 9;
 
 enum class CharacterID {
     Kyo,
@@ -234,10 +249,14 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
     zai_ei_transition_up_forward.c = 1;
     kof_env_joypad_state hcb_d = back();
     hcb_d.d = 1;
+    kof_env_joypad_state hcb_a = back();
+    hcb_a.a = 1;
     kof_env_joypad_state dp_a = down_forward();
     dp_a.a = 1;
     kof_env_joypad_state red_kick_b = down_back();
     red_kick_b.b = 1;
+    kof_env_joypad_state back_b = back();
+    back_b.b = 1;
     kof_env_joypad_state super_a = forward();
     super_a.a = 1;
     kof_env_joypad_state orochinagi_c = forward();
@@ -262,8 +281,16 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
         { 7, simpleAction(neutral_b) },
         { 8, simpleAction(neutral_c) },
         { 9, simpleAction(neutral_d) },
-        { 10, simpleAction(crouch_a) },
-        { 11, simpleAction(crouch_b) },
+        { 10, {
+            { crouch_a, 5 },
+            { down(), 1 },
+            { {}, 2 },
+        } },
+        { 11, {
+            { crouch_b, 5 },
+            { down(), 12 },
+            { {}, 2 },
+        } },
         { 12, simpleAction(crouch_c) },
         { 13, simpleAction(crouch_d) },
         { 14, {
@@ -362,6 +389,31 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
             { neutral_d, 13 },
             { {}, KYO_SEVENTY_FIVE_SHIKI_KAI_RECOVERY_FRAMES },
         } },
+        { KYO_YANO_SABI_ACTION_ID, {
+            { forward(), 2 },
+            { down_forward(), 2 },
+            { down(), 2 },
+            { down_back(), 2 },
+            { hcb_a, 4 },
+            { {}, 12 },
+        } },
+        { KYO_MIGIRI_UGACHI_ACTION_ID, {
+            { neutral_c, 4 },
+            { {}, 8 },
+        } },
+        { KYO_CROUCH_A_MUSHIKI_BUFFER_SCRIPT_ID, {
+            { crouch_a, 5 },
+            { down(), 1 },
+            { down_forward(), 2 },
+            { forward(), 1 },
+            { {}, 12 },
+        } },
+        { KYO_MUSHIKI_FINISH_SCRIPT_ID, {
+            { down(), 1 },
+            { down_forward(), 2 },
+            { super_a, 5 },
+            { {}, 12 },
+        } },
         { KYO_SEVENTY_FIVE_SHIKI_KAI_COMBO_SCRIPT_ID, {
             { down(), 2 },
             { down_forward(), 2 },
@@ -369,6 +421,14 @@ CharacterActionTable buildCharacterActions(bool forward_is_right) {
             { {}, 18 },
             { neutral_d, 8 },
             { {}, 28 },
+        } },
+        { KYO_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_SCRIPT_ID, {
+            { back(), 6 },
+            { down_back(), 2 },
+            { down(), 4 },
+            { red_kick_b, 1 },
+            { back_b, 2 },
+            { {}, 8 },
         } },
     };
 
@@ -386,6 +446,22 @@ public:
         follow_up_lut_.insert(std::make_pair(
             CharacterID::Kyo,
             FollowUpRuleTable {
+                {
+                    KYO_CROUCH_B_ACTION_ID,
+                    KYO_CROUCH_A_ACTION_ID,
+                    0,
+                    KYO_CROUCH_B_CROUCH_A_TRIGGER_FRAME,
+                    KYO_CROUCH_B_CROUCH_A_TRIGGER_FRAME,
+                    KYO_CROUCH_A_MUSHIKI_BUFFER_SCRIPT_ID,
+                },
+                {
+                    KYO_CROUCH_A_ACTION_ID,
+                    KYO_MUSHIKI_ACTION_ID,
+                    0,
+                    KYO_CROUCH_A_MUSHIKI_TRIGGER_FRAME,
+                    KYO_CROUCH_A_MUSHIKI_TRIGGER_FRAME,
+                    KYO_MUSHIKI_FINISH_SCRIPT_ID,
+                },
                 {
                     KYO_CLOSE_C_ACTION_ID,
                     KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
@@ -449,6 +525,42 @@ public:
                     0,
                     KYO_SEVENTY_FIVE_SHIKI_KAI_OROCHINAGI_TRIGGER_FRAME,
                     KYO_SEVENTY_FIVE_SHIKI_KAI_OROCHINAGI_TRIGGER_FRAME,
+                },
+                {
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+                    KYO_RED_KICK_ACTION_ID,
+                    0,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_TRIGGER_FRAME,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_TRIGGER_FRAME,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_SCRIPT_ID,
+                },
+                {
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+                    KYO_KOTOTSUKI_YOU_ACTION_ID,
+                    0,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_KOTOTSUKI_TRIGGER_FRAME,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_KOTOTSUKI_TRIGGER_FRAME,
+                },
+                {
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+                    KYO_ARAGAMI_ACTION_ID,
+                    0,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_ARAGAMI_TRIGGER_FRAME,
+                    KYO_SEVENTY_FIVE_SHIKI_KAI_ARAGAMI_TRIGGER_FRAME,
+                },
+                {
+                    KYO_ARAGAMI_ACTION_ID,
+                    KYO_YANO_SABI_ACTION_ID,
+                    0,
+                    KYO_ARAGAMI_YANO_SABI_TRIGGER_FRAME,
+                    KYO_ARAGAMI_YANO_SABI_TRIGGER_FRAME,
+                },
+                {
+                    KYO_YANO_SABI_ACTION_ID,
+                    KYO_MIGIRI_UGACHI_ACTION_ID,
+                    0,
+                    KYO_YANO_SABI_MIGIRI_UGACHI_TRIGGER_FRAME,
+                    KYO_YANO_SABI_MIGIRI_UGACHI_TRIGGER_FRAME,
                 },
             }));
     }
@@ -538,6 +650,7 @@ public:
 
         if (game_loaded_)
             unloadGame();
+        clearStateCache();
 
         game_path_utf8_ = absoluteUtf8Path(game_path);
         system_directory_utf8_ = absoluteUtf8Path(system_directory);
@@ -588,15 +701,12 @@ public:
             return fail("No loaded game for state load.");
 
         const std::wstring path = absoluteWidePath(state_path);
-        std::ifstream file(path, std::ios::binary);
-        if (!file)
-            return fail("Could not open state file for reading.");
+        if (path.empty())
+            return fail("State path is empty.");
+        if (!cacheStateFile(path))
+            return false;
 
-        std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        if (data.empty())
-            return fail("State file is empty.");
-
-        if (!retro_unserialize_(data.data(), data.size()))
+        if (!retro_unserialize_(cached_state_data_.data(), cached_state_data_.size()))
             return fail("Core rejected state data.");
 
         joypads_[P1_PORT] = {};
@@ -625,7 +735,12 @@ public:
             return fail("Could not open state file for writing.");
 
         file.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
-        return static_cast<bool>(file);
+        if (!file)
+            return fail("Could not write state file.");
+
+        cached_state_path_ = path;
+        cached_state_data_ = std::move(data);
+        return true;
     }
 
     void setJoypadForPort(unsigned port, const kof_env_joypad_state *state) {
@@ -1106,7 +1221,7 @@ public:
                 return true;
             }
             if (std::string(variable->key) == "fbneo-memcard-mode") {
-                variable->value = "shared";
+                variable->value = "disabled";
                 return true;
             }
             return false;
@@ -1167,6 +1282,36 @@ private:
         return false;
     }
 
+    bool cacheStateFile(const std::wstring &path) {
+        if (path == cached_state_path_ && !cached_state_data_.empty())
+            return true;
+
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file)
+            return fail("Could not open state file for reading.");
+
+        const std::streampos end = file.tellg();
+        if (end <= 0)
+            return fail("State file is empty.");
+
+        std::vector<uint8_t> data(static_cast<size_t>(end));
+        file.seekg(0, std::ios::beg);
+        file.read(
+            reinterpret_cast<char *>(data.data()),
+            static_cast<std::streamsize>(data.size()));
+        if (!file)
+            return fail("Could not read complete state file.");
+
+        cached_state_path_ = path;
+        cached_state_data_ = std::move(data);
+        return true;
+    }
+
+    void clearStateCache() {
+        cached_state_path_.clear();
+        cached_state_data_.clear();
+    }
+
     void close() {
         unloadGame();
 
@@ -1187,6 +1332,7 @@ private:
         if (game_loaded_ && retro_unload_game_)
             retro_unload_game_();
         game_loaded_ = false;
+        clearStateCache();
         joypads_[P1_PORT] = {};
         joypads_[P2_PORT] = {};
         clearActionState();
@@ -1321,6 +1467,8 @@ private:
     std::string game_path_utf8_;
     std::string system_directory_utf8_;
     std::string save_directory_utf8_;
+    std::wstring cached_state_path_;
+    std::vector<uint8_t> cached_state_data_;
     mutable std::string last_error_;
     kof_env_video_refresh_t video_refresh_callback_ = nullptr;
     void *video_refresh_user_data_ = nullptr;

@@ -112,7 +112,7 @@ DISTANCE_TOO_FAR_START = 110
 DISTANCE_MAX_PENALTY_AT = 180
 DISTANCE_IN_RANGE_REWARD = 0.02
 DISTANCE_FAR_PENALTY = 0.04
-ACTION_COUNT = 27
+ACTION_COUNT = 29
 GUARD_ACTION_IDS = {2, 3, 4}
 DEFENSE_PRESSURE_MARGIN = 28
 DEFENSE_GUARD_REWARD = 0.08
@@ -128,28 +128,39 @@ ONIYAKI_ACTION_ID = 16
 P2_AIRBORNE_Y_THRESHOLD = 185
 ONIYAKI_ANTI_AIR_BONUS = 1.0
 ATTACK_RISK_ACTION_IDS = set(range(14, ACTION_COUNT))
-ATTACK_RISK_WINDOW_STEPS = 4
+ATTACK_RISK_WINDOW_FRAMES = 24
 ATTACK_RISK_CLOSE_DISTANCE = 55
 ATTACK_RISK_PUNISH_PENALTY = 4.0
 ATTACK_RISK_UNSAFE_CLOSE_PENALTY = 0.12
 ATTACK_RISK_SAFE_REWARD = 0.05
 FAST_WIN_BONUS_MAX = 15.0
+# Per-step shaping terms were tuned at action_repeat=6; scale them by
+# action_repeat / 6 so reward accrued per emulated second stays constant.
+FIGHT_SHAPING_BASELINE_FRAMES = 6.0
+FIGHT_FOLLOWUP_TRACK_WINDOW_FRAMES = 180
 
 IDLE_ACTION_ID = 0
 FORWARD_ACTION_ID = 1
 CLOSE_C_ACTION_ID = 8
+CROUCH_A_ACTION_ID = 10
+CROUCH_B_ACTION_ID = 11
 ARAGAMI_ACTION_ID = 14
 KOTOTSUKI_YOU_ACTION_ID = 15
 RED_KICK_ACTION_ID = 17
 OROCHINAGI_ACTION_ID = 18
+MUSHIKI_ACTION_ID = 19
 FORWARD_B_ACTION_ID = 22
 POISON_BITE_ACTION_ID = 23
 TSUMI_YOMI_ACTION_ID = 24
 BATSU_YOMI_ACTION_ID = 25
 SEVENTY_FIVE_SHIKI_KAI_ACTION_ID = 26
+YANO_SABI_ACTION_ID = 27
+MIGIRI_UGACHI_ACTION_ID = 28
 
 COMBO_CLOSE_DISTANCE = 45
 COMBO_PHASE_AGE_SCALE_FRAMES = 30.0
+COMBO_WRONG_ACTION_PENALTY = 0.1
+GUIDED_DISTRACTOR_COUNT = 2
 
 
 @dataclass(frozen=True)
@@ -163,6 +174,7 @@ class ComboPhase:
     require_power_stock_spent: bool = False
     require_damage: bool = True
     hit_timeout_frames: Optional[int] = None
+    allow_started_followup_on_hit: bool = False
 
 
 @dataclass(frozen=True)
@@ -260,6 +272,162 @@ KYO_FORWARD_B_ARAGAMI_SCENARIO = ComboScenario(
     ),
 )
 
+KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_OROCHINAGI_SCENARIO = ComboScenario(
+    name="kyo_close_c_seventy_five_shiki_kai_orochinagi",
+    phases=(
+        ComboPhase(CLOSE_C_ACTION_ID, 1, 1.0),
+        ComboPhase(
+            SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+            3,
+            15.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+        ),
+        ComboPhase(
+            OROCHINAGI_ACTION_ID,
+            4,
+            30.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+            require_power_stock_spent=True,
+            hit_timeout_frames=160,
+        ),
+    ),
+)
+
+KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_SCENARIO = ComboScenario(
+    name="kyo_close_c_seventy_five_shiki_kai_red_kick",
+    phases=(
+        ComboPhase(CLOSE_C_ACTION_ID, 1, 1.0),
+        ComboPhase(
+            SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+            3,
+            15.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+        ),
+        ComboPhase(
+            RED_KICK_ACTION_ID,
+            4,
+            15.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+            hit_timeout_frames=120,
+        ),
+    ),
+)
+
+KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_KOTOTSUKI_SCENARIO = ComboScenario(
+    name="kyo_close_c_seventy_five_shiki_kai_kototsuki",
+    phases=(
+        ComboPhase(CLOSE_C_ACTION_ID, 1, 1.0),
+        ComboPhase(
+            SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+            3,
+            15.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+        ),
+        ComboPhase(
+            KOTOTSUKI_YOU_ACTION_ID,
+            5,
+            20.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+            require_damage=False,
+            hit_timeout_frames=150,
+        ),
+    ),
+)
+
+KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_ARAGAMI_SCENARIO = ComboScenario(
+    name="kyo_close_c_seventy_five_shiki_kai_aragami",
+    phases=(
+        ComboPhase(CLOSE_C_ACTION_ID, 1, 1.0),
+        ComboPhase(
+            SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+            3,
+            15.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+        ),
+        ComboPhase(
+            ARAGAMI_ACTION_ID,
+            4,
+            15.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+            hit_timeout_frames=130,
+        ),
+    ),
+)
+
+KYO_CORNER_SEVENTY_FIVE_SHIKI_KAI_ARAGAMI_CHAIN_SCENARIO = ComboScenario(
+    name="kyo_corner_seventy_five_shiki_kai_aragami_chain",
+    phases=(
+        ComboPhase(CLOSE_C_ACTION_ID, 1, 1.0),
+        ComboPhase(
+            SEVENTY_FIVE_SHIKI_KAI_ACTION_ID,
+            3,
+            15.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+        ),
+        ComboPhase(
+            ARAGAMI_ACTION_ID,
+            4,
+            15.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+            hit_timeout_frames=130,
+            allow_started_followup_on_hit=True,
+        ),
+        ComboPhase(
+            YANO_SABI_ACTION_ID,
+            5,
+            20.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+            hit_timeout_frames=180,
+            allow_started_followup_on_hit=True,
+        ),
+        ComboPhase(
+            MIGIRI_UGACHI_ACTION_ID,
+            6,
+            30.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+            hit_timeout_frames=180,
+        ),
+    ),
+)
+
+KYO_CROUCH_B_CROUCH_A_MUSHIKI_SCENARIO = ComboScenario(
+    name="kyo_crouch_b_crouch_a_mushiki",
+    phases=(
+        ComboPhase(CROUCH_B_ACTION_ID, 1, 1.0),
+        ComboPhase(
+            CROUCH_A_ACTION_ID,
+            2,
+            8.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+            hit_timeout_frames=80,
+            allow_started_followup_on_hit=True,
+        ),
+        ComboPhase(
+            MUSHIKI_ACTION_ID,
+            7,
+            40.0,
+            queue_during_previous=True,
+            require_combo_increment=True,
+            require_power_stock_spent=True,
+            hit_timeout_frames=180,
+        ),
+    ),
+    complete_reward=35.0,
+)
+
 COMBO_SCENARIOS = {
     scenario.name: scenario
     for scenario in (
@@ -268,6 +436,12 @@ COMBO_SCENARIOS = {
         KYO_FORWARD_B_OROCHINAGI_SCENARIO,
         KYO_FORWARD_B_RED_KICK_SCENARIO,
         KYO_FORWARD_B_ARAGAMI_SCENARIO,
+        KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_OROCHINAGI_SCENARIO,
+        KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_SCENARIO,
+        KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_KOTOTSUKI_SCENARIO,
+        KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_ARAGAMI_SCENARIO,
+        KYO_CORNER_SEVENTY_FIVE_SHIKI_KAI_ARAGAMI_CHAIN_SCENARIO,
+        KYO_CROUCH_B_CROUCH_A_MUSHIKI_SCENARIO,
     )
 }
 DEFAULT_COMBO_SCENARIO_NAME = KYO_CORNER_DOKUGAMI_SCENARIO.name
@@ -276,6 +450,12 @@ DEFAULT_COMBO_SCENARIO_NAME = KYO_CORNER_DOKUGAMI_SCENARIO.name
 class TrainingProfile(str, Enum):
     COMBO = "combo"
     FIGHT = "fight"
+
+
+class ActionMaskLevel(str, Enum):
+    STRICT = "strict"
+    GUIDED = "guided"
+    PHYSICAL = "physical"
 
 
 @dataclass(frozen=True)
@@ -639,6 +819,7 @@ class Kof98Env(gym.Env if gym else object):
         combo_state_path: Optional[str | Path] = None,
         fight_state_path: Optional[str | Path] = None,
         combo_scenario: ComboScenario | str = DEFAULT_COMBO_SCENARIO_NAME,
+        action_mask_level: ActionMaskLevel | str = ActionMaskLevel.STRICT,
     ):
         if gym is None or spaces is None:
             raise RuntimeError("Install gymnasium before using Kof98Env")
@@ -651,6 +832,7 @@ class Kof98Env(gym.Env if gym else object):
         self.combo_state_path = Path(combo_state_path) if combo_state_path else self.state_path
         self.fight_state_path = Path(fight_state_path) if fight_state_path else self.state_path
         self.training_profile = TrainingProfile(training_profile)
+        self.action_mask_level = ActionMaskLevel(action_mask_level)
         if isinstance(combo_scenario, ComboScenario):
             self.combo_scenario = combo_scenario
         else:
@@ -663,10 +845,12 @@ class Kof98Env(gym.Env if gym else object):
             if self.training_profile is TrainingProfile.COMBO
             else action_repeat
         )
+        self.fight_frame_scale = float(self.action_repeat) / FIGHT_SHAPING_BASELINE_FRAMES
         self.hitbox_reward = hitbox_reward and self.training_profile is TrainingProfile.FIGHT
         self.p2_training_ai = p2_training_ai
         self.previous_observation: Optional[Kof98Observation] = None
         self.pending_attack_risk: Optional[dict[str, float]] = None
+        self.fight_pending_followup: Optional[dict] = None
         self.episode_steps = 0
         self.episode_max_combo = 0
         self.combo_phase = 0
@@ -700,6 +884,7 @@ class Kof98Env(gym.Env if gym else object):
         observation = self.client.observation()
         self.previous_observation = observation
         self.pending_attack_risk = None
+        self.fight_pending_followup = None
         self.episode_steps = 0
         self.episode_max_combo = 0
         self.combo_phase = 0
@@ -714,6 +899,7 @@ class Kof98Env(gym.Env if gym else object):
             "raw": observation,
             "training_profile": self.training_profile.value,
             "combo_scenario": self.combo_scenario.name,
+            "action_mask_level": self.action_mask_level.value,
         }
 
     def step(self, action):
@@ -750,6 +936,7 @@ class Kof98Env(gym.Env if gym else object):
         )
         input_ready_before_step = self._combo_input_ready()
         queueable_followup_phase = self._queueable_followup_phase()
+        expected_phase_before_step = queueable_followup_phase or self._current_combo_phase()
         observation = self.client.step(action_id, COMBO_PROFILE.action_repeat)
         action_status = self.client.action_status()
         action_accepted = bool(action_status.action_accepted)
@@ -799,6 +986,18 @@ class Kof98Env(gym.Env if gym else object):
             p2_damage,
             action_status,
         )
+        wrong_action = (
+            action_accepted
+            and action_id != IDLE_ACTION_ID
+            and (
+                expected_phase_before_step is None
+                or action_id != expected_phase_before_step.action_id
+            )
+        )
+        reward_parts["wrong_action"] = 0.0
+        if wrong_action:
+            reward_parts["wrong_action"] -= COMBO_WRONG_ACTION_PENALTY
+            reward -= COMBO_WRONG_ACTION_PENALTY
         phase_advanced = self.combo_phase > phase_before_reward
         advanced_phase = self._combo_phase_at(phase_before_reward)
         advanced_action = advanced_phase.action_id if advanced_phase is not None else None
@@ -813,7 +1012,9 @@ class Kof98Env(gym.Env if gym else object):
             "raw": observation,
             "training_profile": self.training_profile.value,
             "combo_scenario": self.combo_scenario.name,
+            "action_mask_level": self.action_mask_level.value,
             "action": action_id,
+            "frame_count": float(COMBO_PROFILE.action_repeat),
             "p1_health": observation.p1_health,
             "p2_health": observation.p2_health,
             "p1_damage": p1_damage,
@@ -839,6 +1040,8 @@ class Kof98Env(gym.Env if gym else object):
             "action_17_hit": float(phase_advanced and advanced_action == RED_KICK_ACTION_ID),
             "action_18": float(action_id == OROCHINAGI_ACTION_ID and action_accepted),
             "action_18_hit": float(phase_advanced and advanced_action == OROCHINAGI_ACTION_ID),
+            "action_19": float(action_id == MUSHIKI_ACTION_ID and action_accepted),
+            "action_19_hit": float(phase_advanced and advanced_action == MUSHIKI_ACTION_ID),
             "action_22": float(action_id == FORWARD_B_ACTION_ID and action_accepted),
             "action_22_hit": float(phase_advanced and advanced_action == FORWARD_B_ACTION_ID),
             "action_23": float(action_id == POISON_BITE_ACTION_ID and action_accepted),
@@ -849,6 +1052,10 @@ class Kof98Env(gym.Env if gym else object):
             "action_25_hit": float(phase_advanced and advanced_action == BATSU_YOMI_ACTION_ID),
             "action_26": float(action_id == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID and action_accepted),
             "action_26_hit": float(phase_advanced and advanced_action == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID),
+            "action_27": float(action_id == YANO_SABI_ACTION_ID and action_accepted),
+            "action_27_hit": float(phase_advanced and advanced_action == YANO_SABI_ACTION_ID),
+            "action_28": float(action_id == MIGIRI_UGACHI_ACTION_ID and action_accepted),
+            "action_28_hit": float(phase_advanced and advanced_action == MIGIRI_UGACHI_ACTION_ID),
             "reward_damage": reward_parts["damage"],
             "reward_phase": reward_parts["phase"],
             "reward_complete": reward_parts["complete"],
@@ -856,12 +1063,21 @@ class Kof98Env(gym.Env if gym else object):
             "reward_timeout": reward_parts["timeout"],
             "reward_ko_without_combo": reward_parts["ko_without_combo"],
             "reward_time": reward_parts["time"],
+            "reward_wrong_action": reward_parts["wrong_action"],
         }
         return self._make_observation(observation), reward, terminated, truncated, info
 
     def _step_fight(self, action_id: int):
         previous = self.previous_observation
+        dll_input_ready = bool(self.client.input_ready())
+        free_decision = dll_input_ready and bool(self.client.p1_ready_for_action())
+        action_availability = self._physical_action_mask()
+        legal_action_count = int(action_availability.sum())
+        queue_decision = not free_decision and legal_action_count > 1
+        forced_idle = legal_action_count <= 1
         observation = self.client.step(action_id, self.action_repeat)
+        action_status = self.client.action_status()
+        action_accepted = bool(action_status.action_accepted)
         hitbox_rects: list[HitboxRectResult] = []
         if self.hitbox_reward:
             try:
@@ -889,6 +1105,49 @@ class Kof98Env(gym.Env if gym else object):
             if previous.p1_health >= 0 and observation.p1_health >= 0:
                 p1_damage = float(max(0, previous.p1_health - observation.p1_health))
 
+        previous_combo = max(0, previous.p1_combo_count) if previous is not None else 0
+        current_combo = max(0, observation.p1_combo_count)
+        combo_delta = max(0, current_combo - previous_combo)
+
+        # A follow-up is an action issued while the DLL runtime is busy that it
+        # accepted into its queue (or that already fired within this step's
+        # frames). Gate on DLL-level input_ready: setAction only accepts a
+        # non-idle action while busy through canQueueAction, so acceptance
+        # here proves a genuine queue rather than a raw start.
+        queued_followup = (
+            not dll_input_ready
+            and action_accepted
+            and action_id != IDLE_ACTION_ID
+            and (
+                action_status.queued_action_id == action_id
+                or action_status.active_action_id == action_id
+                or action_status.last_started_action_id == action_id
+            )
+        )
+        started_followup = False
+        followup_hit = False
+        if queued_followup:
+            self.fight_pending_followup = {"action": action_id, "age": 0, "started": False}
+        followup_action = (
+            self.fight_pending_followup["action"]
+            if self.fight_pending_followup is not None
+            else -1
+        )
+        if self.fight_pending_followup is not None:
+            pending = self.fight_pending_followup
+            pending["age"] += self.action_repeat
+            if not pending["started"] and (
+                action_status.active_action_id == pending["action"]
+                or action_status.last_started_action_id == pending["action"]
+            ):
+                pending["started"] = True
+                started_followup = True
+            if pending["started"] and (p2_damage > 0.0 or combo_delta > 0):
+                followup_hit = True
+                self.fight_pending_followup = None
+            elif pending["age"] > FIGHT_FOLLOWUP_TRACK_WINDOW_FRAMES:
+                self.fight_pending_followup = None
+
         guard_action = action_id in GUARD_ACTION_IDS
         guard_success = guard_action and p2_attack_pressure and p1_damage <= 0.0
         super_action = action_id in SUPER_ACTION_IDS
@@ -911,6 +1170,7 @@ class Kof98Env(gym.Env if gym else object):
             p2_attack_pressure,
             super_available_before_action,
             p2_airborne_before_action,
+            self.fight_frame_scale,
         )
         safety_reward, safety_info = self._update_attack_safety(
             action_id,
@@ -928,10 +1188,37 @@ class Kof98Env(gym.Env if gym else object):
             or observation.round_time == 0
         )
         truncated = False
+        fight_outcome = ""
+        if terminated:
+            p1_ko = 0 <= observation.p1_health <= 0
+            p2_ko = 0 <= observation.p2_health <= 0
+            if p1_ko and p2_ko:
+                fight_outcome = "draw_ko"
+            elif p2_ko:
+                fight_outcome = "win_ko"
+            elif p1_ko:
+                fight_outcome = "loss_ko"
+            elif observation.p1_health > observation.p2_health:
+                fight_outcome = "win_timeout"
+            elif observation.p1_health < observation.p2_health:
+                fight_outcome = "loss_timeout"
+            else:
+                fight_outcome = "draw_timeout"
         info = {
             "raw": observation,
             "training_profile": self.training_profile.value,
             "action": action_id,
+            "frame_count": float(self.action_repeat),
+            "free_decision": float(free_decision),
+            "queue_decision": float(queue_decision),
+            "forced_idle": float(forced_idle),
+            "legal_action_count": float(legal_action_count),
+            "action_availability": action_availability.copy(),
+            "queued_followup": float(queued_followup),
+            "started_followup": float(started_followup),
+            "followup_hit": float(followup_hit),
+            "followup_action": float(followup_action),
+            "fight_outcome": fight_outcome,
             "p1_health": observation.p1_health,
             "p2_health": observation.p2_health,
             "p1_advanced_power_value": float(max(0, observation.p1_advanced_power_value)),
@@ -981,6 +1268,10 @@ class Kof98Env(gym.Env if gym else object):
             "action_25_hit": float(action_id == 25 and p2_damage > 0),
             "action_26": float(action_id == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID),
             "action_26_hit": float(action_id == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID and p2_damage > 0),
+            "action_27": float(action_id == YANO_SABI_ACTION_ID),
+            "action_27_hit": float(action_id == YANO_SABI_ACTION_ID and p2_damage > 0),
+            "action_28": float(action_id == MIGIRI_UGACHI_ACTION_ID),
+            "action_28_hit": float(action_id == MIGIRI_UGACHI_ACTION_ID and p2_damage > 0),
             "distance_x_abs": float(abs(observation.distance_x)),
             "reward_hp": reward_parts["hp"],
             "reward_hitbox": reward_parts["hitbox"],
@@ -1041,6 +1332,7 @@ class Kof98Env(gym.Env if gym else object):
                 not phase.queue_during_previous
                 or action_status.active_action_id == expected_action
                 or action_status.last_started_action_id == expected_action
+                or phase.allow_started_followup_on_hit
             )
         )
 
@@ -1174,7 +1466,7 @@ class Kof98Env(gym.Env if gym else object):
         return self.pending_chain_action is None
 
     def _make_observation(self, observation: Kof98Observation) -> np.ndarray:
-        input_ready = self.client.input_ready()
+        input_ready = self.client.input_ready() and self.client.p1_ready_for_action()
         if self.training_profile is TrainingProfile.COMBO:
             input_ready = self._combo_input_ready()
         normalized_phase = float(self.combo_phase) / float(
@@ -1194,16 +1486,50 @@ class Kof98Env(gym.Env if gym else object):
             ],
         )
 
-    def action_masks(self) -> np.ndarray:
-        mask = np.ones(self.action_space.n, dtype=bool)
-        if self.training_profile is not TrainingProfile.COMBO:
+    def _physical_action_mask(self) -> np.ndarray:
+        mask = np.zeros(self.action_space.n, dtype=bool)
+        mask[IDLE_ACTION_ID] = True
+        if self.client.input_ready() and self.client.p1_ready_for_action():
+            mask[:] = True
             return mask
 
-        mask[:] = False
+        for action_id in range(1, self.action_space.n):
+            if self.client.can_queue_action(action_id):
+                mask[action_id] = True
+        return mask
+
+    def _add_guided_distractors(
+        self,
+        mask: np.ndarray,
+        physical_mask: np.ndarray,
+    ) -> None:
+        candidates = [
+            action_id
+            for action_id in range(1, self.action_space.n)
+            if physical_mask[action_id] and not mask[action_id]
+        ]
+        if not candidates:
+            return
+
+        offset = self.combo_phase % len(candidates)
+        ordered = candidates[offset:] + candidates[:offset]
+        for action_id in ordered[:GUIDED_DISTRACTOR_COUNT]:
+            mask[action_id] = True
+
+    def action_masks(self) -> np.ndarray:
+        physical_mask = self._physical_action_mask()
+        if self.training_profile is not TrainingProfile.COMBO:
+            return physical_mask
+        if self.action_mask_level is ActionMaskLevel.PHYSICAL:
+            return physical_mask
+
+        mask = np.zeros(self.action_space.n, dtype=bool)
         mask[IDLE_ACTION_ID] = True
         queueable_followup_phase = self._queueable_followup_phase()
         if queueable_followup_phase is not None:
             mask[queueable_followup_phase.action_id] = True
+            if self.action_mask_level is ActionMaskLevel.GUIDED:
+                self._add_guided_distractors(mask, physical_mask)
             return mask
 
         if not self._combo_input_ready():
@@ -1216,11 +1542,15 @@ class Kof98Env(gym.Env if gym else object):
         ):
             mask[IDLE_ACTION_ID] = False
             mask[FORWARD_ACTION_ID] = True
+            if self.action_mask_level is ActionMaskLevel.GUIDED:
+                self._add_guided_distractors(mask, physical_mask)
             return mask
 
         phase = self._current_combo_phase()
         if phase is not None:
             mask[phase.action_id] = True
+        if self.action_mask_level is ActionMaskLevel.GUIDED:
+            self._add_guided_distractors(mask, physical_mask)
         return mask
 
     def close(self):
@@ -1242,7 +1572,7 @@ class Kof98Env(gym.Env if gym else object):
         reward = 0.0
 
         if self.pending_attack_risk is not None:
-            self.pending_attack_risk["steps_left"] -= 1.0
+            self.pending_attack_risk["frames_left"] -= float(self.action_repeat)
             self.pending_attack_risk["p2_damage"] += p2_damage
 
             close_to_p2 = (
@@ -1258,7 +1588,7 @@ class Kof98Env(gym.Env if gym else object):
                 reward -= ATTACK_RISK_PUNISH_PENALTY
                 info["punished"] = 1.0
                 self.pending_attack_risk = None
-            elif self.pending_attack_risk["steps_left"] <= 0.0:
+            elif self.pending_attack_risk["frames_left"] <= 0.0:
                 if close_to_p2:
                     reward -= ATTACK_RISK_UNSAFE_CLOSE_PENALTY
                     info["unsafe_close"] = 1.0
@@ -1275,7 +1605,7 @@ class Kof98Env(gym.Env if gym else object):
         ):
             self.pending_attack_risk = {
                 "action_id": float(action_id),
-                "steps_left": float(ATTACK_RISK_WINDOW_STEPS),
+                "frames_left": float(ATTACK_RISK_WINDOW_FRAMES),
                 "p2_damage": 0.0,
             }
 
@@ -1294,6 +1624,7 @@ class Kof98Env(gym.Env if gym else object):
         p2_attack_pressure: bool,
         super_available: bool,
         p2_airborne: bool,
+        frame_scale: float = 1.0,
     ) -> tuple[float, dict[str, float]]:
         reward_parts = {
             "hp": 0.0,
@@ -1305,7 +1636,7 @@ class Kof98Env(gym.Env if gym else object):
             "anti_air": 0.0,
             "safety": 0.0,
             "fast_win": 0.0,
-            "time": -0.001,
+            "time": -0.001 * frame_scale,
         }
         if previous is None:
             return 0.0, reward_parts
@@ -1320,18 +1651,18 @@ class Kof98Env(gym.Env if gym else object):
             reward_parts["hp"] -= float(previous.p1_health - current.p1_health) * 2.0
 
         if p1_attack_overlap:
-            reward_parts["hitbox"] += P1_ATTACK_OVERLAP_REWARD
+            reward_parts["hitbox"] += P1_ATTACK_OVERLAP_REWARD * frame_scale
         if p2_attack_overlap:
-            reward_parts["hitbox"] -= P2_ATTACK_OVERLAP_PENALTY
+            reward_parts["hitbox"] -= P2_ATTACK_OVERLAP_PENALTY * frame_scale
 
         guard_action = action_id in GUARD_ACTION_IDS
         if p2_attack_pressure:
             if guard_action and p1_damage <= 0.0:
-                reward_parts["defense"] += DEFENSE_GUARD_REWARD
+                reward_parts["defense"] += DEFENSE_GUARD_REWARD * frame_scale
             elif guard_action:
-                reward_parts["defense"] -= DEFENSE_BAD_GUARD_PENALTY
+                reward_parts["defense"] -= DEFENSE_BAD_GUARD_PENALTY * frame_scale
             else:
-                reward_parts["defense"] -= DEFENSE_UNGUARDED_PRESSURE_PENALTY
+                reward_parts["defense"] -= DEFENSE_UNGUARDED_PRESSURE_PENALTY * frame_scale
 
         if previous.p1_combo_count >= 0 and current.p1_combo_count >= 0:
             combo_delta = max(0, current.p1_combo_count - previous.p1_combo_count)
@@ -1351,14 +1682,14 @@ class Kof98Env(gym.Env if gym else object):
         if current.p1_has_position and current.p2_has_position:
             distance = abs(current.distance_x)
             if EFFECTIVE_DISTANCE_MIN <= distance <= EFFECTIVE_DISTANCE_MAX:
-                reward_parts["distance"] += DISTANCE_IN_RANGE_REWARD
+                reward_parts["distance"] += DISTANCE_IN_RANGE_REWARD * frame_scale
             elif distance > DISTANCE_TOO_FAR_START:
                 penalty_t = min(
                     1.0,
                     (distance - DISTANCE_TOO_FAR_START)
                     / max(1, DISTANCE_MAX_PENALTY_AT - DISTANCE_TOO_FAR_START),
                 )
-                reward_parts["distance"] -= DISTANCE_FAR_PENALTY * penalty_t
+                reward_parts["distance"] -= DISTANCE_FAR_PENALTY * penalty_t * frame_scale
 
         reward = (
             reward_parts["hp"]

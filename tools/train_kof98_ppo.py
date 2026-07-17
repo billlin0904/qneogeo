@@ -2,20 +2,44 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
+import json
 import os
 import socket
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 from importlib.metadata import PackageNotFoundError, version
 
+import numpy as np
+
 from kof98_env import (
+    ACTION_COUNT,
+    ActionMaskLevel,
     COMBO_SCENARIOS,
     DEFAULT_COMBO_SCENARIO_NAME,
     IDLE_ACTION_ID,
     Kof98Env,
     TrainingProfile,
+)
+
+# Hyperparameters were tuned at action_repeat=6. The repeat4 preset keeps the
+# per-emulated-frame semantics: gamma = 0.99^(4/6), gae_lambda = 0.95^(4/6),
+# and n_steps scaled so one rollout covers the same emulated time.
+TRAINING_PRESETS = {
+    "repeat6": {"action_repeat": 6, "gamma": 0.99, "gae_lambda": 0.95, "n_steps": 1024},
+    "repeat4": {"action_repeat": 4, "gamma": 0.99331, "gae_lambda": 0.96638, "n_steps": 1536},
+}
+
+FIGHT_OUTCOME_NAMES = (
+    "win_ko",
+    "loss_ko",
+    "win_timeout",
+    "loss_timeout",
+    "draw_timeout",
+    "draw_ko",
 )
 
 
@@ -29,6 +53,7 @@ def make_env(
     fight_state_path: Optional[Path],
     training_profile: TrainingProfile,
     combo_scenario: str,
+    action_mask_level: ActionMaskLevel,
     action_repeat: int,
     seed: int,
     p2_training_ai: bool = False,
@@ -54,6 +79,7 @@ def make_env(
             p2_training_ai=p2_training_ai,
             training_profile=training_profile,
             combo_scenario=combo_scenario,
+            action_mask_level=action_mask_level,
         )
         if viewer:
             env = TrainingViewerWrapper(
@@ -197,6 +223,12 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of parallel environments assigned to Combo in mixed mode.",
     )
     parser.add_argument(
+        "--mask-level",
+        choices=tuple(level.value for level in ActionMaskLevel),
+        default=ActionMaskLevel.STRICT.value,
+        help="Combo curriculum mask. Fight always uses physical legality.",
+    )
+    parser.add_argument(
         "--p2-training-ai",
         action="store_true",
         help="Enable the DLL P2 training AI in Fight environments.",
@@ -214,10 +246,34 @@ def parse_args() -> argparse.Namespace:
         help="Number of parallel environments. Start with 1, then increase after it is stable.",
     )
     parser.add_argument(
+        "--preset",
+        choices=tuple(TRAINING_PRESETS),
+        default="repeat6",
+        help="Bundled action_repeat/gamma/gae_lambda/n_steps. repeat6 is the reproducible baseline.",
+    )
+    parser.add_argument(
         "--action-repeat",
         type=int,
-        default=6,
-        help="Fight profile setting retained for later. Combo training always uses its profile value of 1.",
+        default=None,
+        help="Fight profile frames per decision. Defaults to the preset value. Combo training always uses 1.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=None,
+        help="PPO discount factor. Defaults to the preset value.",
+    )
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=None,
+        help="PPO GAE lambda. Defaults to the preset value.",
+    )
+    parser.add_argument(
+        "--n-steps",
+        type=int,
+        default=None,
+        help="PPO rollout length per environment. Defaults to the preset value.",
     )
     parser.add_argument(
         "--device",
@@ -303,6 +359,81 @@ def parse_args() -> argparse.Namespace:
 def validate_file(path: Path, label: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"{label} not found: {path}")
+
+
+def file_sha256(path: Path) -> Optional[str]:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def git_command_output(root: Path, *arguments: str) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def package_version_or_none(name: str) -> Optional[str]:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+
+
+def write_run_manifest(
+    manifest_path: Path,
+    args: argparse.Namespace,
+    root: Path,
+    effective: dict,
+    manifest_files: dict[str, Path],
+) -> None:
+    try:
+        import torch
+
+        torch_version = torch.__version__
+    except ImportError:
+        torch_version = None
+
+    porcelain = git_command_output(root, "status", "--porcelain")
+    manifest = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "argv": sys.argv,
+        "args": {
+            key: (str(value) if isinstance(value, Path) else value)
+            for key, value in vars(args).items()
+        },
+        "effective": effective,
+        "git": {
+            "commit": git_command_output(root, "rev-parse", "HEAD"),
+            "dirty": None if porcelain is None else bool(porcelain),
+        },
+        "versions": {
+            "python": sys.version,
+            "torch": torch_version,
+            "stable-baselines3": package_version_or_none("stable-baselines3"),
+            "sb3-contrib": package_version_or_none("sb3-contrib"),
+            "gymnasium": package_version_or_none("gymnasium"),
+            "numpy": package_version_or_none("numpy"),
+        },
+        "files": {
+            label: {"path": str(path), "sha256": file_sha256(path)}
+            for label, path in manifest_files.items()
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
 def build_training_profiles(
@@ -470,12 +601,34 @@ def main() -> int:
     class TrainingMetricsCallback(BaseCallback):
         def __init__(self):
             super().__init__()
+            self.cumulative_frames = 0.0
+            self.cumulative_fight_frames = 0.0
+            self.env_fight_max_combo: dict[int, float] = {}
+            self.env_fight_damage_dealt: dict[int, float] = {}
+            self.env_fight_damage_taken: dict[int, float] = {}
             self.reset_rollout_metrics()
 
         def reset_rollout_metrics(self) -> None:
             self.step_count = 0
             self.combo_step_count = 0
             self.fight_step_count = 0
+            self.frames_total = 0.0
+            self.fight_frames_total = 0.0
+            self.fight_free_decision_steps = 0.0
+            self.fight_queue_decision_steps = 0.0
+            self.fight_forced_idle_steps = 0.0
+            self.fight_action_available = np.zeros(ACTION_COUNT, dtype=np.float64)
+            self.fight_action_selected = np.zeros(ACTION_COUNT, dtype=np.float64)
+            self.fight_followup_queued = np.zeros(ACTION_COUNT, dtype=np.float64)
+            self.fight_followup_started = np.zeros(ACTION_COUNT, dtype=np.float64)
+            self.fight_followup_hit = np.zeros(ACTION_COUNT, dtype=np.float64)
+            self.fight_episodes = 0.0
+            self.fight_outcome_counts = {name: 0.0 for name in FIGHT_OUTCOME_NAMES}
+            self.fight_episode_max_combo_total = 0.0
+            self.fight_combo_2plus_episodes = 0.0
+            self.fight_combo_4plus_episodes = 0.0
+            self.fight_episode_damage_dealt_total = 0.0
+            self.fight_episode_damage_taken_total = 0.0
             self.p1_damage = 0.0
             self.p2_damage = 0.0
             self.p1_attack_overlap = 0.0
@@ -523,6 +676,10 @@ def main() -> int:
             self.action_25_hit = 0.0
             self.action_26 = 0.0
             self.action_26_hit = 0.0
+            self.action_27 = 0.0
+            self.action_27_hit = 0.0
+            self.action_28 = 0.0
+            self.action_28_hit = 0.0
             self.distance_x_abs = 0.0
             self.reward_hp = 0.0
             self.reward_hitbox = 0.0
@@ -548,12 +705,16 @@ def main() -> int:
             self.reward_phase = 0.0
             self.reward_complete = 0.0
             self.reward_phase_reset = 0.0
+            self.reward_wrong_action = 0.0
 
         def _on_step(self) -> bool:
             infos = self.locals.get("infos", [])
             dones = self.locals.get("dones", [])
             for index, info in enumerate(infos):
                 self.step_count += 1
+                frame_count = float(info.get("frame_count", 0.0))
+                self.frames_total += frame_count
+                self.cumulative_frames += frame_count
                 training_profile = info.get("training_profile")
                 is_combo_profile = training_profile == TrainingProfile.COMBO.value
                 if is_combo_profile:
@@ -569,6 +730,51 @@ def main() -> int:
                     )
                 elif training_profile == TrainingProfile.FIGHT.value:
                     self.fight_step_count += 1
+                    self.fight_frames_total += frame_count
+                    self.cumulative_fight_frames += frame_count
+                    self.fight_free_decision_steps += float(info.get("free_decision", 0.0))
+                    self.fight_queue_decision_steps += float(info.get("queue_decision", 0.0))
+                    self.fight_forced_idle_steps += float(info.get("forced_idle", 0.0))
+                    availability = info.get("action_availability")
+                    if availability is not None:
+                        self.fight_action_available += np.asarray(availability, dtype=np.float64)
+                    selected_action = int(info.get("action", -1))
+                    if 0 <= selected_action < ACTION_COUNT:
+                        self.fight_action_selected[selected_action] += 1.0
+                    followup_action = int(info.get("followup_action", -1.0))
+                    if 0 <= followup_action < ACTION_COUNT:
+                        if info.get("queued_followup", 0.0):
+                            self.fight_followup_queued[followup_action] += 1.0
+                        if info.get("started_followup", 0.0):
+                            self.fight_followup_started[followup_action] += 1.0
+                        if info.get("followup_hit", 0.0):
+                            self.fight_followup_hit[followup_action] += 1.0
+                    fight_combo_count = float(info.get("p1_combo_count", 0.0))
+                    self.env_fight_max_combo[index] = max(
+                        self.env_fight_max_combo.get(index, 0.0),
+                        fight_combo_count,
+                    )
+                    self.env_fight_damage_dealt[index] = (
+                        self.env_fight_damage_dealt.get(index, 0.0)
+                        + float(info.get("p2_damage", 0.0))
+                    )
+                    self.env_fight_damage_taken[index] = (
+                        self.env_fight_damage_taken.get(index, 0.0)
+                        + float(info.get("p1_damage", 0.0))
+                    )
+                    if index < len(dones) and dones[index]:
+                        self.fight_episodes += 1.0
+                        outcome = str(info.get("fight_outcome", ""))
+                        if outcome in self.fight_outcome_counts:
+                            self.fight_outcome_counts[outcome] += 1.0
+                        episode_max_combo = self.env_fight_max_combo.pop(index, 0.0)
+                        self.fight_episode_max_combo_total += episode_max_combo
+                        if episode_max_combo >= 2.0:
+                            self.fight_combo_2plus_episodes += 1.0
+                        if episode_max_combo >= 4.0:
+                            self.fight_combo_4plus_episodes += 1.0
+                        self.fight_episode_damage_dealt_total += self.env_fight_damage_dealt.pop(index, 0.0)
+                        self.fight_episode_damage_taken_total += self.env_fight_damage_taken.pop(index, 0.0)
                 self.p1_damage += float(info.get("p1_damage", 0.0))
                 self.p2_damage += float(info.get("p2_damage", 0.0))
                 self.p1_attack_overlap += float(info.get("p1_attack_overlap", 0.0))
@@ -617,6 +823,10 @@ def main() -> int:
                 self.action_25_hit += float(info.get("action_25_hit", 0.0))
                 self.action_26 += float(info.get("action_26", 0.0))
                 self.action_26_hit += float(info.get("action_26_hit", 0.0))
+                self.action_27 += float(info.get("action_27", 0.0))
+                self.action_27_hit += float(info.get("action_27_hit", 0.0))
+                self.action_28 += float(info.get("action_28", 0.0))
+                self.action_28_hit += float(info.get("action_28_hit", 0.0))
                 self.distance_x_abs += float(info.get("distance_x_abs", 0.0))
                 self.reward_hp += float(info.get("reward_hp", 0.0))
                 self.reward_hitbox += float(info.get("reward_hitbox", 0.0))
@@ -639,6 +849,7 @@ def main() -> int:
                     self.reward_phase += float(info.get("reward_phase", 0.0))
                     self.reward_complete += float(info.get("reward_complete", 0.0))
                     self.reward_phase_reset += float(info.get("reward_phase_reset", 0.0))
+                    self.reward_wrong_action += float(info.get("reward_wrong_action", 0.0))
 
                 if is_combo_profile and index < len(dones) and dones[index]:
                     self.combo_episodes += 1.0
@@ -666,7 +877,7 @@ def main() -> int:
             self.logger.record("kof/super_without_stock_total", self.super_without_stock)
             self.logger.record("kof/p2_airborne_rate", self.p2_airborne / count)
             self.logger.record("kof/oniyaki_anti_air_hit_total", self.oniyaki_anti_air_hit)
-            self.logger.record("kof/oniyaki_anti_air_hit_rate", self.oniyaki_anti_air_hit / max(1.0, self.action_17))
+            self.logger.record("kof/oniyaki_anti_air_hit_rate", self.oniyaki_anti_air_hit / max(1.0, self.action_16))
             self.logger.record("kof/attack_safety_pending_rate", self.attack_safety_pending / count)
             self.logger.record("kof/attack_safety_punished_total", self.attack_safety_punished)
             self.logger.record("kof/attack_safety_unsafe_close_total", self.attack_safety_unsafe_close)
@@ -716,6 +927,12 @@ def main() -> int:
             self.logger.record("kof/action_26_rate", self.action_26 / count)
             self.logger.record("kof/action_26_hit_total", self.action_26_hit)
             self.logger.record("kof/action_26_hit_rate", self.action_26_hit / max(1.0, self.action_26))
+            self.logger.record("kof/action_27_rate", self.action_27 / count)
+            self.logger.record("kof/action_27_hit_total", self.action_27_hit)
+            self.logger.record("kof/action_27_hit_rate", self.action_27_hit / max(1.0, self.action_27))
+            self.logger.record("kof/action_28_rate", self.action_28 / count)
+            self.logger.record("kof/action_28_hit_total", self.action_28_hit)
+            self.logger.record("kof/action_28_hit_rate", self.action_28_hit / max(1.0, self.action_28))
             self.logger.record("kof/mean_distance_x_abs", self.distance_x_abs / count)
             self.logger.record("kof/reward_hp_total", self.reward_hp)
             self.logger.record("kof/reward_hitbox_total", self.reward_hitbox)
@@ -735,10 +952,12 @@ def main() -> int:
                 self.logger.record(
                     f"kof_combo/{scenario_name}/success_rate",
                     metrics["successes"] / episode_count,
+                    exclude="stdout",
                 )
                 self.logger.record(
                     f"kof_combo/{scenario_name}/episode_max_mean",
                     metrics["episode_max_total"] / episode_count,
+                    exclude="stdout",
                 )
             self.logger.record("kof/reward_damage_total", self.reward_damage)
             self.logger.record("kof/reward_combo_milestone_total", self.reward_combo_milestone)
@@ -750,9 +969,105 @@ def main() -> int:
             self.logger.record("kof/reward_phase_total", self.reward_phase)
             self.logger.record("kof/reward_complete_total", self.reward_complete)
             self.logger.record("kof/reward_phase_reset_total", self.reward_phase_reset)
+            self.logger.record("kof/reward_wrong_action_total", self.reward_wrong_action)
+            self.logger.record("kof/emulated_frames", self.frames_total)
+            self.logger.record("kof/emulated_frames_cumulative", self.cumulative_frames)
+
+            fight_episode_count = max(1.0, self.fight_episodes)
+            fight_wins = (
+                self.fight_outcome_counts["win_ko"]
+                + self.fight_outcome_counts["win_timeout"]
+            )
+            followup_queued_total = float(self.fight_followup_queued.sum())
+            followup_started_total = float(self.fight_followup_started.sum())
+            followup_hit_total = float(self.fight_followup_hit.sum())
+            self.logger.record("kof_fight/episodes_total", self.fight_episodes)
+            self.logger.record("kof_fight/win_rate", fight_wins / fight_episode_count)
+            for outcome_name, outcome_count in self.fight_outcome_counts.items():
+                self.logger.record(f"kof_fight/{outcome_name}_total", outcome_count)
+            self.logger.record(
+                "kof_fight/episode_max_combo_mean",
+                self.fight_episode_max_combo_total / fight_episode_count,
+            )
+            self.logger.record(
+                "kof_fight/combo_2plus_episode_rate",
+                self.fight_combo_2plus_episodes / fight_episode_count,
+            )
+            self.logger.record(
+                "kof_fight/combo_4plus_episode_rate",
+                self.fight_combo_4plus_episodes / fight_episode_count,
+            )
+            self.logger.record(
+                "kof_fight/damage_dealt_mean",
+                self.fight_episode_damage_dealt_total / fight_episode_count,
+            )
+            self.logger.record(
+                "kof_fight/damage_taken_mean",
+                self.fight_episode_damage_taken_total / fight_episode_count,
+            )
+            self.logger.record("kof_fight/free_decision_steps", self.fight_free_decision_steps)
+            self.logger.record("kof_fight/queue_decision_steps", self.fight_queue_decision_steps)
+            self.logger.record("kof_fight/forced_idle_steps", self.fight_forced_idle_steps)
+            self.logger.record("kof_fight/queued_followup_total", followup_queued_total)
+            self.logger.record("kof_fight/started_followup_total", followup_started_total)
+            self.logger.record("kof_fight/followup_hit_total", followup_hit_total)
+            self.logger.record(
+                "kof_fight/followup_hit_rate",
+                followup_hit_total / max(1.0, followup_started_total),
+            )
+            self.logger.record("kof_fight/emulated_frames", self.fight_frames_total)
+            self.logger.record("kof_fight/emulated_frames_cumulative", self.cumulative_fight_frames)
+            for action_id in range(ACTION_COUNT):
+                available_steps = float(self.fight_action_available[action_id])
+                selected_total = float(self.fight_action_selected[action_id])
+                self.logger.record(
+                    f"kof_fight/action_{action_id}_available_steps",
+                    available_steps,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"kof_fight/action_{action_id}_selected_total",
+                    selected_total,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"kof_fight/action_{action_id}_selection_rate_when_available",
+                    selected_total / max(1.0, available_steps),
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"kof_fight/followup_{action_id}_queued_total",
+                    float(self.fight_followup_queued[action_id]),
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"kof_fight/followup_{action_id}_started_total",
+                    float(self.fight_followup_started[action_id]),
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"kof_fight/followup_{action_id}_hit_total",
+                    float(self.fight_followup_hit[action_id]),
+                    exclude="stdout",
+                )
             self.reset_rollout_metrics()
 
     root = args.root.resolve()
+    preset = TRAINING_PRESETS[args.preset]
+    effective_action_repeat = (
+        args.action_repeat if args.action_repeat is not None else preset["action_repeat"]
+    )
+    effective_gamma = args.gamma if args.gamma is not None else preset["gamma"]
+    effective_gae_lambda = (
+        args.gae_lambda if args.gae_lambda is not None else preset["gae_lambda"]
+    )
+    effective_n_steps = args.n_steps if args.n_steps is not None else preset["n_steps"]
+    print(
+        f"Preset {args.preset}: action_repeat={effective_action_repeat}, "
+        f"gamma={effective_gamma}, gae_lambda={effective_gae_lambda}, "
+        f"n_steps={effective_n_steps}"
+    )
+
     if args.viewer and args.profile == "mixed":
         print("--viewer cannot display mixed parallel environments. Use combo or fight.", file=sys.stderr)
         return 2
@@ -812,6 +1127,48 @@ def main() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    resume_path: Optional[Path] = None
+    if args.resume:
+        resume_path = args.resume if args.resume.is_absolute() else root / args.resume
+        validate_file(resume_path, "Resume model")
+
+    manifest_files: dict[str, Path] = {
+        "fbneo_training_dll": root / "build-vs2026-x64" / "Release" / "fbneo_training.dll",
+        "fbneo_libretro_core": root / "downloads" / "fbneo_libretro" / "fbneo_libretro.dll",
+        "rom": root / "roms" / "fbneo" / "kof98.zip",
+    }
+    if combo_env_count:
+        for scenario_name, scenario_state_path in combo_scenario_specs:
+            manifest_files[f"combo_state_{scenario_name}"] = scenario_state_path
+    if fight_env_count:
+        manifest_files["fight_state"] = fight_state_path
+    if resume_path is not None:
+        manifest_files["resume_model"] = resume_path
+    manifest_path = log_dir / (
+        f"run_manifest_{args.save_name}_"
+        f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    )
+    write_run_manifest(
+        manifest_path,
+        args,
+        root,
+        effective={
+            "preset": args.preset,
+            "action_repeat": effective_action_repeat,
+            "gamma": effective_gamma,
+            "gae_lambda": effective_gae_lambda,
+            "n_steps": effective_n_steps,
+            "timesteps": args.timesteps,
+            "num_envs": args.num_envs,
+            "profile": args.profile,
+            "combo_ratio": args.combo_ratio,
+            "mask_level": args.mask_level,
+            "p2_training_ai": args.p2_training_ai,
+        },
+        manifest_files=manifest_files,
+    )
+    print(f"Run manifest: {manifest_path}")
+
     if args.tensorboard:
         start_tensorboard(log_dir, args.tensorboard_port)
 
@@ -842,7 +1199,8 @@ def main() -> int:
                 fight_state_path=fight_state_path,
                 training_profile=training_profile,
                 combo_scenario=combo_scenario,
-                action_repeat=args.action_repeat,
+                action_mask_level=ActionMaskLevel(args.mask_level),
+                action_repeat=effective_action_repeat,
                 seed=seed,
                 p2_training_ai=args.p2_training_ai,
                 hitbox_reward=not args.no_hitbox_reward,
@@ -873,14 +1231,19 @@ def main() -> int:
     )
     callback = CallbackList([checkpoint_callback, TrainingMetricsCallback()])
 
-    if args.resume:
-        resume_path = args.resume if args.resume.is_absolute() else root / args.resume
-        validate_file(resume_path, "Resume model")
+    if resume_path is not None:
         model = MaskablePPO.load(
             str(resume_path),
             env=env,
             device=args.device,
             tensorboard_log=str(log_dir),
+            gamma=effective_gamma,
+            gae_lambda=effective_gae_lambda,
+            n_steps=effective_n_steps,
+        )
+        print(
+            f"Resumed with gamma={effective_gamma}, "
+            f"gae_lambda={effective_gae_lambda}, n_steps={effective_n_steps}"
         )
     else:
         model = MaskablePPO(
@@ -888,11 +1251,11 @@ def main() -> int:
             env,
             device=args.device,
             verbose=1,
-            n_steps=1024,
+            n_steps=effective_n_steps,
             batch_size=128,
             n_epochs=6,
-            gamma=0.99,
-            gae_lambda=0.95,
+            gamma=effective_gamma,
+            gae_lambda=effective_gae_lambda,
             learning_rate=2.5e-4,
             ent_coef=0.01,
             clip_range=0.2,

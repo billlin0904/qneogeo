@@ -9,7 +9,13 @@ from typing import Optional
 
 import numpy as np
 
-from kof98_env import Kof98Env, TrainingProfile
+from kof98_env import (
+    ActionMaskLevel,
+    COMBO_SCENARIOS,
+    DEFAULT_COMBO_SCENARIO_NAME,
+    Kof98Env,
+    TrainingProfile,
+)
 
 
 def default_project_root() -> Path:
@@ -32,6 +38,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=default_project_root(), help="qneogeo project root.")
     parser.add_argument("--model", type=Path, default=None, help="Stable-Baselines3 PPO .zip model.")
     parser.add_argument("--state", type=Path, default=None, help="Initial save state.")
+    parser.add_argument(
+        "--combo-scenario",
+        choices=tuple(sorted(COMBO_SCENARIOS)),
+        default=DEFAULT_COMBO_SCENARIO_NAME,
+        help="Combo scenario whose mask drives the model. Defaults to the dokugami chain.",
+    )
+    parser.add_argument(
+        "--mask-level",
+        choices=tuple(level.value for level in ActionMaskLevel),
+        default=ActionMaskLevel.STRICT.value,
+        help="strict locks the model to the scenario's next move; physical opens every action.",
+    )
     parser.add_argument("--device", default="cuda", help="PPO inference device.")
     parser.add_argument("--action-repeat", type=int, default=6, help="Frames to run per action.")
     parser.add_argument("--scale", type=int, default=3, help="Initial window scale.")
@@ -658,6 +676,8 @@ def main() -> int:
         combo_state_path=state_path,
         training_profile=TrainingProfile.COMBO,
         action_repeat=args.action_repeat,
+        combo_scenario=args.combo_scenario,
+        action_mask_level=ActionMaskLevel(args.mask_level),
     )
     env.client.set_video_refresh_callback(sink.receive)
 
@@ -667,10 +687,18 @@ def main() -> int:
             raise ValueError(f"Fixed action ids are out of range: {invalid_actions}")
 
     model = None
+    model_action_count = env.action_space.n
     if args.model:
         from sb3_contrib import MaskablePPO
 
         model = MaskablePPO.load(str(model_path), device=args.device)
+        model_action_count = int(model.action_space.n)
+        if model_action_count != env.action_space.n:
+            print(
+                f"Warning: model has {model_action_count} actions, environment has "
+                f"{env.action_space.n}; viewer will trim the mask for compatibility.",
+                flush=True,
+            )
 
     obs, _ = env.reset()
     env.step(0)
@@ -764,10 +792,11 @@ def main() -> int:
                         action_id = int(args.fixed_action)
                         fixed_action_sent = True
                 elif model is not None:
+                    action_mask = env.action_masks()[:model_action_count]
                     action, _ = model.predict(
                         obs,
                         deterministic=deterministic,
-                        action_masks=env.action_masks(),
+                        action_masks=action_mask,
                     )
                     action_id = int(np.asarray(action).item())
                 elif args.random:
