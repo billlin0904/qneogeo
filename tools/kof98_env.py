@@ -917,6 +917,7 @@ class Kof98Env(gym.Env if gym else object):
         action_repeat: int = 6,
         hitbox_reward: bool = True,
         p2_training_ai: bool = False,
+        fight_guided: bool = False,
         training_profile: TrainingProfile | str = TrainingProfile.COMBO,
         combo_state_path: Optional[str | Path] = None,
         fight_state_path: Optional[str | Path] = None,
@@ -950,12 +951,16 @@ class Kof98Env(gym.Env if gym else object):
         self.fight_frame_scale = float(self.action_repeat) / FIGHT_SHAPING_BASELINE_FRAMES
         self.hitbox_reward = hitbox_reward and self.training_profile is TrainingProfile.FIGHT
         self.p2_training_ai = p2_training_ai
+        self.fight_guided = fight_guided and self.training_profile is TrainingProfile.FIGHT
         self.previous_observation: Optional[Kof98Observation] = None
         self.pending_attack_risk: Optional[dict[str, float]] = None
         self.fight_pending_followups: list[dict] = []
         self.fight_prev_p1_attack_overlap = False
         self.fight_prev_p2_attack_overlap = False
         self.fight_combo_4plus_rewarded = False
+        self.fight_teacher_phase = 0
+        self.fight_teacher_chain_seen = False
+        self.fight_teacher_route_completed = False
         self.episode_steps = 0
         self.episode_max_combo = 0
         self.combo_phase = 0
@@ -998,6 +1003,9 @@ class Kof98Env(gym.Env if gym else object):
         self.fight_prev_p1_attack_overlap = False
         self.fight_prev_p2_attack_overlap = False
         self.fight_combo_4plus_rewarded = False
+        self.fight_teacher_phase = 0
+        self.fight_teacher_chain_seen = False
+        self.fight_teacher_route_completed = False
         self.episode_steps = 0
         self.episode_max_combo = 0
         self.combo_phase = 0
@@ -1287,6 +1295,14 @@ class Kof98Env(gym.Env if gym else object):
         previous_combo = max(0, previous.p1_combo_count) if previous is not None else 0
         current_combo = max(0, observation.p1_combo_count)
         combo_delta = max(0, current_combo - previous_combo)
+        fight_teacher_completed_now = self._update_fight_teacher(
+            action_id,
+            action_accepted,
+            action_status,
+            previous_combo,
+            current_combo,
+            p1_damage,
+        )
 
         # A follow-up is an action issued while the DLL runtime is busy that it
         # accepted into its queue (or that already fired within this step's
@@ -1460,7 +1476,14 @@ class Kof98Env(gym.Env if gym else object):
         info = {
             "raw": observation,
             "training_profile": self.training_profile.value,
+            "fight_guided": float(self.fight_guided),
+            "fight_teacher_phase": float(self.fight_teacher_phase),
+            "fight_teacher_complete": float(fight_teacher_completed_now),
             "action": action_id,
+            "input_accepted": float(action_accepted),
+            "active_action_id": float(action_status.active_action_id),
+            "queued_action_id": float(action_status.queued_action_id),
+            "last_started_action_id": float(action_status.last_started_action_id),
             "frame_count": float(self.action_repeat),
             "free_decision": float(free_decision),
             "queue_decision": float(queue_decision),
@@ -1868,6 +1891,92 @@ class Kof98Env(gym.Env if gym else object):
                 mask[action_id] = True
         return mask
 
+    def _fight_teacher_expected_action(self) -> Optional[int]:
+        if not self.fight_guided or self.fight_teacher_route_completed:
+            return None
+        if 0 <= self.fight_teacher_phase < len(self.combo_scenario.phases):
+            return self.combo_scenario.phases[self.fight_teacher_phase].action_id
+        return None
+
+    def _guided_fight_action_mask(self, physical_mask: np.ndarray) -> np.ndarray:
+        expected_action = self._fight_teacher_expected_action()
+        if expected_action is None:
+            return physical_mask
+
+        # Neutral remains a real Fight problem. The teacher only takes over
+        # once Close C is in range, then exposes the next move exclusively
+        # when the DLL says that move can physically start or be queued.
+        if (
+            self.fight_teacher_phase == 0
+            and self.previous_observation is not None
+            and abs(self.previous_observation.distance_x) > COMBO_CLOSE_DISTANCE
+        ):
+            return physical_mask
+
+        mask = np.zeros(self.action_space.n, dtype=bool)
+        if physical_mask[expected_action]:
+            mask[expected_action] = True
+            if self.fight_teacher_phase > 0:
+                mask[IDLE_ACTION_ID] = True
+        else:
+            mask[IDLE_ACTION_ID] = True
+        return mask
+
+    def _update_fight_teacher(
+        self,
+        action_id: int,
+        action_accepted: bool,
+        action_status: ActionStatus,
+        previous_combo: int,
+        current_combo: int,
+        p1_damage: float,
+    ) -> bool:
+        if not self.fight_guided:
+            return False
+
+        expected_action = self._fight_teacher_expected_action()
+        if (
+            expected_action is not None
+            and action_accepted
+            and action_id == expected_action
+        ):
+            self.fight_teacher_phase += 1
+
+        if current_combo > 0:
+            self.fight_teacher_chain_seen = True
+
+        completed_now = False
+        final_required_combo = self.combo_scenario.phases[-1].required_combo
+        if (
+            not self.fight_teacher_route_completed
+            and self.fight_teacher_phase >= len(self.combo_scenario.phases)
+            and current_combo >= final_required_combo
+        ):
+            self.fight_teacher_route_completed = True
+            completed_now = True
+
+        runtime_idle = (
+            action_status.active_action_id < 0
+            and action_status.queued_action_id < 0
+        )
+        chain_dropped = (
+            self.fight_teacher_chain_seen
+            and previous_combo > 0
+            and current_combo == 0
+        )
+        opener_whiffed = (
+            not self.fight_teacher_chain_seen
+            and self.fight_teacher_phase > 0
+            and current_combo == 0
+            and runtime_idle
+        )
+        if p1_damage > 0.0 or chain_dropped or opener_whiffed:
+            self.fight_teacher_phase = 0
+            self.fight_teacher_chain_seen = False
+            self.fight_teacher_route_completed = False
+
+        return completed_now
+
     def _add_guided_distractors(
         self,
         mask: np.ndarray,
@@ -1889,7 +1998,7 @@ class Kof98Env(gym.Env if gym else object):
     def action_masks(self) -> np.ndarray:
         physical_mask = self._physical_action_mask()
         if self.training_profile is not TrainingProfile.COMBO:
-            return physical_mask
+            return self._guided_fight_action_mask(physical_mask)
         if self.action_mask_level is ActionMaskLevel.PHYSICAL:
             return physical_mask
 

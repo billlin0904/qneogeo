@@ -43,6 +43,13 @@ FIGHT_OUTCOME_NAMES = (
     "draw_ko",
 )
 
+DEFAULT_GUIDED_FIGHT_SCENARIOS = (
+    "kyo_close_c_seventy_five_shiki_kai_red_kick",
+    "kyo_close_c_seventy_five_shiki_kai_kototsuki",
+    "kyo_close_c_seventy_five_shiki_kai_aragami",
+    "kyo_forward_b_red_kick",
+)
+
 
 def default_project_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -58,6 +65,7 @@ def make_env(
     action_repeat: int,
     seed: int,
     p2_training_ai: bool = False,
+    fight_guided: bool = False,
     hitbox_reward: bool = True,
     viewer: bool = False,
     viewer_scale: int = 3,
@@ -78,6 +86,7 @@ def make_env(
             action_repeat=action_repeat,
             hitbox_reward=hitbox_reward,
             p2_training_ai=p2_training_ai,
+            fight_guided=fight_guided,
             training_profile=training_profile,
             combo_scenario=combo_scenario,
             action_mask_level=action_mask_level,
@@ -222,6 +231,25 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Fraction of parallel environments assigned to Combo in mixed mode.",
+    )
+    parser.add_argument(
+        "--guided-fight-envs",
+        type=int,
+        default=0,
+        help=(
+            "Number of Fight environments that expose a combo-route action "
+            "mask while keeping the real Fight state, opponent and rewards."
+        ),
+    )
+    parser.add_argument(
+        "--guided-fight-scenario",
+        action="append",
+        choices=tuple(COMBO_SCENARIOS),
+        default=None,
+        help=(
+            "Combo route assigned to Guided Fight environments. Repeat to "
+            "cycle multiple routes."
+        ),
     )
     parser.add_argument(
         "--mask-level",
@@ -638,6 +666,22 @@ def main() -> int:
             self.fight_combo_4plus_episodes = 0.0
             self.fight_episode_damage_dealt_total = 0.0
             self.fight_episode_damage_taken_total = 0.0
+            self.fight_mode_metrics = {
+                "guided": {
+                    "episodes": 0.0,
+                    "wins": 0.0,
+                    "combo_4plus": 0.0,
+                    "episode_max_total": 0.0,
+                    "teacher_completions": 0.0,
+                },
+                "physical": {
+                    "episodes": 0.0,
+                    "wins": 0.0,
+                    "combo_4plus": 0.0,
+                    "episode_max_total": 0.0,
+                    "teacher_completions": 0.0,
+                },
+            }
             self.p1_damage = 0.0
             self.p2_damage = 0.0
             self.p1_attack_overlap = 0.0
@@ -743,6 +787,14 @@ def main() -> int:
                         },
                     )
                 elif training_profile == TrainingProfile.FIGHT.value:
+                    fight_mode = (
+                        "guided"
+                        if bool(info.get("fight_guided", 0.0))
+                        else "physical"
+                    )
+                    self.fight_mode_metrics[fight_mode]["teacher_completions"] += float(
+                        info.get("fight_teacher_complete", 0.0)
+                    )
                     self.fight_step_count += 1
                     self.fight_frames_total += frame_count
                     self.cumulative_fight_frames += frame_count
@@ -803,6 +855,13 @@ def main() -> int:
                         if outcome in self.fight_outcome_counts:
                             self.fight_outcome_counts[outcome] += 1.0
                         episode_max_combo = self.env_fight_max_combo.pop(index, 0.0)
+                        mode_metrics = self.fight_mode_metrics[fight_mode]
+                        mode_metrics["episodes"] += 1.0
+                        mode_metrics["episode_max_total"] += episode_max_combo
+                        if outcome in ("win_ko", "win_timeout"):
+                            mode_metrics["wins"] += 1.0
+                        if episode_max_combo >= 4.0:
+                            mode_metrics["combo_4plus"] += 1.0
                         self.fight_episode_max_combo_total += episode_max_combo
                         if episode_max_combo >= 2.0:
                             self.fight_combo_2plus_episodes += 1.0
@@ -1071,6 +1130,26 @@ def main() -> int:
             )
             self.logger.record("kof_fight/emulated_frames", self.fight_frames_total)
             self.logger.record("kof_fight/emulated_frames_cumulative", self.cumulative_fight_frames)
+            for fight_mode, metrics in self.fight_mode_metrics.items():
+                mode_episode_count = max(1.0, metrics["episodes"])
+                prefix = f"kof_fight_{fight_mode}"
+                self.logger.record(f"{prefix}/episodes_total", metrics["episodes"])
+                self.logger.record(
+                    f"{prefix}/win_rate",
+                    metrics["wins"] / mode_episode_count,
+                )
+                self.logger.record(
+                    f"{prefix}/combo_4plus_episode_rate",
+                    metrics["combo_4plus"] / mode_episode_count,
+                )
+                self.logger.record(
+                    f"{prefix}/episode_max_combo_mean",
+                    metrics["episode_max_total"] / mode_episode_count,
+                )
+                self.logger.record(
+                    f"{prefix}/teacher_completions_total",
+                    metrics["teacher_completions"],
+                )
             for action_id in range(ACTION_COUNT):
                 available_steps = float(self.fight_action_available[action_id])
                 selected_total = float(self.fight_action_selected[action_id])
@@ -1164,6 +1243,16 @@ def main() -> int:
     validate_file(root / "roms" / "fbneo" / "kof98.zip", "kof98.zip")
     combo_env_count = training_profiles.count(TrainingProfile.COMBO)
     fight_env_count = training_profiles.count(TrainingProfile.FIGHT)
+    if args.guided_fight_envs < 0 or args.guided_fight_envs > fight_env_count:
+        print(
+            "--guided-fight-envs must be between 0 and the number of Fight environments "
+            f"({fight_env_count}).",
+            file=sys.stderr,
+        )
+        return 2
+    guided_fight_scenarios = tuple(
+        args.guided_fight_scenario or DEFAULT_GUIDED_FIGHT_SCENARIOS
+    )
     if combo_env_count:
         for scenario_name, scenario_state_path in combo_scenario_specs:
             validate_file(scenario_state_path, f"Combo state for {scenario_name}")
@@ -1171,7 +1260,11 @@ def main() -> int:
     if fight_env_count:
         validate_file(fight_state_path, "Fight save state")
         print(f"Fight profile state: {fight_state_path}")
-    print(f"Training environments: Combo={combo_env_count}, Fight={fight_env_count}")
+    print(
+        f"Training environments: Combo={combo_env_count}, "
+        f"Guided Fight={args.guided_fight_envs}, "
+        f"Physical Fight={fight_env_count - args.guided_fight_envs}"
+    )
 
     if args.save_name is None:
         args.save_name = f"kof98_{args.profile}_ppo"
@@ -1221,6 +1314,8 @@ def main() -> int:
             "num_envs": args.num_envs,
             "profile": args.profile,
             "combo_ratio": args.combo_ratio,
+            "guided_fight_envs": args.guided_fight_envs,
+            "guided_fight_scenarios": guided_fight_scenarios,
             "mask_level": args.mask_level,
             "p2_training_ai": args.p2_training_ai,
             "fight_reward_version": FIGHT_REWARD_VERSION,
@@ -1234,18 +1329,29 @@ def main() -> int:
     if args.tensorboard:
         start_tensorboard(log_dir, args.tensorboard_port)
 
-    environment_specs: list[tuple[TrainingProfile, str, Path]] = []
+    environment_specs: list[tuple[TrainingProfile, str, Path, bool]] = []
     combo_spec_index = 0
+    fight_spec_index = 0
     for training_profile in training_profiles:
         if training_profile is TrainingProfile.COMBO:
             scenario_name, scenario_state_path = combo_scenario_specs[
                 combo_spec_index % len(combo_scenario_specs)
             ]
             combo_spec_index += 1
+            fight_guided = False
         else:
-            scenario_name, scenario_state_path = combo_scenario_specs[0]
+            fight_guided = fight_spec_index < args.guided_fight_envs
+            scenario_name = (
+                guided_fight_scenarios[
+                    fight_spec_index % len(guided_fight_scenarios)
+                ]
+                if fight_guided
+                else combo_scenario_specs[0][0]
+            )
+            scenario_state_path = combo_scenario_specs[0][1]
+            fight_spec_index += 1
         environment_specs.append(
-            (training_profile, scenario_name, scenario_state_path)
+            (training_profile, scenario_name, scenario_state_path, fight_guided)
         )
 
     def monitored_env(
@@ -1253,6 +1359,7 @@ def main() -> int:
         training_profile: TrainingProfile,
         combo_scenario: str,
         scenario_state_path: Path,
+        fight_guided: bool,
     ) -> Callable:
         def _init():
             return MaskableMonitor(make_env(
@@ -1265,6 +1372,7 @@ def main() -> int:
                 action_repeat=effective_action_repeat,
                 seed=seed,
                 p2_training_ai=args.p2_training_ai,
+                fight_guided=fight_guided,
                 hitbox_reward=not args.no_hitbox_reward,
                 viewer=args.viewer,
                 viewer_scale=args.viewer_scale,
@@ -1277,8 +1385,14 @@ def main() -> int:
         return _init
 
     env_fns = [
-        monitored_env(seed, training_profile, combo_scenario, scenario_state_path)
-        for seed, (training_profile, combo_scenario, scenario_state_path)
+        monitored_env(
+            seed,
+            training_profile,
+            combo_scenario,
+            scenario_state_path,
+            fight_guided,
+        )
+        for seed, (training_profile, combo_scenario, scenario_state_path, fight_guided)
         in enumerate(environment_specs)
     ]
     if len(env_fns) == 1:

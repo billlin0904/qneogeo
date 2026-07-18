@@ -372,6 +372,63 @@ def verify_fight_event_attribution(root: Path, state_path: Path) -> bool:
         env.close()
 
 
+def verify_guided_fight_teacher(root: Path, state_path: Path) -> bool:
+    env = Kof98Env(
+        root / "build-vs2026-x64" / "Release" / "fbneo_training.dll",
+        root / "downloads" / "fbneo_libretro" / "fbneo_libretro.dll",
+        root / "roms" / "fbneo" / "kof98.zip",
+        root / "roms" / "fbneo",
+        root / "saves",
+        state_path=state_path,
+        action_repeat=1,
+        hitbox_reward=False,
+        p2_training_ai=False,
+        fight_guided=True,
+        training_profile=TrainingProfile.FIGHT,
+        combo_scenario="kyo_close_c_seventy_five_shiki_kai_red_kick",
+        action_mask_level=ActionMaskLevel.PHYSICAL,
+    )
+    try:
+        env.reset()
+        pending_actions = [8, 26, 17]
+        accepted_actions: list[int] = []
+        teacher_completions = 0
+        max_combo = 0
+
+        for _frame in range(180):
+            mask = env.action_masks()
+            action_id = 0
+            if pending_actions and mask[pending_actions[0]]:
+                action_id = pending_actions[0]
+
+            _observation, _reward, terminated, truncated, info = env.step(action_id)
+            if (
+                pending_actions
+                and action_id == pending_actions[0]
+                and bool(info["input_accepted"])
+            ):
+                accepted_actions.append(pending_actions.pop(0))
+            teacher_completions += int(info["fight_teacher_complete"])
+            max_combo = max(max_combo, int(info["p1_combo_count"]))
+            if terminated or truncated or teacher_completions:
+                break
+
+        passed = (
+            not pending_actions
+            and accepted_actions == [8, 26, 17]
+            and teacher_completions == 1
+            and max_combo >= 4
+        )
+        status = "PASS" if passed else "FAIL"
+        print(
+            f"[{status}] guided fight teacher: actions={accepted_actions} "
+            f"completions={teacher_completions} max_combo={max_combo}"
+        )
+        return passed
+    finally:
+        env.close()
+
+
 def main() -> int:
     args = parse_args()
     root = args.root.resolve()
@@ -406,6 +463,7 @@ def main() -> int:
         failed = not verify_combo_scenarios(root, state_path) or failed
         failed = not verify_physical_reward_cases(root) or failed
         failed = not verify_fight_event_attribution(root, state_path) or failed
+        failed = not verify_guided_fight_teacher(root, state_path) or failed
 
     return 1 if failed else 0
 
