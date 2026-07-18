@@ -288,6 +288,14 @@ def parse_args() -> argparse.Namespace:
         help="TensorBoard log directory.",
     )
     parser.add_argument(
+        "--tensorboard-run-name",
+        default=None,
+        help=(
+            "TensorBoard run name. Defaults to a timestamped name so resumed "
+            "training never merges events with an older run."
+        ),
+    )
+    parser.add_argument(
         "--save-dir",
         type=Path,
         default=None,
@@ -1159,6 +1167,11 @@ def main() -> int:
 
     if args.save_name is None:
         args.save_name = f"kof98_{args.profile}_ppo"
+    run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tensorboard_run_name = (
+        args.tensorboard_run_name
+        or f"{args.save_name}_{run_timestamp}"
+    )
 
     log_dir = (args.log_dir or root / "ai_logs").resolve()
     save_dir = (args.save_dir or root / "trained_models").resolve()
@@ -1184,7 +1197,7 @@ def main() -> int:
         manifest_files["resume_model"] = resume_path
     manifest_path = log_dir / (
         f"run_manifest_{args.save_name}_"
-        f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        f"{run_timestamp}.json"
     )
     write_run_manifest(
         manifest_path,
@@ -1203,10 +1216,12 @@ def main() -> int:
             "mask_level": args.mask_level,
             "p2_training_ai": args.p2_training_ai,
             "fight_reward_version": FIGHT_REWARD_VERSION,
+            "tensorboard_run_name": tensorboard_run_name,
         },
         manifest_files=manifest_files,
     )
     print(f"Run manifest: {manifest_path}")
+    print(f"TensorBoard run: {tensorboard_run_name}")
 
     if args.tensorboard:
         start_tensorboard(log_dir, args.tensorboard_port)
@@ -1307,7 +1322,7 @@ def main() -> int:
             total_timesteps=args.timesteps,
             callback=callback,
             reset_num_timesteps=args.resume is None,
-            tb_log_name=args.save_name,
+            tb_log_name=tensorboard_run_name,
         )
         final_path = save_dir / f"{args.save_name}_final.zip"
         model.save(str(final_path))
