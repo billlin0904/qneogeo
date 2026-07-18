@@ -150,12 +150,14 @@ DEFENSE_PRESSURE_MARGIN = 28
 DEFENSE_GUARD_REWARD = 0.08
 DEFENSE_UNGUARDED_PRESSURE_PENALTY = 0.04
 DEFENSE_BAD_GUARD_PENALTY = 0.08
-FIGHT_REWARD_VERSION = "attributed_hits_v2"
+FIGHT_REWARD_VERSION = "combo4_milestone_v3"
 # Escalating per-hit combo rewards: hit 1 is paid through hp damage, later
 # hits pay increasingly more so continuing a chain beats resetting to neutral
 # even under KOF98 damage scaling. Hits past 5 pay the cap.
 FIGHT_COMBO_HIT_REWARDS = {2: 1.0, 3: 2.0, 4: 3.5, 5: 5.0}
 FIGHT_COMBO_HIT_REWARD_CAP = 6.0
+FIGHT_COMBO_4PLUS_MILESTONE_HITS = 4
+FIGHT_COMBO_4PLUS_MILESTONE_REWARD = 8.0
 SUPER_COMBO_BONUS = 3.0
 SUPER_ACTION_IDS = {18, 19}
 SUPER_POWER_STOCKS_REQUIRED = 1
@@ -953,6 +955,7 @@ class Kof98Env(gym.Env if gym else object):
         self.fight_pending_followups: list[dict] = []
         self.fight_prev_p1_attack_overlap = False
         self.fight_prev_p2_attack_overlap = False
+        self.fight_combo_4plus_rewarded = False
         self.episode_steps = 0
         self.episode_max_combo = 0
         self.combo_phase = 0
@@ -994,6 +997,7 @@ class Kof98Env(gym.Env if gym else object):
         self.fight_pending_followups = []
         self.fight_prev_p1_attack_overlap = False
         self.fight_prev_p2_attack_overlap = False
+        self.fight_combo_4plus_rewarded = False
         self.episode_steps = 0
         self.episode_max_combo = 0
         self.combo_phase = 0
@@ -1416,6 +1420,19 @@ class Kof98Env(gym.Env if gym else object):
         reward += safety_reward
         reward_parts["safety"] = safety_reward
         reward_parts["cancel"] = 0.0
+        combo_4plus_milestone = (
+            not self.fight_combo_4plus_rewarded
+            and previous_combo < FIGHT_COMBO_4PLUS_MILESTONE_HITS
+            and current_combo >= FIGHT_COMBO_4PLUS_MILESTONE_HITS
+        )
+        reward_parts["combo_4plus_milestone"] = (
+            FIGHT_COMBO_4PLUS_MILESTONE_REWARD
+            if combo_4plus_milestone
+            else 0.0
+        )
+        if combo_4plus_milestone:
+            self.fight_combo_4plus_rewarded = True
+            reward += reward_parts["combo_4plus_milestone"]
         self.previous_observation = observation
 
         terminated = (
@@ -1522,6 +1539,7 @@ class Kof98Env(gym.Env if gym else object):
             "reward_distance": reward_parts["distance"],
             "reward_defense": reward_parts["defense"],
             "reward_combo": reward_parts["combo"],
+            "reward_fight_combo_4plus_milestone": reward_parts["combo_4plus_milestone"],
             "reward_super": reward_parts["super"],
             "reward_anti_air": reward_parts["anti_air"],
             "reward_safety": reward_parts["safety"],

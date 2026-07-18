@@ -325,6 +325,8 @@ def verify_fight_event_attribution(root: Path, state_path: Path) -> bool:
         followup_hits: list[int] = []
         combo_hit_actions: set[int] = set()
         cancel_reward = 0.0
+        combo_4plus_milestone_reward = 0.0
+        combo_4plus_milestone_events = 0
         max_combo = 0
 
         for _frame in range(180):
@@ -339,6 +341,9 @@ def verify_fight_event_attribution(root: Path, state_path: Path) -> bool:
             followup_hits.extend(int(value) for value in info["hit_followup_actions"])
             combo_hit_actions.update(int(value) for value in info["step_combo_hit_action_ids"])
             cancel_reward += float(info["reward_cancel"])
+            milestone_reward = float(info["reward_fight_combo_4plus_milestone"])
+            combo_4plus_milestone_reward += milestone_reward
+            combo_4plus_milestone_events += int(milestone_reward > 0.0)
             max_combo = max(max_combo, int(info["p1_combo_count"]))
             if terminated or truncated or (not pending_actions and max_combo >= 7):
                 break
@@ -350,13 +355,17 @@ def verify_fight_event_attribution(root: Path, state_path: Path) -> bool:
             and followup_hits == [10, 19]
             and combo_hit_actions == {11, 10, 19}
             and cancel_reward == 0.0
+            and combo_4plus_milestone_reward == 8.0
+            and combo_4plus_milestone_events == 1
             and max_combo >= 7
         )
         status = "PASS" if passed else "FAIL"
         print(
             f"[{status}] fight attribution: queued={queued} started={started} "
             f"followup_hits={followup_hits} hit_actions={sorted(combo_hit_actions)} "
-            f"cancel_reward={cancel_reward:.1f} max_combo={max_combo}"
+            f"cancel_reward={cancel_reward:.1f} "
+            f"milestone_reward={combo_4plus_milestone_reward:.1f} "
+            f"max_combo={max_combo}"
         )
         return passed
     finally:

@@ -695,6 +695,7 @@ def main() -> int:
             self.reward_distance = 0.0
             self.reward_defense = 0.0
             self.reward_combo = 0.0
+            self.reward_fight_combo_4plus_milestone = 0.0
             self.reward_super = 0.0
             self.reward_anti_air = 0.0
             self.reward_safety = 0.0
@@ -867,6 +868,9 @@ def main() -> int:
                 self.reward_distance += float(info.get("reward_distance", 0.0))
                 self.reward_defense += float(info.get("reward_defense", 0.0))
                 self.reward_combo += float(info.get("reward_combo", 0.0))
+                self.reward_fight_combo_4plus_milestone += float(
+                    info.get("reward_fight_combo_4plus_milestone", 0.0)
+                )
                 self.reward_super += float(info.get("reward_super", 0.0))
                 self.reward_anti_air += float(info.get("reward_anti_air", 0.0))
                 self.reward_safety += float(info.get("reward_safety", 0.0))
@@ -977,6 +981,10 @@ def main() -> int:
             self.logger.record("kof/reward_distance_total", self.reward_distance)
             self.logger.record("kof/reward_defense_total", self.reward_defense)
             self.logger.record("kof/reward_combo_total", self.reward_combo)
+            self.logger.record(
+                "kof_fight/reward_4plus_milestone_total",
+                self.reward_fight_combo_4plus_milestone,
+            )
             self.logger.record("kof/reward_super_total", self.reward_super)
             self.logger.record("kof/reward_anti_air_total", self.reward_anti_air)
             self.logger.record("kof/reward_safety_total", self.reward_safety)
