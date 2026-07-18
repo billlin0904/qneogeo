@@ -249,6 +249,15 @@ MainWindow::MainWindow(QWidget *parent)
     show_input_history_action_ = video_menu->addAction(QStringLiteral("Show Input History"));
     show_input_history_action_->setCheckable(true);
     show_input_history_action_->setChecked(true);
+    show_input_frame_numbers_action_ = video_menu->addAction(QStringLiteral("Show Frame Numbers"));
+    show_input_frame_numbers_action_->setCheckable(true);
+    {
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        const bool show_frame_numbers =
+            settings.value(QStringLiteral("Video/ShowFrameNumbers"), true).toBool();
+        show_input_frame_numbers_action_->setChecked(show_frame_numbers);
+        emulator_view_->setInputFrameNumbersEnabled(show_frame_numbers);
+    }
     show_hitboxes_action_ = video_menu->addAction(QStringLiteral("Show Hitboxes"));
     show_hitboxes_action_->setCheckable(true);
     show_hitboxes_action_->setChecked(true);
@@ -368,6 +377,15 @@ MainWindow::MainWindow(QWidget *parent)
     connect(show_fps_action_, &QAction::toggled, power_label_, &QLabel::setVisible);
     connect(show_input_history_action_, &QAction::toggled,
             emulator_view_, &EmulatorView::setInputOverlayEnabled);
+    connect(show_input_frame_numbers_action_, &QAction::toggled, this, [this](bool enabled) {
+        emulator_view_->setInputFrameNumbersEnabled(enabled);
+
+        QFileInfo file_info(inputConfigPath());
+        QDir().mkpath(file_info.absolutePath());
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        settings.setValue(QStringLiteral("Video/ShowFrameNumbers"), enabled);
+        settings.sync();
+    });
     connect(show_hitboxes_action_, &QAction::toggled, emulator_view_, &EmulatorView::setHitboxOverlayEnabled);
     connect(emulator_view_, &EmulatorView::fpsChanged, this, &MainWindow::updateFpsOverlay);
 
@@ -954,7 +972,9 @@ void MainWindow::updateInputOverlay() {
     if (!emulator_view_ || !core_ || !core_->isGameLoaded())
         return;
 
-    emulator_view_->submitInputFrame(core_->lastP1Input(), core_->emulatedFrameCount());
+    const uint64_t frame_number = core_->emulatedFrameCount();
+    emulator_view_->submitInputFrame(0, core_->lastP1Input(), frame_number);
+    emulator_view_->submitInputFrame(1, core_->lastP2Input(), frame_number);
 }
 
 void MainWindow::updateKof98Overlay() {

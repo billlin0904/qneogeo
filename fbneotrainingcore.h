@@ -46,6 +46,8 @@ private:
     using kof_env_save_state_t = int (*)(kof_env_handle, const wchar_t *);
     using kof_env_set_joypad_t = void (*)(kof_env_handle, const kof_env_joypad_state *);
     using kof_env_set_joypad_for_port_t = void (*)(kof_env_handle, unsigned, const kof_env_joypad_state *);
+    using kof_env_get_last_joypad_for_port_t =
+        int (*)(kof_env_handle, unsigned, kof_env_joypad_state *);
     using kof_env_set_video_refresh_t = void (*)(kof_env_handle, kof_env_video_refresh_t, void *);
     using kof_env_set_p2_random_ai_t = void (*)(kof_env_handle, int);
     using kof_env_run_frames_t = int (*)(kof_env_handle, int32_t);
@@ -91,6 +93,7 @@ private:
     kof_env_save_state_t kof_env_save_state_ = nullptr;
     kof_env_set_joypad_t kof_env_set_joypad_ = nullptr;
     kof_env_set_joypad_for_port_t kof_env_set_joypad_for_port_ = nullptr;
+    kof_env_get_last_joypad_for_port_t kof_env_get_last_joypad_for_port_ = nullptr;
     kof_env_set_video_refresh_t kof_env_set_video_refresh_ = nullptr;
     kof_env_set_p2_random_ai_t kof_env_set_p2_random_ai_ = nullptr;
     kof_env_run_frames_t kof_env_run_frames_ = nullptr;

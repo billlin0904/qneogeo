@@ -58,6 +58,7 @@ public:
     virtual bool readSystemRam(QByteArray &ram) const;
     virtual bool readSystemRamByte(uint32_t address, uint8_t &value) const;
     EmulatorView::JoypadInput lastP1Input() const;
+    EmulatorView::JoypadInput lastP2Input() const;
     uint64_t emulatedFrameCount() const;
 
     int keyBinding(unsigned retroButtonId) const;
@@ -106,7 +107,8 @@ protected:
     void finishKeyboardMotionAssist();
     void finishXInputMotionAssist();
     EmulatorView::JoypadInput currentP1Input() const;
-    void recordP1InputFrame(const EmulatorView::JoypadInput &input);
+    void recordInputFrame(const EmulatorView::JoypadInput &p1Input,
+                          const EmulatorView::JoypadInput &p2Input = {});
     void resetInputFrameTracking();
 
     std::string selected_bios_;
@@ -197,6 +199,7 @@ private:
     std::array<int, 16> xinput_bindings_ {};
     unsigned xinput_user_index_ = 0;
     EmulatorView::JoypadInput last_p1_input_;
+    EmulatorView::JoypadInput last_p2_input_;
     uint64_t emulated_frame_count_ = 0;
 
     retro_set_environment_t retro_set_environment_ = nullptr;

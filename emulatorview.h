@@ -49,6 +49,8 @@ public:
     bool hitboxOverlayEnabled() const;
     void setInputOverlayEnabled(bool enabled);
     bool inputOverlayEnabled() const;
+    void setInputFrameNumbersEnabled(bool enabled);
+    bool inputFrameNumbersEnabled() const;
 
     struct HitboxRect {
         QRectF rect;
@@ -76,7 +78,7 @@ public:
     };
 
     void setHitboxOverlay(QVector<HitboxRect> boxes, QVector<HitboxAxis> axes);
-    void submitInputFrame(const JoypadInput &input, uint64_t frameNumber);
+    void submitInputFrame(int32_t player, const JoypadInput &input, uint64_t frameNumber);
     void clearInputHistory();
 
 signals:
@@ -126,6 +128,7 @@ private:
     double fps_ = 0.0;
     bool hitbox_overlay_enabled_ = false;
     bool input_overlay_enabled_ = true;
+    bool input_frame_numbers_enabled_ = true;
     QVector<HitboxRect> hitbox_boxes_;
     QVector<HitboxAxis> hitbox_axes_;
     QWidget *hitbox_overlay_widget_ = nullptr;

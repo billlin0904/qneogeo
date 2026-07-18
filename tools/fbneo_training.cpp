@@ -692,6 +692,7 @@ public:
         last_frame_joypads_ = {};
         clearActionState();
         clearP2RandomAiScript();
+        resetHitTracking();
         retro_reset_();
         return true;
     }
@@ -714,6 +715,7 @@ public:
         last_frame_joypads_ = {};
         clearActionState();
         clearP2RandomAiScript();
+        resetHitTracking();
         return true;
     }
 
@@ -797,7 +799,35 @@ public:
         status->queued_action_id = queued_action_id_;
         status->last_started_action_id = last_started_action_id_;
         status->action_accepted = last_action_accepted_ ? 1 : 0;
+        status->step_last_hit_action_id = step_last_hit_action_id_;
         return true;
+    }
+
+    void resetHitTracking() {
+        hit_track_p2_health_ = -1;
+        hit_track_p1_combo_ = -1;
+        step_last_hit_action_id_ = -1;
+    }
+
+    void detectFrameHit(int32_t acting_action_id) {
+        size_t ram_size = 0;
+        const uint8_t *ram_ptr = systemRam(&ram_size);
+        if (!ram_ptr || ram_size == 0)
+            return;
+
+        const game_memory::GameMemReaderCore mem_reader(ram_ptr, ram_size);
+        const int32_t p2_health = mem_reader.readP2Health();
+        const int32_t p1_combo = mem_reader.readP1ComboCount();
+        const bool p2_health_dropped =
+            p2_health >= 0 && hit_track_p2_health_ >= 0 && p2_health < hit_track_p2_health_;
+        const bool p1_combo_rose =
+            p1_combo >= 0 && hit_track_p1_combo_ >= 0 && p1_combo > hit_track_p1_combo_;
+        if (p2_health_dropped || p1_combo_rose)
+            step_last_hit_action_id_ = acting_action_id;
+        if (p2_health >= 0)
+            hit_track_p2_health_ = p2_health;
+        if (p1_combo >= 0)
+            hit_track_p1_combo_ = p1_combo;
     }
 
     void clearActionScript() {
@@ -987,6 +1017,7 @@ public:
 
     bool setAction(int32_t action_id) {
         last_action_accepted_ = false;
+        step_last_hit_action_id_ = -1;
         if (active_action_id_ >= 0) {
             if (action_id == IDLE_ACTION_ID) {
                 last_action_accepted_ = true;
@@ -1018,7 +1049,10 @@ public:
             advanceActionScriptFrame();
             advanceP2RandomAiFrame();
             last_frame_joypads_ = joypads_;
+            const int32_t acting_action_id =
+                active_action_id_ >= 0 ? active_action_id_ : last_started_action_id_;
             retro_run_();
+            detectFrameHit(acting_action_id);
             finishActionScriptFrame();
             advanceActionLifecycleFrame();
         }
@@ -1459,6 +1493,9 @@ private:
     int32_t last_started_action_id_ = -1;
     int32_t active_action_elapsed_frames_ = 0;
     bool last_action_accepted_ = false;
+    int32_t step_last_hit_action_id_ = -1;
+    int32_t hit_track_p2_health_ = -1;
+    int32_t hit_track_p1_combo_ = -1;
     std::vector<InputFrame> p2_random_script_;
     size_t p2_random_script_index_ = 0;
     int32_t p2_random_script_remaining_frames_ = 0;

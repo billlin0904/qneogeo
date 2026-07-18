@@ -79,6 +79,7 @@ private:
     QAction *gameplay_with_ai_p2_action_;
     QAction *show_fps_action_;
     QAction *show_input_history_action_;
+    QAction *show_input_frame_numbers_action_;
     QAction *show_hitboxes_action_;
     QAction *neocd_core_action_;
     QAction *fbneo_core_action_;

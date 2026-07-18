@@ -20,6 +20,7 @@ from kof98_env import (
     ActionMaskLevel,
     COMBO_SCENARIOS,
     DEFAULT_COMBO_SCENARIO_NAME,
+    FIGHT_REWARD_VERSION,
     IDLE_ACTION_ID,
     Kof98Env,
     TrainingProfile,
@@ -689,6 +690,7 @@ def main() -> int:
             self.reward_super = 0.0
             self.reward_anti_air = 0.0
             self.reward_safety = 0.0
+            self.reward_cancel = 0.0
             self.reward_fast_win = 0.0
             self.reward_time = 0.0
             self.combo_episodes = 0.0
@@ -744,14 +746,35 @@ def main() -> int:
                     selected_action = int(info.get("action", -1))
                     if 0 <= selected_action < ACTION_COUNT:
                         self.fight_action_selected[selected_action] += 1.0
-                    followup_action = int(info.get("followup_action", -1.0))
-                    if 0 <= followup_action < ACTION_COUNT:
-                        if info.get("queued_followup", 0.0):
-                            self.fight_followup_queued[followup_action] += 1.0
-                        if info.get("started_followup", 0.0):
-                            self.fight_followup_started[followup_action] += 1.0
-                        if info.get("followup_hit", 0.0):
-                            self.fight_followup_hit[followup_action] += 1.0
+                    queued_actions = info.get("queued_followup_actions")
+                    started_actions = info.get("started_followup_actions")
+                    hit_actions = info.get("hit_followup_actions")
+                    if queued_actions is None or started_actions is None or hit_actions is None:
+                        followup_action = int(info.get("followup_action", -1.0))
+                        queued_actions = (
+                            [followup_action]
+                            if info.get("queued_followup", 0.0)
+                            else []
+                        )
+                        started_actions = (
+                            [followup_action]
+                            if info.get("started_followup", 0.0)
+                            else []
+                        )
+                        hit_actions = (
+                            [followup_action]
+                            if info.get("followup_hit", 0.0)
+                            else []
+                        )
+                    for followup_action in queued_actions:
+                        if 0 <= int(followup_action) < ACTION_COUNT:
+                            self.fight_followup_queued[int(followup_action)] += 1.0
+                    for followup_action in started_actions:
+                        if 0 <= int(followup_action) < ACTION_COUNT:
+                            self.fight_followup_started[int(followup_action)] += 1.0
+                    for followup_action in hit_actions:
+                        if 0 <= int(followup_action) < ACTION_COUNT:
+                            self.fight_followup_hit[int(followup_action)] += 1.0
                     fight_combo_count = float(info.get("p1_combo_count", 0.0))
                     self.env_fight_max_combo[index] = max(
                         self.env_fight_max_combo.get(index, 0.0),
@@ -839,6 +862,7 @@ def main() -> int:
                 self.reward_super += float(info.get("reward_super", 0.0))
                 self.reward_anti_air += float(info.get("reward_anti_air", 0.0))
                 self.reward_safety += float(info.get("reward_safety", 0.0))
+                self.reward_cancel += float(info.get("reward_cancel", 0.0))
                 self.reward_fast_win += float(info.get("reward_fast_win", 0.0))
                 self.reward_time += float(info.get("reward_time", 0.0))
                 self.reward_damage += float(info.get("reward_damage", 0.0))
@@ -948,6 +972,7 @@ def main() -> int:
             self.logger.record("kof/reward_super_total", self.reward_super)
             self.logger.record("kof/reward_anti_air_total", self.reward_anti_air)
             self.logger.record("kof/reward_safety_total", self.reward_safety)
+            self.logger.record("kof/reward_cancel_total", self.reward_cancel)
             self.logger.record("kof/reward_fast_win_total", self.reward_fast_win)
             self.logger.record("kof/reward_time_total", self.reward_time)
             self.logger.record("kof/combo_episodes_total", self.combo_episodes)
@@ -1177,6 +1202,7 @@ def main() -> int:
             "combo_ratio": args.combo_ratio,
             "mask_level": args.mask_level,
             "p2_training_ai": args.p2_training_ai,
+            "fight_reward_version": FIGHT_REWARD_VERSION,
         },
         manifest_files=manifest_files,
     )

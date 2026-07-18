@@ -69,6 +69,11 @@ typedef struct kof_env_action_status {
     int32_t queued_action_id;
     int32_t last_started_action_id;
     uint8_t action_accepted;
+    /* Action that was active on the most recent frame where P2 lost health or
+     * P1's combo counter rose, since the last kof_env_step/set_action call.
+     * -1 when no hit landed. Lets callers attribute damage to the move that
+     * actually connected instead of the action chosen this step. */
+    int32_t step_last_hit_action_id;
 } kof_env_action_status;
 
 typedef enum kof_env_hitbox_type {

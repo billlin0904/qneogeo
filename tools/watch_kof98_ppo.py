@@ -39,6 +39,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=None, help="Stable-Baselines3 PPO .zip model.")
     parser.add_argument("--state", type=Path, default=None, help="Initial save state.")
     parser.add_argument(
+        "--profile",
+        choices=tuple(profile.value for profile in TrainingProfile),
+        default=TrainingProfile.COMBO.value,
+        help="Environment profile to watch.",
+    )
+    parser.add_argument(
+        "--p2-training-ai",
+        action="store_true",
+        help="Enable the DLL's P2 training opponent. Intended for the fight profile.",
+    )
+    parser.add_argument(
         "--combo-scenario",
         choices=tuple(sorted(COMBO_SCENARIOS)),
         default=DEFAULT_COMBO_SCENARIO_NAME,
@@ -654,6 +665,8 @@ def main() -> int:
         print(f"  game: {root / 'roms' / 'fbneo' / 'kof98.zip'}", flush=True)
         print(f"  state: {state_path if state_path else '(none)'}", flush=True)
         print(f"  model: {model_path if model_path else '(none)'}", flush=True)
+        print(f"  profile: {args.profile}", flush=True)
+        print(f"  P2 training AI: {'on' if args.p2_training_ai else 'off'}", flush=True)
         if args.fixed_actions is not None:
             print(f"  fixed actions: {','.join(str(action) for action in args.fixed_actions)}", flush=True)
             if args.fixed_actions_loop:
@@ -667,15 +680,18 @@ def main() -> int:
     pygame = viewer.pygame
     clock = pygame.time.Clock()
 
+    training_profile = TrainingProfile(args.profile)
     env = Kof98Env(
         dll_path=root / "build-vs2026-x64" / "Release" / "fbneo_training.dll",
         core_path=root / "downloads" / "fbneo_libretro" / "fbneo_libretro.dll",
         game_path=root / "roms" / "fbneo" / "kof98.zip",
         system_dir=root / "system",
         save_dir=root / "saves",
-        combo_state_path=state_path,
-        training_profile=TrainingProfile.COMBO,
+        combo_state_path=state_path if training_profile is TrainingProfile.COMBO else None,
+        fight_state_path=state_path if training_profile is TrainingProfile.FIGHT else None,
+        training_profile=training_profile,
         action_repeat=args.action_repeat,
+        p2_training_ai=args.p2_training_ai,
         combo_scenario=args.combo_scenario,
         action_mask_level=ActionMaskLevel(args.mask_level),
     )

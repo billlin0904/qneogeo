@@ -83,6 +83,7 @@ class ActionStatus(ctypes.Structure):
         ("queued_action_id", ctypes.c_int32),
         ("last_started_action_id", ctypes.c_int32),
         ("action_accepted", ctypes.c_uint8),
+        ("step_last_hit_action_id", ctypes.c_int32),
     ]
 
 
@@ -104,8 +105,10 @@ HITBOX_OWNER_P1 = 1
 HITBOX_OWNER_P2 = 2
 HITBOX_REWARD_SOURCE_WIDTH = 320
 HITBOX_REWARD_SOURCE_HEIGHT = 224
-P1_ATTACK_OVERLAP_REWARD = 2.0
-P2_ATTACK_OVERLAP_PENALTY = 2.0
+# Edge-triggered (False -> True transition only): per-step overlap payouts
+# double-count with the hp reward once the attack actually connects.
+P1_ATTACK_OVERLAP_REWARD = 0.5
+P2_ATTACK_OVERLAP_PENALTY = 0.5
 EFFECTIVE_DISTANCE_MIN = 35
 EFFECTIVE_DISTANCE_MAX = 85
 DISTANCE_TOO_FAR_START = 110
@@ -118,8 +121,13 @@ DEFENSE_PRESSURE_MARGIN = 28
 DEFENSE_GUARD_REWARD = 0.08
 DEFENSE_UNGUARDED_PRESSURE_PENALTY = 0.04
 DEFENSE_BAD_GUARD_PENALTY = 0.08
-COMBO_DELTA_REWARD = 1.0
-COMBO_LENGTH_REWARD = 0.25
+FIGHT_REWARD_VERSION = "long_combo_v1"
+# Escalating per-hit combo rewards: hit 1 is paid through hp damage, later
+# hits pay increasingly more so continuing a chain beats resetting to neutral
+# even under KOF98 damage scaling. Hits past 5 pay the cap.
+FIGHT_COMBO_HIT_REWARDS = {2: 1.0, 3: 2.0, 4: 3.5, 5: 5.0}
+FIGHT_COMBO_HIT_REWARD_CAP = 6.0
+FIGHT_FOLLOWUP_HIT_REWARD = 1.0
 SUPER_COMBO_BONUS = 3.0
 SUPER_ACTION_IDS = {18, 19}
 SUPER_POWER_STOCKS_REQUIRED = 1
@@ -881,7 +889,9 @@ class Kof98Env(gym.Env if gym else object):
         self.p2_training_ai = p2_training_ai
         self.previous_observation: Optional[Kof98Observation] = None
         self.pending_attack_risk: Optional[dict[str, float]] = None
-        self.fight_pending_followup: Optional[dict] = None
+        self.fight_pending_followups: list[dict] = []
+        self.fight_prev_p1_attack_overlap = False
+        self.fight_prev_p2_attack_overlap = False
         self.episode_steps = 0
         self.episode_max_combo = 0
         self.combo_phase = 0
@@ -920,7 +930,9 @@ class Kof98Env(gym.Env if gym else object):
         observation = self.client.observation()
         self.previous_observation = observation
         self.pending_attack_risk = None
-        self.fight_pending_followup = None
+        self.fight_pending_followups = []
+        self.fight_prev_p1_attack_overlap = False
+        self.fight_prev_p2_attack_overlap = False
         self.episode_steps = 0
         self.episode_max_combo = 0
         self.combo_phase = 0
@@ -1193,6 +1205,10 @@ class Kof98Env(gym.Env if gym else object):
             HITBOX_OWNER_P1,
             DEFENSE_PRESSURE_MARGIN,
         )
+        p1_attack_overlap_edge = p1_attack_overlap and not self.fight_prev_p1_attack_overlap
+        p2_attack_overlap_edge = p2_attack_overlap and not self.fight_prev_p2_attack_overlap
+        self.fight_prev_p1_attack_overlap = p1_attack_overlap
+        self.fight_prev_p2_attack_overlap = p2_attack_overlap
 
         p2_damage = 0.0
         p1_damage = 0.0
@@ -1221,29 +1237,59 @@ class Kof98Env(gym.Env if gym else object):
                 or action_status.last_started_action_id == action_id
             )
         )
-        started_followup = False
-        followup_hit = False
+        queued_followup_actions: list[int] = []
+        started_followup_actions: list[int] = []
+        hit_followup_actions: list[int] = []
         if queued_followup:
-            self.fight_pending_followup = {"action": action_id, "age": 0, "started": False}
-        followup_action = (
-            self.fight_pending_followup["action"]
-            if self.fight_pending_followup is not None
-            else -1
-        )
-        if self.fight_pending_followup is not None:
-            pending = self.fight_pending_followup
+            self.fight_pending_followups.append(
+                {"action": action_id, "age": 0, "started": False},
+            )
+            queued_followup_actions.append(action_id)
+
+        for pending in self.fight_pending_followups:
             pending["age"] += self.action_repeat
+
+        for pending in self.fight_pending_followups:
             if not pending["started"] and (
-                action_status.active_action_id == pending["action"]
-                or action_status.last_started_action_id == pending["action"]
+                action_status.queued_action_id != pending["action"]
+                and (
+                    action_status.active_action_id == pending["action"]
+                    or action_status.last_started_action_id == pending["action"]
+                )
             ):
                 pending["started"] = True
-                started_followup = True
-            if pending["started"] and (p2_damage > 0.0 or combo_delta > 0):
-                followup_hit = True
-                self.fight_pending_followup = None
-            elif pending["age"] > FIGHT_FOLLOWUP_TRACK_WINDOW_FRAMES:
-                self.fight_pending_followup = None
+                started_followup_actions.append(pending["action"])
+                break
+
+        if p2_damage > 0.0 or combo_delta > 0:
+            for pending_index, pending in enumerate(self.fight_pending_followups):
+                if not pending["started"]:
+                    continue
+
+                hit_followup_actions.append(pending["action"])
+                del self.fight_pending_followups[pending_index]
+                break
+
+        self.fight_pending_followups = [
+            pending
+            for pending in self.fight_pending_followups
+            if pending["age"] <= FIGHT_FOLLOWUP_TRACK_WINDOW_FRAMES
+        ]
+
+        followup_action = -1
+        for actions in (
+            hit_followup_actions,
+            started_followup_actions,
+            queued_followup_actions,
+        ):
+            if actions:
+                followup_action = actions[0]
+                break
+        if followup_action < 0 and self.fight_pending_followups:
+            followup_action = self.fight_pending_followups[0]["action"]
+
+        started_followup = bool(started_followup_actions)
+        followup_hit = bool(hit_followup_actions)
 
         guard_action = action_id in GUARD_ACTION_IDS
         guard_success = guard_action and p2_attack_pressure and p1_damage <= 0.0
@@ -1262,8 +1308,8 @@ class Kof98Env(gym.Env if gym else object):
             action_id,
             p1_damage,
             p2_damage,
-            p1_attack_overlap,
-            p2_attack_overlap,
+            p1_attack_overlap_edge,
+            p2_attack_overlap_edge,
             p2_attack_pressure,
             super_available_before_action,
             p2_airborne_before_action,
@@ -1277,6 +1323,9 @@ class Kof98Env(gym.Env if gym else object):
         )
         reward += safety_reward
         reward_parts["safety"] = safety_reward
+        cancel_reward = FIGHT_FOLLOWUP_HIT_REWARD * len(hit_followup_actions)
+        reward += cancel_reward
+        reward_parts["cancel"] = cancel_reward
         self.previous_observation = observation
 
         terminated = (
@@ -1315,6 +1364,9 @@ class Kof98Env(gym.Env if gym else object):
             "started_followup": float(started_followup),
             "followup_hit": float(followup_hit),
             "followup_action": float(followup_action),
+            "queued_followup_actions": queued_followup_actions,
+            "started_followup_actions": started_followup_actions,
+            "hit_followup_actions": hit_followup_actions,
             "fight_outcome": fight_outcome,
             "p1_health": observation.p1_health,
             "p2_health": observation.p2_health,
@@ -1378,6 +1430,7 @@ class Kof98Env(gym.Env if gym else object):
             "reward_super": reward_parts["super"],
             "reward_anti_air": reward_parts["anti_air"],
             "reward_safety": reward_parts["safety"],
+            "reward_cancel": reward_parts["cancel"],
             "reward_fast_win": reward_parts["fast_win"],
             "reward_time": reward_parts["time"],
         }
@@ -1817,8 +1870,8 @@ class Kof98Env(gym.Env if gym else object):
         action_id: int,
         p1_damage: float,
         p2_damage: float,
-        p1_attack_overlap: bool,
-        p2_attack_overlap: bool,
+        p1_attack_overlap_edge: bool,
+        p2_attack_overlap_edge: bool,
         p2_attack_pressure: bool,
         super_available: bool,
         p2_airborne: bool,
@@ -1842,16 +1895,17 @@ class Kof98Env(gym.Env if gym else object):
         if previous.p2_health >= 0 and current.p2_health >= 0:
             p2_health_delta = float(previous.p2_health - current.p2_health)
             if action_id != ONIYAKI_ACTION_ID or p2_airborne:
-                reward_parts["hp"] += p2_health_delta * 3.0
+                reward_parts["hp"] += p2_health_delta * 2.0
             if action_id == ONIYAKI_ACTION_ID and p2_airborne and p2_health_delta > 0.0:
                 reward_parts["anti_air"] += ONIYAKI_ANTI_AIR_BONUS
         if previous.p1_health >= 0 and current.p1_health >= 0:
             reward_parts["hp"] -= float(previous.p1_health - current.p1_health) * 2.0
 
-        if p1_attack_overlap:
-            reward_parts["hitbox"] += P1_ATTACK_OVERLAP_REWARD * frame_scale
-        if p2_attack_overlap:
-            reward_parts["hitbox"] -= P2_ATTACK_OVERLAP_PENALTY * frame_scale
+        # Edge events, not per-step accrual, so no frame_scale here.
+        if p1_attack_overlap_edge:
+            reward_parts["hitbox"] += P1_ATTACK_OVERLAP_REWARD
+        if p2_attack_overlap_edge:
+            reward_parts["hitbox"] -= P2_ATTACK_OVERLAP_PENALTY
 
         guard_action = action_id in GUARD_ACTION_IDS
         if p2_attack_pressure:
@@ -1863,10 +1917,16 @@ class Kof98Env(gym.Env if gym else object):
                 reward_parts["defense"] -= DEFENSE_UNGUARDED_PRESSURE_PENALTY * frame_scale
 
         if previous.p1_combo_count >= 0 and current.p1_combo_count >= 0:
-            combo_delta = max(0, current.p1_combo_count - previous.p1_combo_count)
-            if combo_delta > 0:
-                reward_parts["combo"] += combo_delta * COMBO_DELTA_REWARD
-                reward_parts["combo"] += max(0, current.p1_combo_count - 1) * COMBO_LENGTH_REWARD
+            previous_combo = max(0, previous.p1_combo_count)
+            current_combo = max(0, current.p1_combo_count)
+            if current_combo > previous_combo:
+                # A multi-hit step credits every newly reached hit number.
+                for hit_number in range(previous_combo + 1, current_combo + 1):
+                    if hit_number >= 2:
+                        reward_parts["combo"] += FIGHT_COMBO_HIT_REWARDS.get(
+                            hit_number,
+                            FIGHT_COMBO_HIT_REWARD_CAP,
+                        )
             if action_id in SUPER_ACTION_IDS and super_available and p2_damage > 0.0 and current.p1_combo_count >= 2:
                 reward_parts["combo"] += SUPER_COMBO_BONUS
 

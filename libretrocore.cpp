@@ -737,7 +737,7 @@ bool LibretroCore::eventFilter(QObject *watched, QEvent *event) {
 void LibretroCore::runFrame() {
     if (game_loaded_ && !paused_ && retro_run_) {
         retro_run_();
-        recordP1InputFrame(currentP1Input());
+        recordInputFrame(currentP1Input());
         finishKeyboardMotionAssist();
         finishXInputMotionAssist();
         emit frameAdvanced();
@@ -900,6 +900,10 @@ EmulatorView::JoypadInput LibretroCore::lastP1Input() const {
     return last_p1_input_;
 }
 
+EmulatorView::JoypadInput LibretroCore::lastP2Input() const {
+    return last_p2_input_;
+}
+
 uint64_t LibretroCore::emulatedFrameCount() const {
     return emulated_frame_count_;
 }
@@ -936,13 +940,16 @@ EmulatorView::JoypadInput LibretroCore::currentP1Input() const {
     return input;
 }
 
-void LibretroCore::recordP1InputFrame(const EmulatorView::JoypadInput &input) {
-    last_p1_input_ = input;
+void LibretroCore::recordInputFrame(const EmulatorView::JoypadInput &p1Input,
+                                    const EmulatorView::JoypadInput &p2Input) {
+    last_p1_input_ = p1Input;
+    last_p2_input_ = p2Input;
     ++emulated_frame_count_;
 }
 
 void LibretroCore::resetInputFrameTracking() {
     last_p1_input_ = {};
+    last_p2_input_ = {};
     emulated_frame_count_ = 0;
 }
 

@@ -11,6 +11,7 @@
 #include <QVector2D>
 #include <QWidget>
 #include <algorithm>
+#include <array>
 #include <cstring>
 
 namespace {
@@ -119,94 +120,132 @@ public:
         setAttribute(Qt::WA_TranslucentBackground);
     }
 
-    void appendInput(const EmulatorView::JoypadInput &input, uint64_t frameNumber) {
-        if (frameNumber == 0)
+    void appendInput(int32_t player,
+                     const EmulatorView::JoypadInput &input,
+                     uint64_t frameNumber) {
+        if (player < 0 || player >= PLAYER_COUNT || frameNumber == 0)
             return;
 
-        if (!history_.isEmpty() && frameNumber <= history_.constLast().last_frame)
-            history_.clear();
+        QVector<Entry> &history = histories_[static_cast<size_t>(player)];
+        if (!history.isEmpty() && frameNumber <= history.constLast().last_frame)
+            history.clear();
 
-        if (!history_.isEmpty() &&
-            history_.constLast().input == input &&
-            frameNumber == history_.constLast().last_frame + 1) {
-            history_.last().last_frame = frameNumber;
+        if (!history.isEmpty() &&
+            history.constLast().input == input &&
+            frameNumber == history.constLast().last_frame + 1) {
+            history.last().last_frame = frameNumber;
         } else {
-            history_.push_back({ input, frameNumber, frameNumber });
-            while (history_.size() > MAX_HISTORY_ENTRIES)
-                history_.remove(0);
+            history.push_back({ input, frameNumber, frameNumber });
+            while (history.size() > MAX_HISTORY_ENTRIES)
+                history.remove(0);
         }
 
         update();
     }
 
     void clearHistory() {
-        history_.clear();
+        for (QVector<Entry> &history : histories_)
+            history.clear();
+        update();
+    }
+
+    void setFrameNumbersEnabled(bool enabled) {
+        if (frame_numbers_enabled_ == enabled)
+            return;
+
+        frame_numbers_enabled_ = enabled;
         update();
     }
 
 protected:
     void paintEvent(QPaintEvent *) override {
-        if (history_.isEmpty())
+        if (histories_[0].isEmpty() && histories_[1].isEmpty())
             return;
 
         constexpr int32_t PANEL_X = 12;
         constexpr int32_t PANEL_TOP = 52;
-        constexpr int32_t PANEL_WIDTH = 252;
+        constexpr int32_t PANEL_WIDTH_WITH_FRAMES = 252;
+        constexpr int32_t PANEL_WIDTH_WITHOUT_FRAMES = 144;
         constexpr int32_t HEADER_HEIGHT = 24;
         constexpr int32_t ROW_HEIGHT = 22;
         constexpr int32_t PANEL_MARGIN_BOTTOM = 12;
-
-        const int32_t available_height = height() - PANEL_TOP - HEADER_HEIGHT - PANEL_MARGIN_BOTTOM;
-        const int32_t visible_count = std::min<int32_t>(
-            static_cast<int32_t>(history_.size()),
-            std::max<int32_t>(1, available_height / ROW_HEIGHT));
-        const int32_t first_visible = static_cast<int32_t>(history_.size()) - visible_count;
-        const QRect panel_rect(PANEL_X,
-                               PANEL_TOP,
-                               PANEL_WIDTH,
-                               HEADER_HEIGHT + visible_count * ROW_HEIGHT);
+        const int32_t panel_width = frame_numbers_enabled_
+                                        ? PANEL_WIDTH_WITH_FRAMES
+                                        : PANEL_WIDTH_WITHOUT_FRAMES;
+        const int32_t input_x = frame_numbers_enabled_ ? PANEL_X + 116 : PANEL_X + 8;
 
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing, false);
-        painter.fillRect(panel_rect, QColor(0, 0, 0, 176));
-        painter.setPen(QPen(QColor(255, 255, 255, 100), 1));
-        painter.drawRect(panel_rect.adjusted(0, 0, -1, -1));
 
         QFont font(QStringLiteral("SF Mono"));
         font.setStyleHint(QFont::Monospace);
         font.setPixelSize(12);
         font.setBold(true);
-        painter.setFont(font);
-        painter.setPen(Qt::white);
-        painter.drawText(QRect(PANEL_X + 8, PANEL_TOP, PANEL_WIDTH - 16, HEADER_HEIGHT),
-                         Qt::AlignVCenter | Qt::AlignLeft,
-                         QStringLiteral("P1 INPUT / FRAME"));
 
-        for (int32_t row = 0; row < visible_count; ++row) {
-            const Entry &entry = history_.at(first_visible + row);
-            const int32_t row_y = PANEL_TOP + HEADER_HEIGHT + row * ROW_HEIGHT;
-            if ((row & 1) != 0)
-                painter.fillRect(QRect(PANEL_X + 1, row_y, PANEL_WIDTH - 2, ROW_HEIGHT),
-                                 QColor(255, 255, 255, 12));
+        const int32_t available_height = height() - PANEL_TOP - HEADER_HEIGHT - PANEL_MARGIN_BOTTOM;
+        const int32_t max_visible_count = std::max<int32_t>(1, available_height / ROW_HEIGHT);
+        auto drawHistory = [&](const QVector<Entry> &history, int32_t player, int32_t panel_x) {
+            if (history.isEmpty())
+                return;
 
-            painter.setPen(QColor(225, 225, 225));
-            painter.drawText(QRect(PANEL_X + 8, row_y, 108, ROW_HEIGHT),
-                             Qt::AlignVCenter | Qt::AlignLeft,
-                             frameText(entry));
+            const int32_t visible_count = std::min<int32_t>(
+                static_cast<int32_t>(history.size()),
+                max_visible_count);
+            const int32_t first_visible = static_cast<int32_t>(history.size()) - visible_count;
+            const QRect panel_rect(panel_x,
+                                   PANEL_TOP,
+                                   panel_width,
+                                   HEADER_HEIGHT + visible_count * ROW_HEIGHT);
+
+            painter.fillRect(panel_rect, QColor(0, 0, 0, 176));
+            painter.setPen(QPen(QColor(255, 255, 255, 100), 1));
+            painter.drawRect(panel_rect.adjusted(0, 0, -1, -1));
+            painter.setFont(font);
             painter.setPen(Qt::white);
-            painter.drawText(QRect(PANEL_X + 116, row_y, 30, ROW_HEIGHT),
-                             Qt::AlignCenter,
-                             directionText(entry.input));
+            painter.drawText(QRect(panel_x + 8, PANEL_TOP, panel_width - 16, HEADER_HEIGHT),
+                             Qt::AlignVCenter | Qt::AlignLeft,
+                             frame_numbers_enabled_
+                                 ? QStringLiteral("P%1 INPUT / FRAME").arg(player + 1)
+                                 : QStringLiteral("P%1 INPUT").arg(player + 1));
 
-            drawButton(painter, PANEL_X + 150, row_y + 2, QStringLiteral("A"), entry.input.a,
-                       QColor(225, 56, 54), Qt::white);
-            drawButton(painter, PANEL_X + 173, row_y + 2, QStringLiteral("B"), entry.input.b,
-                       QColor(250, 193, 31), Qt::black);
-            drawButton(painter, PANEL_X + 196, row_y + 2, QStringLiteral("C"), entry.input.c,
-                       QColor(30, 196, 91), Qt::black);
-            drawButton(painter, PANEL_X + 219, row_y + 2, QStringLiteral("D"), entry.input.d,
-                       QColor(55, 125, 230), Qt::white);
-        }
+            const int32_t input_x = frame_numbers_enabled_ ? panel_x + 116 : panel_x + 8;
+            for (int32_t row = 0; row < visible_count; ++row) {
+                const Entry &entry = history.at(first_visible + row);
+                const int32_t row_y = PANEL_TOP + HEADER_HEIGHT + row * ROW_HEIGHT;
+                if ((row & 1) != 0)
+                    painter.fillRect(QRect(panel_x + 1, row_y, panel_width - 2, ROW_HEIGHT),
+                                     QColor(255, 255, 255, 12));
+
+                if (frame_numbers_enabled_) {
+                    painter.setFont(font);
+                    painter.setPen(QColor(225, 225, 225));
+                    painter.drawText(QRect(panel_x + 8, row_y, 108, ROW_HEIGHT),
+                                     Qt::AlignVCenter | Qt::AlignLeft,
+                                     frameText(entry));
+                }
+
+                QFont direction_font = font;
+                direction_font.setPixelSize(18);
+                painter.setFont(direction_font);
+                painter.setPen(Qt::white);
+                painter.drawText(QRect(input_x, row_y, 30, ROW_HEIGHT),
+                                 Qt::AlignCenter,
+                                 directionText(entry.input));
+                painter.setFont(font);
+
+                drawButton(painter, input_x + 34, row_y + 2, QStringLiteral("A"), entry.input.a,
+                           QColor(225, 56, 54), Qt::white);
+                drawButton(painter, input_x + 57, row_y + 2, QStringLiteral("B"), entry.input.b,
+                           QColor(250, 193, 31), Qt::black);
+                drawButton(painter, input_x + 80, row_y + 2, QStringLiteral("C"), entry.input.c,
+                           QColor(30, 196, 91), Qt::black);
+                drawButton(painter, input_x + 103, row_y + 2, QStringLiteral("D"), entry.input.d,
+                           QColor(55, 125, 230), Qt::white);
+            }
+        };
+
+        drawHistory(histories_[0], 0, PANEL_X);
+        drawHistory(histories_[1], 1, width() - panel_width - PANEL_X);
     }
 
 private:
@@ -217,6 +256,7 @@ private:
     };
 
     static constexpr int32_t MAX_HISTORY_ENTRIES = 18;
+    static constexpr int32_t PLAYER_COUNT = 2;
 
     static QString frameText(const Entry &entry) {
         const QString first = QStringLiteral("%1")
@@ -271,7 +311,8 @@ private:
         painter.drawText(rect, Qt::AlignCenter, label);
     }
 
-    QVector<Entry> history_;
+    std::array<QVector<Entry>, PLAYER_COUNT> histories_;
+    bool frame_numbers_enabled_ = true;
 };
 
 } // namespace
@@ -364,6 +405,20 @@ bool EmulatorView::inputOverlayEnabled() const {
     return input_overlay_enabled_;
 }
 
+void EmulatorView::setInputFrameNumbersEnabled(bool enabled) {
+    if (input_frame_numbers_enabled_ == enabled)
+        return;
+
+    input_frame_numbers_enabled_ = enabled;
+    auto *overlay = static_cast<InputHistoryOverlayWidget *>(input_overlay_widget_);
+    if (overlay)
+        overlay->setFrameNumbersEnabled(enabled);
+}
+
+bool EmulatorView::inputFrameNumbersEnabled() const {
+    return input_frame_numbers_enabled_;
+}
+
 void EmulatorView::setHitboxOverlay(QVector<HitboxRect> boxes, QVector<HitboxAxis> axes) {
     hitbox_boxes_ = std::move(boxes);
     hitbox_axes_ = std::move(axes);
@@ -387,12 +442,14 @@ bool EmulatorView::JoypadInput::isNeutral() const {
     return !up && !down && !left && !right && !a && !b && !c && !d;
 }
 
-void EmulatorView::submitInputFrame(const JoypadInput &input, uint64_t frameNumber) {
+void EmulatorView::submitInputFrame(int32_t player,
+                                    const JoypadInput &input,
+                                    uint64_t frameNumber) {
     auto *overlay = static_cast<InputHistoryOverlayWidget *>(input_overlay_widget_);
     if (!overlay)
         return;
 
-    overlay->appendInput(input, frameNumber);
+    overlay->appendInput(player, input, frameNumber);
     if (input_overlay_enabled_) {
         overlay->show();
         overlay->raise();

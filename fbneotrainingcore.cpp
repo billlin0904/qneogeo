@@ -251,6 +251,8 @@ bool FbneoTrainingCore::resolveSymbols() {
         kof_env_set_joypad_ = resolveSymbol<kof_env_set_joypad_t>("kof_env_set_joypad");
         kof_env_set_joypad_for_port_ =
             resolveSymbol<kof_env_set_joypad_for_port_t>("kof_env_set_joypad_for_port");
+        kof_env_get_last_joypad_for_port_ =
+            resolveSymbol<kof_env_get_last_joypad_for_port_t>("kof_env_get_last_joypad_for_port");
         kof_env_set_video_refresh_ = resolveSymbol<kof_env_set_video_refresh_t>("kof_env_set_video_refresh");
         kof_env_set_p2_random_ai_ = resolveSymbol<kof_env_set_p2_random_ai_t>("kof_env_set_p2_random_ai");
         kof_env_run_frames_ = resolveSymbol<kof_env_run_frames_t>("kof_env_run_frames");
@@ -316,6 +318,7 @@ void FbneoTrainingCore::unloadLibrary() {
     kof_env_save_state_ = nullptr;
     kof_env_set_joypad_ = nullptr;
     kof_env_set_joypad_for_port_ = nullptr;
+    kof_env_get_last_joypad_for_port_ = nullptr;
     kof_env_set_video_refresh_ = nullptr;
     kof_env_set_p2_random_ai_ = nullptr;
     kof_env_run_frames_ = nullptr;
@@ -338,7 +341,30 @@ void FbneoTrainingCore::advanceFrame() {
         return;
     }
 
-    recordP1InputFrame(p1_input);
+    auto toJoypadInput = [](const kof_env_joypad_state &state) {
+        EmulatorView::JoypadInput input;
+        input.up = state.up != 0;
+        input.down = state.down != 0;
+        input.left = state.left != 0;
+        input.right = state.right != 0;
+        input.a = state.a != 0;
+        input.b = state.b != 0;
+        input.c = state.c != 0;
+        input.d = state.d != 0;
+        return input;
+    };
+
+    EmulatorView::JoypadInput recorded_p1_input = p1_input;
+    EmulatorView::JoypadInput recorded_p2_input;
+    if (kof_env_get_last_joypad_for_port_) {
+        kof_env_joypad_state state {};
+        if (kof_env_get_last_joypad_for_port_(handle_, 0, &state))
+            recorded_p1_input = toJoypadInput(state);
+        if (kof_env_get_last_joypad_for_port_(handle_, 1, &state))
+            recorded_p2_input = toJoypadInput(state);
+    }
+
+    recordInputFrame(recorded_p1_input, recorded_p2_input);
     finishKeyboardMotionAssist();
     finishXInputMotionAssist();
     emit frameAdvanced();
