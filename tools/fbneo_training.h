@@ -69,12 +69,39 @@ typedef struct kof_env_action_status {
     int32_t queued_action_id;
     int32_t last_started_action_id;
     uint8_t action_accepted;
-    /* Action that was active on the most recent frame where P2 lost health or
-     * P1's combo counter rose, since the last kof_env_step/set_action call.
-     * -1 when no hit landed. Lets callers attribute damage to the move that
-     * actually connected instead of the action chosen this step. */
+    /* Deprecated compatibility field. New callers should consume
+     * kof_env_get_step_events_v1() to preserve every hit and action serial. */
     int32_t step_last_hit_action_id;
 } kof_env_action_status;
+
+enum {
+    KOF_ENV_STEP_EVENTS_VERSION_1 = 1,
+    KOF_ENV_STEP_EVENT_CAPACITY_V1 = 16,
+};
+
+typedef enum kof_env_step_event_type {
+    KOF_ENV_STEP_EVENT_ACTION_STARTED = 1,
+    KOF_ENV_STEP_EVENT_COMBO_HIT = 2,
+    KOF_ENV_STEP_EVENT_DAMAGE_ONLY = 3,
+} kof_env_step_event_type;
+
+typedef struct kof_env_step_event_v1 {
+    int32_t frame_offset;
+    int32_t event_type;
+    int32_t action_id;
+    uint32_t action_serial;
+    int32_t combo_before;
+    int32_t combo_after;
+    int32_t p2_hp_delta;
+} kof_env_step_event_v1;
+
+typedef struct kof_env_step_events_v1 {
+    uint32_t struct_size;
+    uint32_t version;
+    uint32_t event_count;
+    uint32_t dropped_event_count;
+    kof_env_step_event_v1 events[KOF_ENV_STEP_EVENT_CAPACITY_V1];
+} kof_env_step_events_v1;
 
 typedef enum kof_env_hitbox_type {
     KOF_ENV_HITBOX_UNDEFINED = 0,
@@ -127,6 +154,8 @@ KOF_ENV_API int kof_env_set_action(kof_env_handle handle, int32_t action_id);
 KOF_ENV_API int kof_env_can_queue_action(kof_env_handle handle, int32_t action_id);
 KOF_ENV_API int kof_env_get_action_status(kof_env_handle handle,
                                           kof_env_action_status *status);
+KOF_ENV_API int kof_env_get_step_events_v1(kof_env_handle handle,
+                                           kof_env_step_events_v1 *events);
 KOF_ENV_API int kof_env_run_frames(kof_env_handle handle, int32_t frame_count);
 KOF_ENV_API int kof_env_step(kof_env_handle handle,
                              int32_t action_id,

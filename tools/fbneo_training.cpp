@@ -23,6 +23,9 @@
 
 namespace {
 
+static_assert(sizeof(kof_env_step_event_v1) == 28);
+static_assert(sizeof(kof_env_step_events_v1) == 464);
+
 using retro_set_environment_t = void (*)(retro_environment_t);
 using retro_set_video_refresh_t = void (*)(retro_video_refresh_t);
 using retro_set_audio_sample_t = void (*)(retro_audio_sample_t);
@@ -110,9 +113,15 @@ struct FollowUpRule {
     int32_t script_action_id = -1;
 };
 
+struct FrameCombatState {
+    int32_t p2_health = -1;
+    int32_t p1_combo = -1;
+};
+
 constexpr size_t P1_PORT = 0;
 constexpr size_t P2_PORT = 1;
 constexpr size_t PLAYER_PORT_COUNT = 2;
+constexpr int32_t COMBO_EVENT_DAMAGE_GRACE_FRAMES = 2;
 constexpr int32_t KYO_CROUCH_A_ACTION_ID = 10;
 constexpr int32_t KYO_CROUCH_B_ACTION_ID = 11;
 constexpr int32_t KYO_CLOSE_C_ACTION_ID = 8;
@@ -618,6 +627,10 @@ private:
 
 class FbneoTrainingRuntime {
 public:
+    FbneoTrainingRuntime() {
+        clearStepEvents();
+    }
+
     ~FbneoTrainingRuntime() {
         close();
     }
@@ -692,7 +705,8 @@ public:
         last_frame_joypads_ = {};
         clearActionState();
         clearP2RandomAiScript();
-        resetHitTracking();
+        clearStepEvents();
+        clearCombatEventState();
         retro_reset_();
         return true;
     }
@@ -715,7 +729,8 @@ public:
         last_frame_joypads_ = {};
         clearActionState();
         clearP2RandomAiScript();
-        resetHitTracking();
+        clearStepEvents();
+        clearCombatEventState();
         return true;
     }
 
@@ -799,35 +814,127 @@ public:
         status->queued_action_id = queued_action_id_;
         status->last_started_action_id = last_started_action_id_;
         status->action_accepted = last_action_accepted_ ? 1 : 0;
-        status->step_last_hit_action_id = step_last_hit_action_id_;
+        status->step_last_hit_action_id = -1;
+        for (uint32_t index = 0; index < step_events_.event_count; ++index) {
+            const auto &event = step_events_.events[index];
+            if (event.event_type == KOF_ENV_STEP_EVENT_COMBO_HIT ||
+                event.event_type == KOF_ENV_STEP_EVENT_DAMAGE_ONLY) {
+                status->step_last_hit_action_id = event.action_id;
+            }
+        }
         return true;
     }
 
-    void resetHitTracking() {
-        hit_track_p2_health_ = -1;
-        hit_track_p1_combo_ = -1;
-        step_last_hit_action_id_ = -1;
+    bool getStepEventsV1(kof_env_step_events_v1 *events) const {
+        if (!events)
+            return fail("Step events output pointer is null.");
+        if (events->struct_size != sizeof(kof_env_step_events_v1))
+            return fail("Step events v1 struct size does not match the DLL ABI.");
+        if (events->version != KOF_ENV_STEP_EVENTS_VERSION_1)
+            return fail("Unsupported step events version.");
+
+        *events = step_events_;
+        return true;
     }
 
-    void detectFrameHit(int32_t acting_action_id) {
+    void clearStepEvents() {
+        step_events_ = {};
+        step_events_.struct_size = sizeof(kof_env_step_events_v1);
+        step_events_.version = KOF_ENV_STEP_EVENTS_VERSION_1;
+    }
+
+    void clearCombatEventState() {
+        recent_damage_action_id_ = -1;
+        recent_damage_action_serial_ = 0;
+        recent_damage_age_frames_ = 0;
+    }
+
+    FrameCombatState readFrameCombatState() const {
+        FrameCombatState state;
         size_t ram_size = 0;
         const uint8_t *ram_ptr = systemRam(&ram_size);
         if (!ram_ptr || ram_size == 0)
-            return;
+            return state;
 
         const game_memory::GameMemReaderCore mem_reader(ram_ptr, ram_size);
-        const int32_t p2_health = mem_reader.readP2Health();
-        const int32_t p1_combo = mem_reader.readP1ComboCount();
-        const bool p2_health_dropped =
-            p2_health >= 0 && hit_track_p2_health_ >= 0 && p2_health < hit_track_p2_health_;
-        const bool p1_combo_rose =
-            p1_combo >= 0 && hit_track_p1_combo_ >= 0 && p1_combo > hit_track_p1_combo_;
-        if (p2_health_dropped || p1_combo_rose)
-            step_last_hit_action_id_ = acting_action_id;
-        if (p2_health >= 0)
-            hit_track_p2_health_ = p2_health;
-        if (p1_combo >= 0)
-            hit_track_p1_combo_ = p1_combo;
+        state.p2_health = mem_reader.readP2Health();
+        state.p1_combo = mem_reader.readP1ComboCount();
+        return state;
+    }
+
+    void appendStepEvent(int32_t frame_offset,
+                         kof_env_step_event_type event_type,
+                         int32_t action_id,
+                         uint32_t action_serial,
+                         int32_t combo_before,
+                         int32_t combo_after,
+                         int32_t p2_hp_delta) {
+        if (step_events_.event_count >= KOF_ENV_STEP_EVENT_CAPACITY_V1) {
+            ++step_events_.dropped_event_count;
+            return;
+        }
+
+        auto &event = step_events_.events[step_events_.event_count++];
+        event.frame_offset = frame_offset;
+        event.event_type = event_type;
+        event.action_id = action_id;
+        event.action_serial = action_serial;
+        event.combo_before = combo_before;
+        event.combo_after = combo_after;
+        event.p2_hp_delta = p2_hp_delta;
+    }
+
+    void detectFrameCombatEvents(int32_t frame_offset,
+                                 int32_t acting_action_id,
+                                 uint32_t acting_action_serial,
+                                 const FrameCombatState &before,
+                                 const FrameCombatState &after) {
+        if (recent_damage_action_id_ >= 0)
+            ++recent_damage_age_frames_;
+
+        const int32_t p2_hp_delta =
+            before.p2_health >= 0 && after.p2_health >= 0
+                ? std::max(0, before.p2_health - after.p2_health)
+                : 0;
+        const bool combo_rose =
+            before.p1_combo >= 0 &&
+            after.p1_combo >= 0 &&
+            after.p1_combo > before.p1_combo;
+
+        if (combo_rose) {
+            int32_t hit_action_id = acting_action_id;
+            uint32_t hit_action_serial = acting_action_serial;
+            if (p2_hp_delta == 0 &&
+                recent_damage_action_id_ >= 0 &&
+                recent_damage_age_frames_ <= COMBO_EVENT_DAMAGE_GRACE_FRAMES) {
+                hit_action_id = recent_damage_action_id_;
+                hit_action_serial = recent_damage_action_serial_;
+            }
+
+            appendStepEvent(
+                frame_offset,
+                KOF_ENV_STEP_EVENT_COMBO_HIT,
+                hit_action_id,
+                hit_action_serial,
+                before.p1_combo,
+                after.p1_combo,
+                p2_hp_delta);
+            clearCombatEventState();
+        } else if (p2_hp_delta > 0) {
+            appendStepEvent(
+                frame_offset,
+                KOF_ENV_STEP_EVENT_DAMAGE_ONLY,
+                acting_action_id,
+                acting_action_serial,
+                before.p1_combo,
+                after.p1_combo,
+                p2_hp_delta);
+            recent_damage_action_id_ = acting_action_id;
+            recent_damage_action_serial_ = acting_action_serial;
+            recent_damage_age_frames_ = 0;
+        } else if (recent_damage_age_frames_ > COMBO_EVENT_DAMAGE_GRACE_FRAMES) {
+            clearCombatEventState();
+        }
     }
 
     void clearActionScript() {
@@ -839,8 +946,11 @@ public:
     void clearActionState() {
         clearActionScript();
         active_action_id_ = -1;
+        active_action_serial_ = 0;
+        action_start_event_pending_ = false;
         queued_action_id_ = -1;
         last_started_action_id_ = -1;
+        last_started_action_serial_ = 0;
         active_action_elapsed_frames_ = 0;
         last_action_accepted_ = false;
     }
@@ -854,8 +964,18 @@ public:
         active_script_remaining_frames_ = active_script_[0].frames;
         active_action_id_ = action_id;
         active_action_elapsed_frames_ = 0;
-        if (action_id != IDLE_ACTION_ID)
+        if (action_id != IDLE_ACTION_ID) {
+            ++next_action_serial_;
+            if (next_action_serial_ == 0)
+                ++next_action_serial_;
+            active_action_serial_ = next_action_serial_;
+            action_start_event_pending_ = true;
             last_started_action_id_ = action_id;
+            last_started_action_serial_ = active_action_serial_;
+        } else {
+            active_action_serial_ = 0;
+            action_start_event_pending_ = false;
+        }
         joypads_[P1_PORT] = active_script_[0].state;
         return true;
     }
@@ -922,6 +1042,8 @@ public:
                 active_action_id_,
                 active_action_elapsed_frames_)) {
             active_action_id_ = -1;
+            active_action_serial_ = 0;
+            action_start_event_pending_ = false;
             active_action_elapsed_frames_ = 0;
         }
     }
@@ -1017,7 +1139,6 @@ public:
 
     bool setAction(int32_t action_id) {
         last_action_accepted_ = false;
-        step_last_hit_action_id_ = -1;
         if (active_action_id_ >= 0) {
             if (action_id == IDLE_ACTION_ID) {
                 last_action_accepted_ = true;
@@ -1044,15 +1165,40 @@ public:
         if (frame_count < 0)
             return fail("Frame count cannot be negative.");
 
+        clearStepEvents();
         g_active_runtime = this;
         for (int32_t frame = 0; frame < frame_count; ++frame) {
             advanceActionScriptFrame();
             advanceP2RandomAiFrame();
             last_frame_joypads_ = joypads_;
             const int32_t acting_action_id =
-                active_action_id_ >= 0 ? active_action_id_ : last_started_action_id_;
+                active_action_id_ > IDLE_ACTION_ID
+                    ? active_action_id_
+                    : last_started_action_id_;
+            const uint32_t acting_action_serial =
+                active_action_id_ > IDLE_ACTION_ID
+                    ? active_action_serial_
+                    : last_started_action_serial_;
+            const FrameCombatState before = readFrameCombatState();
+            if (action_start_event_pending_) {
+                appendStepEvent(
+                    frame,
+                    KOF_ENV_STEP_EVENT_ACTION_STARTED,
+                    acting_action_id,
+                    acting_action_serial,
+                    before.p1_combo,
+                    before.p1_combo,
+                    0);
+                action_start_event_pending_ = false;
+            }
             retro_run_();
-            detectFrameHit(acting_action_id);
+            const FrameCombatState after = readFrameCombatState();
+            detectFrameCombatEvents(
+                frame,
+                acting_action_id,
+                acting_action_serial,
+                before,
+                after);
             finishActionScriptFrame();
             advanceActionLifecycleFrame();
         }
@@ -1491,11 +1637,16 @@ private:
     int32_t active_action_id_ = -1;
     int32_t queued_action_id_ = -1;
     int32_t last_started_action_id_ = -1;
+    uint32_t last_started_action_serial_ = 0;
     int32_t active_action_elapsed_frames_ = 0;
     bool last_action_accepted_ = false;
-    int32_t step_last_hit_action_id_ = -1;
-    int32_t hit_track_p2_health_ = -1;
-    int32_t hit_track_p1_combo_ = -1;
+    uint32_t next_action_serial_ = 0;
+    uint32_t active_action_serial_ = 0;
+    bool action_start_event_pending_ = false;
+    kof_env_step_events_v1 step_events_ {};
+    int32_t recent_damage_action_id_ = -1;
+    uint32_t recent_damage_action_serial_ = 0;
+    int32_t recent_damage_age_frames_ = 0;
     std::vector<InputFrame> p2_random_script_;
     size_t p2_random_script_index_ = 0;
     int32_t p2_random_script_remaining_frames_ = 0;
@@ -1621,6 +1772,12 @@ int kof_env_get_action_status(kof_env_handle handle,
                               kof_env_action_status *status) {
     auto *runtime = runtimeFromHandle(handle);
     return runtime && runtime->getActionStatus(status) ? 1 : 0;
+}
+
+int kof_env_get_step_events_v1(kof_env_handle handle,
+                               kof_env_step_events_v1 *events) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->getStepEventsV1(events) ? 1 : 0;
 }
 
 int kof_env_run_frames(kof_env_handle handle, int32_t frame_count) {

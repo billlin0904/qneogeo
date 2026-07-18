@@ -87,6 +87,35 @@ class ActionStatus(ctypes.Structure):
     ]
 
 
+STEP_EVENTS_VERSION_1 = 1
+STEP_EVENT_CAPACITY_V1 = 16
+STEP_EVENT_ACTION_STARTED = 1
+STEP_EVENT_COMBO_HIT = 2
+STEP_EVENT_DAMAGE_ONLY = 3
+
+
+class StepEventV1(ctypes.Structure):
+    _fields_ = [
+        ("frame_offset", ctypes.c_int32),
+        ("event_type", ctypes.c_int32),
+        ("action_id", ctypes.c_int32),
+        ("action_serial", ctypes.c_uint32),
+        ("combo_before", ctypes.c_int32),
+        ("combo_after", ctypes.c_int32),
+        ("p2_hp_delta", ctypes.c_int32),
+    ]
+
+
+class StepEventsV1(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("event_count", ctypes.c_uint32),
+        ("dropped_event_count", ctypes.c_uint32),
+        ("events", StepEventV1 * STEP_EVENT_CAPACITY_V1),
+    ]
+
+
 VideoRefreshCallback = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
@@ -121,13 +150,12 @@ DEFENSE_PRESSURE_MARGIN = 28
 DEFENSE_GUARD_REWARD = 0.08
 DEFENSE_UNGUARDED_PRESSURE_PENALTY = 0.04
 DEFENSE_BAD_GUARD_PENALTY = 0.08
-FIGHT_REWARD_VERSION = "long_combo_v1"
+FIGHT_REWARD_VERSION = "attributed_hits_v2"
 # Escalating per-hit combo rewards: hit 1 is paid through hp damage, later
 # hits pay increasingly more so continuing a chain beats resetting to neutral
 # even under KOF98 damage scaling. Hits past 5 pay the cap.
 FIGHT_COMBO_HIT_REWARDS = {2: 1.0, 3: 2.0, 4: 3.5, 5: 5.0}
 FIGHT_COMBO_HIT_REWARD_CAP = 6.0
-FIGHT_FOLLOWUP_HIT_REWARD = 1.0
 SUPER_COMBO_BONUS = 3.0
 SUPER_ACTION_IDS = {18, 19}
 SUPER_POWER_STOCKS_REQUIRED = 1
@@ -614,6 +642,33 @@ class KofEnvClient:
         self._check(self.dll.kof_env_get_action_status(self.handle, ctypes.byref(status)))
         return status
 
+    def step_events(self) -> list[StepEventV1]:
+        result = StepEventsV1()
+        result.struct_size = ctypes.sizeof(StepEventsV1)
+        result.version = STEP_EVENTS_VERSION_1
+        self._check(self.dll.kof_env_get_step_events_v1(self.handle, ctypes.byref(result)))
+        if result.dropped_event_count:
+            raise RuntimeError(
+                "Step event buffer overflowed: "
+                f"{result.dropped_event_count} event(s) were dropped"
+            )
+
+        events: list[StepEventV1] = []
+        for index in range(result.event_count):
+            source = result.events[index]
+            events.append(
+                StepEventV1(
+                    source.frame_offset,
+                    source.event_type,
+                    source.action_id,
+                    source.action_serial,
+                    source.combo_before,
+                    source.combo_after,
+                    source.p2_hp_delta,
+                )
+            )
+        return events
+
     def last_joypad(self, port: int = 0) -> JoypadState:
         state = JoypadState()
         self._check(
@@ -724,6 +779,12 @@ class KofEnvClient:
             ctypes.POINTER(ActionStatus),
         ]
         self.dll.kof_env_get_action_status.restype = ctypes.c_int
+
+        self.dll.kof_env_get_step_events_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(StepEventsV1),
+        ]
+        self.dll.kof_env_get_step_events_v1.restype = ctypes.c_int
 
         self.dll.kof_env_p1_ready_for_action.argtypes = [ctypes.c_void_p]
         self.dll.kof_env_p1_ready_for_action.restype = ctypes.c_int
@@ -1186,6 +1247,7 @@ class Kof98Env(gym.Env if gym else object):
         forced_idle = legal_action_count <= 1
         observation = self.client.step(action_id, self.action_repeat)
         action_status = self.client.action_status()
+        step_events = self.client.step_events()
         action_accepted = bool(action_status.action_accepted)
         hitbox_rects: list[HitboxRectResult] = []
         if self.hitbox_reward:
@@ -1242,39 +1304,68 @@ class Kof98Env(gym.Env if gym else object):
         hit_followup_actions: list[int] = []
         if queued_followup:
             self.fight_pending_followups.append(
-                {"action": action_id, "age": 0, "started": False},
+                {
+                    "action": action_id,
+                    "age": 0,
+                    "started": False,
+                    "serial": None,
+                },
             )
             queued_followup_actions.append(action_id)
 
         for pending in self.fight_pending_followups:
             pending["age"] += self.action_repeat
 
-        for pending in self.fight_pending_followups:
-            if not pending["started"] and (
-                action_status.queued_action_id != pending["action"]
-                and (
-                    action_status.active_action_id == pending["action"]
-                    or action_status.last_started_action_id == pending["action"]
-                )
-            ):
-                pending["started"] = True
-                started_followup_actions.append(pending["action"])
-                break
+        for event in step_events:
+            if event.event_type == STEP_EVENT_ACTION_STARTED:
+                for pending in self.fight_pending_followups:
+                    if pending["started"] or pending["action"] != event.action_id:
+                        continue
 
-        if p2_damage > 0.0 or combo_delta > 0:
-            for pending_index, pending in enumerate(self.fight_pending_followups):
-                if not pending["started"]:
-                    continue
+                    pending["started"] = True
+                    pending["serial"] = int(event.action_serial)
+                    started_followup_actions.append(pending["action"])
+                    break
+            elif event.event_type == STEP_EVENT_COMBO_HIT:
+                for pending_index, pending in enumerate(self.fight_pending_followups):
+                    if (
+                        not pending["started"]
+                        or pending["action"] != event.action_id
+                        or pending["serial"] != int(event.action_serial)
+                        or event.combo_after <= event.combo_before
+                        or event.combo_after < 2
+                    ):
+                        continue
 
-                hit_followup_actions.append(pending["action"])
-                del self.fight_pending_followups[pending_index]
-                break
+                    hit_followup_actions.append(pending["action"])
+                    del self.fight_pending_followups[pending_index]
+                    break
 
         self.fight_pending_followups = [
             pending
             for pending in self.fight_pending_followups
             if pending["age"] <= FIGHT_FOLLOWUP_TRACK_WINDOW_FRAMES
         ]
+
+        hit_action_ids = {
+            int(event.action_id)
+            for event in step_events
+            if event.event_type in (STEP_EVENT_COMBO_HIT, STEP_EVENT_DAMAGE_ONLY)
+            and event.action_id >= 0
+        }
+        combo_hit_action_ids = {
+            int(event.action_id)
+            for event in step_events
+            if event.event_type == STEP_EVENT_COMBO_HIT
+            and event.action_id >= 0
+        }
+        damage_action_id = -1
+        for event in step_events:
+            if (
+                event.event_type in (STEP_EVENT_COMBO_HIT, STEP_EVENT_DAMAGE_ONLY)
+                and event.p2_hp_delta > 0
+            ):
+                damage_action_id = int(event.action_id)
 
         followup_action = -1
         for actions in (
@@ -1298,7 +1389,7 @@ class Kof98Env(gym.Env if gym else object):
         super_without_stock = super_action and not super_available_before_action
         p2_airborne_before_action = is_p2_airborne(previous)
         oniyaki_anti_air_hit = (
-            action_id == ONIYAKI_ACTION_ID
+            ONIYAKI_ACTION_ID in hit_action_ids
             and p2_airborne_before_action
             and p2_damage > 0.0
         )
@@ -1306,8 +1397,9 @@ class Kof98Env(gym.Env if gym else object):
             previous,
             observation,
             action_id,
+            damage_action_id,
+            combo_hit_action_ids,
             p1_damage,
-            p2_damage,
             p1_attack_overlap_edge,
             p2_attack_overlap_edge,
             p2_attack_pressure,
@@ -1323,9 +1415,7 @@ class Kof98Env(gym.Env if gym else object):
         )
         reward += safety_reward
         reward_parts["safety"] = safety_reward
-        cancel_reward = FIGHT_FOLLOWUP_HIT_REWARD * len(hit_followup_actions)
-        reward += cancel_reward
-        reward_parts["cancel"] = cancel_reward
+        reward_parts["cancel"] = 0.0
         self.previous_observation = observation
 
         terminated = (
@@ -1367,6 +1457,11 @@ class Kof98Env(gym.Env if gym else object):
             "queued_followup_actions": queued_followup_actions,
             "started_followup_actions": started_followup_actions,
             "hit_followup_actions": hit_followup_actions,
+            "step_event_count": float(len(step_events)),
+            "step_event_dropped": 0.0,
+            "damage_action_id": float(damage_action_id),
+            "step_hit_action_ids": sorted(hit_action_ids),
+            "step_combo_hit_action_ids": sorted(combo_hit_action_ids),
             "fight_outcome": fight_outcome,
             "p1_health": observation.p1_health,
             "p2_health": observation.p2_health,
@@ -1392,35 +1487,35 @@ class Kof98Env(gym.Env if gym else object):
             "attack_safety_unsafe_close": safety_info["unsafe_close"],
             "attack_safety_safe": safety_info["safe"],
             "action_14": float(action_id == 14),
-            "action_14_hit": float(action_id == 14 and p2_damage > 0),
+            "action_14_hit": float(14 in hit_action_ids),
             "action_15": float(action_id == 15),
-            "action_15_hit": float(action_id == 15 and p2_damage > 0),
+            "action_15_hit": float(15 in hit_action_ids),
             "action_16": float(action_id == 16),
-            "action_16_hit": float(action_id == 16 and p2_damage > 0),
+            "action_16_hit": float(16 in hit_action_ids),
             "action_17": float(action_id == 17),
-            "action_17_hit": float(action_id == 17 and p2_damage > 0),
+            "action_17_hit": float(17 in hit_action_ids),
             "action_18": float(action_id == 18),
-            "action_18_hit": float(action_id == 18 and p2_damage > 0),
+            "action_18_hit": float(18 in hit_action_ids),
             "action_19": float(action_id == 19),
-            "action_19_hit": float(action_id == 19 and p2_damage > 0),
+            "action_19_hit": float(19 in hit_action_ids),
             "action_20": float(action_id == 20),
-            "action_20_hit": float(action_id == 20 and p2_damage > 0),
+            "action_20_hit": float(20 in hit_action_ids),
             "action_21": float(action_id == 21),
-            "action_21_hit": float(action_id == 21 and p2_damage > 0),
+            "action_21_hit": float(21 in hit_action_ids),
             "action_22": float(action_id == 22),
-            "action_22_hit": float(action_id == 22 and p2_damage > 0),
+            "action_22_hit": float(22 in hit_action_ids),
             "action_23": float(action_id == 23),
-            "action_23_hit": float(action_id == 23 and p2_damage > 0),
+            "action_23_hit": float(23 in hit_action_ids),
             "action_24": float(action_id == 24),
-            "action_24_hit": float(action_id == 24 and p2_damage > 0),
+            "action_24_hit": float(24 in hit_action_ids),
             "action_25": float(action_id == 25),
-            "action_25_hit": float(action_id == 25 and p2_damage > 0),
+            "action_25_hit": float(25 in hit_action_ids),
             "action_26": float(action_id == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID),
-            "action_26_hit": float(action_id == SEVENTY_FIVE_SHIKI_KAI_ACTION_ID and p2_damage > 0),
+            "action_26_hit": float(SEVENTY_FIVE_SHIKI_KAI_ACTION_ID in hit_action_ids),
             "action_27": float(action_id == YANO_SABI_ACTION_ID),
-            "action_27_hit": float(action_id == YANO_SABI_ACTION_ID and p2_damage > 0),
+            "action_27_hit": float(YANO_SABI_ACTION_ID in hit_action_ids),
             "action_28": float(action_id == MIGIRI_UGACHI_ACTION_ID),
-            "action_28_hit": float(action_id == MIGIRI_UGACHI_ACTION_ID and p2_damage > 0),
+            "action_28_hit": float(MIGIRI_UGACHI_ACTION_ID in hit_action_ids),
             "distance_x_abs": float(abs(observation.distance_x)),
             "reward_hp": reward_parts["hp"],
             "reward_hitbox": reward_parts["hitbox"],
@@ -1740,11 +1835,17 @@ class Kof98Env(gym.Env if gym else object):
     def _physical_action_mask(self) -> np.ndarray:
         mask = np.zeros(self.action_space.n, dtype=bool)
         mask[IDLE_ACTION_ID] = True
+        super_available = can_use_super(self.previous_observation)
         if self.client.input_ready() and self.client.p1_ready_for_action():
             mask[:] = True
+            if not super_available:
+                for action_id in SUPER_ACTION_IDS:
+                    mask[action_id] = False
             return mask
 
         for action_id in range(1, self.action_space.n):
+            if action_id in SUPER_ACTION_IDS and not super_available:
+                continue
             if self.client.can_queue_action(action_id):
                 mask[action_id] = True
         return mask
@@ -1868,8 +1969,9 @@ class Kof98Env(gym.Env if gym else object):
         previous: Optional[Kof98Observation],
         current: Kof98Observation,
         action_id: int,
+        damage_action_id: int,
+        combo_hit_action_ids: set[int],
         p1_damage: float,
-        p2_damage: float,
         p1_attack_overlap_edge: bool,
         p2_attack_overlap_edge: bool,
         p2_attack_pressure: bool,
@@ -1894,9 +1996,13 @@ class Kof98Env(gym.Env if gym else object):
 
         if previous.p2_health >= 0 and current.p2_health >= 0:
             p2_health_delta = float(previous.p2_health - current.p2_health)
-            if action_id != ONIYAKI_ACTION_ID or p2_airborne:
+            if damage_action_id != ONIYAKI_ACTION_ID or p2_airborne:
                 reward_parts["hp"] += p2_health_delta * 2.0
-            if action_id == ONIYAKI_ACTION_ID and p2_airborne and p2_health_delta > 0.0:
+            if (
+                damage_action_id == ONIYAKI_ACTION_ID
+                and p2_airborne
+                and p2_health_delta > 0.0
+            ):
                 reward_parts["anti_air"] += ONIYAKI_ANTI_AIR_BONUS
         if previous.p1_health >= 0 and current.p1_health >= 0:
             reward_parts["hp"] -= float(previous.p1_health - current.p1_health) * 2.0
@@ -1927,7 +2033,10 @@ class Kof98Env(gym.Env if gym else object):
                             hit_number,
                             FIGHT_COMBO_HIT_REWARD_CAP,
                         )
-            if action_id in SUPER_ACTION_IDS and super_available and p2_damage > 0.0 and current.p1_combo_count >= 2:
+            if (
+                combo_hit_action_ids.intersection(SUPER_ACTION_IDS)
+                and current.p1_combo_count >= 2
+            ):
                 reward_parts["combo"] += SUPER_COMBO_BONUS
 
         if action_id in SUPER_ACTION_IDS and not super_available:
