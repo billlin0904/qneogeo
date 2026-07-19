@@ -14,6 +14,7 @@ from kof98_env import (
     COMBO_SCENARIOS,
     DEFAULT_COMBO_SCENARIO_NAME,
     Kof98Env,
+    P2Style,
     TrainingProfile,
 )
 
@@ -48,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         "--p2-training-ai",
         action="store_true",
         help="Enable the DLL's P2 training opponent. Intended for the fight profile.",
+    )
+    parser.add_argument(
+        "--p2-style",
+        choices=tuple(style.value for style in P2Style),
+        default=P2Style.ONIYAKI.value,
+        help="Fixed P2 behavior style used when the training opponent is enabled.",
     )
     parser.add_argument(
         "--combo-scenario",
@@ -667,6 +674,7 @@ def main() -> int:
         print(f"  model: {model_path if model_path else '(none)'}", flush=True)
         print(f"  profile: {args.profile}", flush=True)
         print(f"  P2 training AI: {'on' if args.p2_training_ai else 'off'}", flush=True)
+        print(f"  P2 style: {args.p2_style}", flush=True)
         if args.fixed_actions is not None:
             print(f"  fixed actions: {','.join(str(action) for action in args.fixed_actions)}", flush=True)
             if args.fixed_actions_loop:
@@ -692,6 +700,7 @@ def main() -> int:
         training_profile=training_profile,
         action_repeat=args.action_repeat,
         p2_training_ai=args.p2_training_ai,
+        p2_style=P2Style(args.p2_style),
         combo_scenario=args.combo_scenario,
         action_mask_level=ActionMaskLevel(args.mask_level),
     )

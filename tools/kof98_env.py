@@ -521,6 +521,21 @@ class TrainingProfile(str, Enum):
     FIGHT = "fight"
 
 
+class P2Style(str, Enum):
+    ONIYAKI = "oniyaki"
+    GUARD = "guard"
+    JUMP_IN = "jump_in"
+    POKE = "poke"
+
+
+P2_STYLE_IDS = {
+    P2Style.ONIYAKI: 0,
+    P2Style.GUARD: 1,
+    P2Style.JUMP_IN: 2,
+    P2Style.POKE: 3,
+}
+
+
 class ActionMaskLevel(str, Enum):
     STRICT = "strict"
     GUIDED = "guided"
@@ -619,6 +634,14 @@ class KofEnvClient:
 
     def set_p2_training_ai(self, enabled: bool) -> None:
         self.dll.kof_env_set_p2_random_ai(self.handle, 1 if enabled else 0)
+
+    def set_p2_style(self, style: P2Style) -> None:
+        self._check(
+            self.dll.kof_env_set_p2_style(
+                self.handle,
+                P2_STYLE_IDS[style],
+            )
+        )
 
     def step(self, action_id: int, frames: int = 6) -> Kof98Observation:
         observation = Kof98Observation()
@@ -755,6 +778,8 @@ class KofEnvClient:
         ]
 
         self.dll.kof_env_set_p2_random_ai.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.dll.kof_env_set_p2_style.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+        self.dll.kof_env_set_p2_style.restype = ctypes.c_int
 
         self.dll.kof_env_step.argtypes = [
             ctypes.c_void_p,
@@ -917,6 +942,7 @@ class Kof98Env(gym.Env if gym else object):
         action_repeat: int = 6,
         hitbox_reward: bool = True,
         p2_training_ai: bool = False,
+        p2_style: P2Style | str = P2Style.ONIYAKI,
         fight_guided: bool = False,
         training_profile: TrainingProfile | str = TrainingProfile.COMBO,
         combo_state_path: Optional[str | Path] = None,
@@ -951,6 +977,7 @@ class Kof98Env(gym.Env if gym else object):
         self.fight_frame_scale = float(self.action_repeat) / FIGHT_SHAPING_BASELINE_FRAMES
         self.hitbox_reward = hitbox_reward and self.training_profile is TrainingProfile.FIGHT
         self.p2_training_ai = p2_training_ai
+        self.p2_style = P2Style(p2_style)
         self.fight_guided = fight_guided and self.training_profile is TrainingProfile.FIGHT
         self.previous_observation: Optional[Kof98Observation] = None
         self.pending_attack_risk: Optional[dict[str, float]] = None
@@ -995,6 +1022,7 @@ class Kof98Env(gym.Env if gym else object):
             self.client.reset()
 
         p2_training_ai = self.p2_training_ai if self.training_profile is TrainingProfile.FIGHT else False
+        self.client.set_p2_style(self.p2_style)
         self.client.set_p2_training_ai(p2_training_ai)
         observation = self.client.observation()
         self.previous_observation = observation
@@ -1477,6 +1505,7 @@ class Kof98Env(gym.Env if gym else object):
             "raw": observation,
             "training_profile": self.training_profile.value,
             "fight_guided": float(self.fight_guided),
+            "p2_style": self.p2_style.value,
             "fight_teacher_phase": float(self.fight_teacher_phase),
             "fight_teacher_complete": float(fight_teacher_completed_now),
             "action": action_id,

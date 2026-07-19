@@ -23,6 +23,7 @@ from kof98_env import (
     FIGHT_REWARD_VERSION,
     IDLE_ACTION_ID,
     Kof98Env,
+    P2Style,
     TrainingProfile,
 )
 
@@ -65,6 +66,7 @@ def make_env(
     action_repeat: int,
     seed: int,
     p2_training_ai: bool = False,
+    p2_style: P2Style = P2Style.ONIYAKI,
     fight_guided: bool = False,
     hitbox_reward: bool = True,
     viewer: bool = False,
@@ -86,6 +88,7 @@ def make_env(
             action_repeat=action_repeat,
             hitbox_reward=hitbox_reward,
             p2_training_ai=p2_training_ai,
+            p2_style=p2_style,
             fight_guided=fight_guided,
             training_profile=training_profile,
             combo_scenario=combo_scenario,
@@ -261,6 +264,16 @@ def parse_args() -> argparse.Namespace:
         "--p2-training-ai",
         action="store_true",
         help="Enable the DLL P2 training AI in Fight environments.",
+    )
+    parser.add_argument(
+        "--p2-style",
+        action="append",
+        choices=tuple(style.value for style in P2Style),
+        default=None,
+        help=(
+            "P2 behavior style assigned round-robin to Fight environments. "
+            "Repeat to select a subset; defaults to all four styles."
+        ),
     )
     parser.add_argument(
         "--timesteps",
@@ -682,6 +695,19 @@ def main() -> int:
                     "teacher_completions": 0.0,
                 },
             }
+            self.fight_style_metrics = {
+                mode: {
+                    style.value: {
+                        "episodes": 0.0,
+                        "wins": 0.0,
+                        "combo_4plus": 0.0,
+                        "episode_max_total": 0.0,
+                        "teacher_completions": 0.0,
+                    }
+                    for style in P2Style
+                }
+                for mode in ("guided", "physical")
+            }
             self.p1_damage = 0.0
             self.p2_damage = 0.0
             self.p1_attack_overlap = 0.0
@@ -792,9 +818,18 @@ def main() -> int:
                         if bool(info.get("fight_guided", 0.0))
                         else "physical"
                     )
-                    self.fight_mode_metrics[fight_mode]["teacher_completions"] += float(
+                    p2_style = str(info.get("p2_style", P2Style.ONIYAKI.value))
+                    if p2_style not in self.fight_style_metrics[fight_mode]:
+                        p2_style = P2Style.ONIYAKI.value
+                    teacher_completion = float(
                         info.get("fight_teacher_complete", 0.0)
                     )
+                    self.fight_mode_metrics[fight_mode]["teacher_completions"] += (
+                        teacher_completion
+                    )
+                    self.fight_style_metrics[fight_mode][p2_style][
+                        "teacher_completions"
+                    ] += teacher_completion
                     self.fight_step_count += 1
                     self.fight_frames_total += frame_count
                     self.cumulative_fight_frames += frame_count
@@ -856,12 +891,17 @@ def main() -> int:
                             self.fight_outcome_counts[outcome] += 1.0
                         episode_max_combo = self.env_fight_max_combo.pop(index, 0.0)
                         mode_metrics = self.fight_mode_metrics[fight_mode]
+                        style_metrics = self.fight_style_metrics[fight_mode][p2_style]
                         mode_metrics["episodes"] += 1.0
                         mode_metrics["episode_max_total"] += episode_max_combo
+                        style_metrics["episodes"] += 1.0
+                        style_metrics["episode_max_total"] += episode_max_combo
                         if outcome in ("win_ko", "win_timeout"):
                             mode_metrics["wins"] += 1.0
+                            style_metrics["wins"] += 1.0
                         if episode_max_combo >= 4.0:
                             mode_metrics["combo_4plus"] += 1.0
+                            style_metrics["combo_4plus"] += 1.0
                         self.fight_episode_max_combo_total += episode_max_combo
                         if episode_max_combo >= 2.0:
                             self.fight_combo_2plus_episodes += 1.0
@@ -1150,6 +1190,31 @@ def main() -> int:
                     f"{prefix}/teacher_completions_total",
                     metrics["teacher_completions"],
                 )
+                for p2_style, style_metrics in self.fight_style_metrics[
+                    fight_mode
+                ].items():
+                    style_episode_count = max(1.0, style_metrics["episodes"])
+                    style_prefix = f"{prefix}/{p2_style}"
+                    self.logger.record(
+                        f"{style_prefix}/episodes_total",
+                        style_metrics["episodes"],
+                    )
+                    self.logger.record(
+                        f"{style_prefix}/win_rate",
+                        style_metrics["wins"] / style_episode_count,
+                    )
+                    self.logger.record(
+                        f"{style_prefix}/combo_4plus_episode_rate",
+                        style_metrics["combo_4plus"] / style_episode_count,
+                    )
+                    self.logger.record(
+                        f"{style_prefix}/episode_max_combo_mean",
+                        style_metrics["episode_max_total"] / style_episode_count,
+                    )
+                    self.logger.record(
+                        f"{style_prefix}/teacher_completions_total",
+                        style_metrics["teacher_completions"],
+                    )
             for action_id in range(ACTION_COUNT):
                 available_steps = float(self.fight_action_available[action_id])
                 selected_total = float(self.fight_action_selected[action_id])
@@ -1253,6 +1318,32 @@ def main() -> int:
     guided_fight_scenarios = tuple(
         args.guided_fight_scenario or DEFAULT_GUIDED_FIGHT_SCENARIOS
     )
+    p2_styles = tuple(
+        P2Style(style_name)
+        for style_name in (
+            args.p2_style
+            or [style.value for style in P2Style]
+        )
+    )
+    p2_style_assignments = [
+        {
+            "fight_index": fight_index,
+            "mode": (
+                "guided"
+                if fight_index < args.guided_fight_envs
+                else "physical"
+            ),
+            "style": p2_styles[fight_index % len(p2_styles)].value,
+            "guided_scenario": (
+                guided_fight_scenarios[
+                    fight_index % len(guided_fight_scenarios)
+                ]
+                if fight_index < args.guided_fight_envs
+                else None
+            ),
+        }
+        for fight_index in range(fight_env_count)
+    ]
     if combo_env_count:
         for scenario_name, scenario_state_path in combo_scenario_specs:
             validate_file(scenario_state_path, f"Combo state for {scenario_name}")
@@ -1265,6 +1356,11 @@ def main() -> int:
         f"Guided Fight={args.guided_fight_envs}, "
         f"Physical Fight={fight_env_count - args.guided_fight_envs}"
     )
+    if fight_env_count:
+        print(
+            "P2 styles: "
+            + ", ".join(style.value for style in p2_styles)
+        )
 
     if args.save_name is None:
         args.save_name = f"kof98_{args.profile}_ppo"
@@ -1316,6 +1412,8 @@ def main() -> int:
             "combo_ratio": args.combo_ratio,
             "guided_fight_envs": args.guided_fight_envs,
             "guided_fight_scenarios": guided_fight_scenarios,
+            "p2_styles": tuple(style.value for style in p2_styles),
+            "p2_style_assignments": p2_style_assignments,
             "mask_level": args.mask_level,
             "p2_training_ai": args.p2_training_ai,
             "fight_reward_version": FIGHT_REWARD_VERSION,
@@ -1329,7 +1427,9 @@ def main() -> int:
     if args.tensorboard:
         start_tensorboard(log_dir, args.tensorboard_port)
 
-    environment_specs: list[tuple[TrainingProfile, str, Path, bool]] = []
+    environment_specs: list[
+        tuple[TrainingProfile, str, Path, bool, P2Style]
+    ] = []
     combo_spec_index = 0
     fight_spec_index = 0
     for training_profile in training_profiles:
@@ -1339,8 +1439,10 @@ def main() -> int:
             ]
             combo_spec_index += 1
             fight_guided = False
+            p2_style = P2Style.ONIYAKI
         else:
             fight_guided = fight_spec_index < args.guided_fight_envs
+            p2_style = p2_styles[fight_spec_index % len(p2_styles)]
             scenario_name = (
                 guided_fight_scenarios[
                     fight_spec_index % len(guided_fight_scenarios)
@@ -1351,7 +1453,13 @@ def main() -> int:
             scenario_state_path = combo_scenario_specs[0][1]
             fight_spec_index += 1
         environment_specs.append(
-            (training_profile, scenario_name, scenario_state_path, fight_guided)
+            (
+                training_profile,
+                scenario_name,
+                scenario_state_path,
+                fight_guided,
+                p2_style,
+            )
         )
 
     def monitored_env(
@@ -1360,6 +1468,7 @@ def main() -> int:
         combo_scenario: str,
         scenario_state_path: Path,
         fight_guided: bool,
+        p2_style: P2Style,
     ) -> Callable:
         def _init():
             return MaskableMonitor(make_env(
@@ -1372,6 +1481,7 @@ def main() -> int:
                 action_repeat=effective_action_repeat,
                 seed=seed,
                 p2_training_ai=args.p2_training_ai,
+                p2_style=p2_style,
                 fight_guided=fight_guided,
                 hitbox_reward=not args.no_hitbox_reward,
                 viewer=args.viewer,
@@ -1391,8 +1501,15 @@ def main() -> int:
             combo_scenario,
             scenario_state_path,
             fight_guided,
+            p2_style,
         )
-        for seed, (training_profile, combo_scenario, scenario_state_path, fight_guided)
+        for seed, (
+            training_profile,
+            combo_scenario,
+            scenario_state_path,
+            fight_guided,
+            p2_style,
+        )
         in enumerate(environment_specs)
     ]
     if len(env_fns) == 1:

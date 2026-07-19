@@ -38,6 +38,14 @@ typedef struct kof_env_joypad_state {
     uint8_t coin;
 } kof_env_joypad_state;
 
+typedef enum kof_env_p2_style {
+    KOF_ENV_P2_STYLE_ONIYAKI = 0,
+    KOF_ENV_P2_STYLE_GUARD = 1,
+    KOF_ENV_P2_STYLE_JUMP_IN = 2,
+    KOF_ENV_P2_STYLE_POKE = 3,
+    KOF_ENV_P2_STYLE_COUNT = 4,
+} kof_env_p2_style;
+
 typedef struct kof_env_observation {
     int32_t round_time;
     int32_t p1_health;
@@ -150,6 +158,7 @@ KOF_ENV_API void kof_env_set_video_refresh(kof_env_handle handle,
                                            kof_env_video_refresh_t callback,
                                            void *user_data);
 KOF_ENV_API void kof_env_set_p2_random_ai(kof_env_handle handle, int enabled);
+KOF_ENV_API int kof_env_set_p2_style(kof_env_handle handle, int32_t style);
 KOF_ENV_API int kof_env_set_action(kof_env_handle handle, int32_t action_id);
 KOF_ENV_API int kof_env_can_queue_action(kof_env_handle handle, int32_t action_id);
 KOF_ENV_API int kof_env_get_action_status(kof_env_handle handle,

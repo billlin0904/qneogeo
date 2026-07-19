@@ -13,6 +13,7 @@ from kof98_env import (
     COMBO_SCENARIOS,
     Kof98Env,
     KofEnvClient,
+    P2Style,
     STEP_EVENT_ACTION_STARTED,
     STEP_EVENT_COMBO_HIT,
     STEP_EVENTS_VERSION_1,
@@ -429,6 +430,79 @@ def verify_guided_fight_teacher(root: Path, state_path: Path) -> bool:
         env.close()
 
 
+def verify_p2_styles(root: Path, state_path: Path) -> bool:
+    fight_state_path = root / "saves" / "states" / "kof98.slot2.state"
+    if not fight_state_path.exists():
+        fight_state_path = state_path
+
+    env = Kof98Env(
+        root / "build-vs2026-x64" / "Release" / "fbneo_training.dll",
+        root / "downloads" / "fbneo_libretro" / "fbneo_libretro.dll",
+        root / "roms" / "fbneo" / "kof98.zip",
+        root / "roms" / "fbneo",
+        root / "saves",
+        state_path=fight_state_path,
+        action_repeat=1,
+        hitbox_reward=False,
+        p2_training_ai=True,
+        training_profile=TrainingProfile.FIGHT,
+        action_mask_level=ActionMaskLevel.PHYSICAL,
+    )
+    try:
+        all_passed = True
+        for style in P2Style:
+            env.p2_style = style
+            env.reset()
+            states = []
+            reported_styles = set()
+            for _frame in range(360):
+                _observation, _reward, terminated, truncated, info = env.step(0)
+                states.append(env.client.last_joypad(1))
+                reported_styles.add(str(info["p2_style"]))
+                if terminated or truncated:
+                    env.reset()
+
+            has_horizontal = any(state.left or state.right for state in states)
+            has_crouch_guard = any(
+                state.down
+                and (state.left or state.right)
+                and not (state.a or state.b or state.c or state.d)
+                for state in states
+            )
+            has_oniyaki = any(
+                state.down
+                and (state.left or state.right)
+                and state.a
+                for state in states
+            )
+            has_jump = any(state.up and (state.left or state.right) for state in states)
+            has_jump_attack = any(state.c or state.d for state in states)
+            has_poke = any(state.a or state.b for state in states)
+
+            if style is P2Style.ONIYAKI:
+                passed = has_oniyaki
+            elif style is P2Style.GUARD:
+                passed = has_horizontal and has_crouch_guard and not has_poke
+            elif style is P2Style.JUMP_IN:
+                passed = has_jump and has_jump_attack
+            else:
+                passed = has_horizontal and has_poke
+
+            passed = passed and reported_styles == {style.value}
+            status = "PASS" if passed else "FAIL"
+            print(
+                f"[{status}] P2 style {style.value}: "
+                f"horizontal={has_horizontal} crouch_guard={has_crouch_guard} "
+                f"oniyaki={has_oniyaki} jump={has_jump} "
+                f"jump_attack={has_jump_attack} poke={has_poke}"
+            )
+            all_passed = all_passed and passed
+
+        return all_passed
+    finally:
+        env.close()
+
+
 def main() -> int:
     args = parse_args()
     root = args.root.resolve()
@@ -464,6 +538,7 @@ def main() -> int:
         failed = not verify_physical_reward_cases(root) or failed
         failed = not verify_fight_event_attribution(root, state_path) or failed
         failed = not verify_guided_fight_teacher(root, state_path) or failed
+        failed = not verify_p2_styles(root, state_path) or failed
 
     return 1 if failed else 0
 

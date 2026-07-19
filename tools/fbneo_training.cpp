@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -122,6 +123,9 @@ constexpr size_t P1_PORT = 0;
 constexpr size_t P2_PORT = 1;
 constexpr size_t PLAYER_PORT_COUNT = 2;
 constexpr int32_t COMBO_EVENT_DAMAGE_GRACE_FRAMES = 2;
+constexpr int32_t WALK_FORWARD_ACTION_ID = 1;
+constexpr int32_t WALK_BACK_ACTION_ID = 2;
+constexpr int32_t STAND_B_ACTION_ID = 7;
 constexpr int32_t KYO_CROUCH_A_ACTION_ID = 10;
 constexpr int32_t KYO_CROUCH_B_ACTION_ID = 11;
 constexpr int32_t KYO_CLOSE_C_ACTION_ID = 8;
@@ -131,6 +135,8 @@ constexpr int32_t KYO_ONIYAKI_ACTION_ID = 16;
 constexpr int32_t KYO_RED_KICK_ACTION_ID = 17;
 constexpr int32_t KYO_OROCHINAGI_ACTION_ID = 18;
 constexpr int32_t KYO_MUSHIKI_ACTION_ID = 19;
+constexpr int32_t KYO_JUMP_C_ACTION_ID = 20;
+constexpr int32_t KYO_JUMP_D_ACTION_ID = 21;
 constexpr int32_t KYO_FORWARD_B_ACTION_ID = 22;
 constexpr int32_t KYO_POISON_BITE_ACTION_ID = 23;
 constexpr int32_t IDLE_ACTION_ID = 0;
@@ -705,6 +711,7 @@ public:
         last_frame_joypads_ = {};
         clearActionState();
         clearP2RandomAiScript();
+        p2_training_cycle_ = 0;
         clearStepEvents();
         clearCombatEventState();
         retro_reset_();
@@ -729,6 +736,7 @@ public:
         last_frame_joypads_ = {};
         clearActionState();
         clearP2RandomAiScript();
+        p2_training_cycle_ = 0;
         clearStepEvents();
         clearCombatEventState();
         return true;
@@ -787,7 +795,21 @@ public:
     void setP2RandomAiEnabled(bool enabled) {
         p2_random_ai_enabled_ = enabled;
         clearP2RandomAiScript();
+        p2_training_cycle_ = 0;
         joypads_[P2_PORT] = {};
+    }
+
+    bool setP2Style(int32_t style) {
+        if (style < KOF_ENV_P2_STYLE_ONIYAKI ||
+            style >= KOF_ENV_P2_STYLE_COUNT) {
+            return fail("P2 style is out of range.");
+        }
+
+        p2_style_ = static_cast<kof_env_p2_style>(style);
+        clearP2RandomAiScript();
+        p2_training_cycle_ = 0;
+        joypads_[P2_PORT] = {};
+        return true;
     }
 
     bool inputReady() const {
@@ -1065,6 +1087,19 @@ public:
         return true;
     }
 
+    bool startP2Action(const CharacterActionTable &actions,
+                       int32_t action_id,
+                       int32_t cooldown_frames = 0) {
+        const auto action_it = actions.find(action_id);
+        if (action_it == actions.cend())
+            return false;
+
+        std::vector<InputFrame> script = action_it->second;
+        if (cooldown_frames > 0)
+            script.push_back({ {}, cooldown_frames });
+        return startP2RandomAiScript(std::move(script));
+    }
+
     bool startP2TrainingAction() {
         kof_env_observation observation {};
         const bool has_observation = getObservation(&observation);
@@ -1073,11 +1108,69 @@ public:
         if (!actions || actions->empty())
             return false;
 
-        const auto action_it = actions->find(KYO_ONIYAKI_ACTION_ID);
-        if (action_it == actions->cend())
-            return false;
+        const uint32_t cycle = p2_training_cycle_++;
+        switch (p2_style_) {
+        case KOF_ENV_P2_STYLE_ONIYAKI:
+            return startP2Action(*actions, KYO_ONIYAKI_ACTION_ID);
 
-        return startP2RandomAiScript(action_it->second);
+        case KOF_ENV_P2_STYLE_GUARD: {
+            kof_env_joypad_state stand_guard {};
+            setBackOn(stand_guard, forward_is_right);
+            kof_env_joypad_state crouch_guard = stand_guard;
+            crouch_guard.down = 1;
+
+            switch (cycle % 4) {
+            case 0:
+                return startP2RandomAiScript({
+                    { stand_guard, 42 },
+                    { {}, 10 },
+                });
+            case 1:
+                return startP2RandomAiScript({
+                    { crouch_guard, 36 },
+                    { {}, 8 },
+                });
+            case 2:
+                return startP2RandomAiScript({
+                    { stand_guard, 18 },
+                    { {}, 18 },
+                });
+            default:
+                return startP2RandomAiScript({
+                    { crouch_guard, 24 },
+                    { {}, 14 },
+                });
+            }
+        }
+
+        case KOF_ENV_P2_STYLE_JUMP_IN:
+            return startP2Action(
+                *actions,
+                cycle % 2 == 0 ? KYO_JUMP_C_ACTION_ID : KYO_JUMP_D_ACTION_ID,
+                cycle % 2 == 0 ? 10 : 14);
+
+        case KOF_ENV_P2_STYLE_POKE: {
+            const int32_t distance_x = has_observation
+                ? std::abs(observation.distance_x)
+                : 0;
+            if (distance_x > 80)
+                return startP2Action(*actions, WALK_FORWARD_ACTION_ID, 4);
+
+            switch (cycle % 4) {
+            case 0:
+                return startP2Action(*actions, KYO_CROUCH_B_ACTION_ID, 10);
+            case 1:
+                return startP2Action(*actions, WALK_BACK_ACTION_ID, 8);
+            case 2:
+                return startP2Action(*actions, STAND_B_ACTION_ID, 12);
+            default:
+                return startP2Action(*actions, KYO_CROUCH_A_ACTION_ID, 10);
+            }
+        }
+
+        default:
+            return false;
+        }
     }
 
     void advanceP2RandomAiFrame() {
@@ -1651,6 +1744,8 @@ private:
     size_t p2_random_script_index_ = 0;
     int32_t p2_random_script_remaining_frames_ = 0;
     bool p2_random_ai_enabled_ = false;
+    kof_env_p2_style p2_style_ = KOF_ENV_P2_STYLE_ONIYAKI;
+    uint32_t p2_training_cycle_ = 0;
     CharacterActionMapLut action_lut_;
     std::string game_path_utf8_;
     std::string system_directory_utf8_;
@@ -1756,6 +1851,11 @@ void kof_env_set_video_refresh(kof_env_handle handle,
 void kof_env_set_p2_random_ai(kof_env_handle handle, int enabled) {
     if (auto *runtime = runtimeFromHandle(handle))
         runtime->setP2RandomAiEnabled(enabled != 0);
+}
+
+int kof_env_set_p2_style(kof_env_handle handle, int32_t style) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->setP2Style(style) ? 1 : 0;
 }
 
 int kof_env_set_action(kof_env_handle handle, int32_t action_id) {
