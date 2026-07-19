@@ -482,4 +482,28 @@ bool GameMemReaderCore::p1ReadyForAction() const {
     return body_box.height >= body_box.width;
 }
 
+bool GameMemReaderCore::p2ReadyForAction() const {
+    if (readP2Health() <= 0)
+        return false;
+
+    const HitboxOverlay overlay = getHitboxOverlay();
+    int32_t largest_area = 0;
+    HitboxRect body_box;
+    for (const HitboxRect &box : overlay.boxes) {
+        if (box.owner != 2 || box.type != HitboxVulnerability)
+            continue;
+
+        const int32_t area = box.width * box.height;
+        if (area > largest_area) {
+            largest_area = area;
+            body_box = box;
+        }
+    }
+
+    if (largest_area <= 0)
+        return false;
+
+    return body_box.height >= body_box.width;
+}
+
 } // namespace game_memory

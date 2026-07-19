@@ -643,6 +643,26 @@ class KofEnvClient:
             )
         )
 
+    def set_p2_action_ai(self, enabled: bool) -> None:
+        self.dll.kof_env_set_p2_action_ai(self.handle, 1 if enabled else 0)
+
+    def set_p2_action(self, action_id: int) -> None:
+        self._check(self.dll.kof_env_set_p2_action(self.handle, int(action_id)))
+
+    def p2_input_ready(self) -> bool:
+        return bool(self.dll.kof_env_p2_input_ready(self.handle))
+
+    def p2_ready_for_action(self) -> bool:
+        return bool(self.dll.kof_env_p2_ready_for_action(self.handle))
+
+    def can_queue_p2_action(self, action_id: int) -> bool:
+        return bool(
+            self.dll.kof_env_can_queue_p2_action(
+                self.handle,
+                int(action_id),
+            )
+        )
+
     def step(self, action_id: int, frames: int = 6) -> Kof98Observation:
         observation = Kof98Observation()
         self._check(self.dll.kof_env_step(self.handle, action_id, frames, ctypes.byref(observation)))
@@ -780,6 +800,24 @@ class KofEnvClient:
         self.dll.kof_env_set_p2_random_ai.argtypes = [ctypes.c_void_p, ctypes.c_int]
         self.dll.kof_env_set_p2_style.argtypes = [ctypes.c_void_p, ctypes.c_int32]
         self.dll.kof_env_set_p2_style.restype = ctypes.c_int
+        self.dll.kof_env_set_p2_action_ai.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        self.dll.kof_env_set_p2_action.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int32,
+        ]
+        self.dll.kof_env_set_p2_action.restype = ctypes.c_int
+        self.dll.kof_env_can_queue_p2_action.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int32,
+        ]
+        self.dll.kof_env_can_queue_p2_action.restype = ctypes.c_int
+        self.dll.kof_env_p2_input_ready.argtypes = [ctypes.c_void_p]
+        self.dll.kof_env_p2_input_ready.restype = ctypes.c_int
+        self.dll.kof_env_p2_ready_for_action.argtypes = [ctypes.c_void_p]
+        self.dll.kof_env_p2_ready_for_action.restype = ctypes.c_int
 
         self.dll.kof_env_step.argtypes = [
             ctypes.c_void_p,

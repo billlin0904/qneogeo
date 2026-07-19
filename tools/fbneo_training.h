@@ -159,6 +159,11 @@ KOF_ENV_API void kof_env_set_video_refresh(kof_env_handle handle,
                                            void *user_data);
 KOF_ENV_API void kof_env_set_p2_random_ai(kof_env_handle handle, int enabled);
 KOF_ENV_API int kof_env_set_p2_style(kof_env_handle handle, int32_t style);
+KOF_ENV_API void kof_env_set_p2_action_ai(kof_env_handle handle, int enabled);
+KOF_ENV_API int kof_env_set_p2_action(kof_env_handle handle, int32_t action_id);
+KOF_ENV_API int kof_env_can_queue_p2_action(kof_env_handle handle, int32_t action_id);
+KOF_ENV_API int kof_env_p2_input_ready(kof_env_handle handle);
+KOF_ENV_API int kof_env_p2_ready_for_action(kof_env_handle handle);
 KOF_ENV_API int kof_env_set_action(kof_env_handle handle, int32_t action_id);
 KOF_ENV_API int kof_env_can_queue_action(kof_env_handle handle, int32_t action_id);
 KOF_ENV_API int kof_env_get_action_status(kof_env_handle handle,

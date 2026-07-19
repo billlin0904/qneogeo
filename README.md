@@ -359,3 +359,30 @@ C:\Users\User\anaconda3\envs\KofAI\python.exe tools\verify_kof98_actions.py
 新的 Action space 是 `Discrete(29)`。舊 `Discrete(26)`／`Discrete(27)` 模型只能用
 Viewer 觀看，不能接續訓練 Action 27、28。建議依序訓練 strict、guided、physical Combo，最後使用
 `--profile mixed --mask-level physical` 混入 Fight environments。
+
+### 在 qneogeo 與 PPO 對戰
+
+切換到 `FBNeo Training DLL` core、載入 KOF98，再勾選
+`Tools > GamePlay With AI (P2)`。qneogeo 會讓常駐 Python process 載入：
+
+```text
+trained_models/kof98_mixed29_guided_fight_ppo_final.zip
+```
+
+Qt 每 4 個模擬 frame 非同步送出 P2 視角的 26 維 observation 與 physical action
+mask；Python 只做 MaskablePPO 推論，P2 的逐 frame 指令與派生技 queue 仍由
+`fbneo_training.dll` 執行。關閉選項後，P2 鍵盤輸入會恢復。
+
+預設 Python 為：
+
+```text
+C:/Users/User/anaconda3/envs/KofAI/python.exe
+```
+
+可在 `config/input.ini` 覆寫：
+
+```ini
+[AI]
+PythonExecutable=C:/path/to/python.exe
+P2Model=F:/path/to/model.zip
+```

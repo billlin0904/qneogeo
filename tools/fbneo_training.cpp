@@ -710,7 +710,7 @@ public:
         joypads_[P2_PORT] = {};
         last_frame_joypads_ = {};
         clearActionState();
-        clearP2RandomAiScript();
+        clearP2ActionState();
         p2_training_cycle_ = 0;
         clearStepEvents();
         clearCombatEventState();
@@ -735,7 +735,7 @@ public:
         joypads_[P2_PORT] = {};
         last_frame_joypads_ = {};
         clearActionState();
-        clearP2RandomAiScript();
+        clearP2ActionState();
         p2_training_cycle_ = 0;
         clearStepEvents();
         clearCombatEventState();
@@ -794,8 +794,20 @@ public:
 
     void setP2RandomAiEnabled(bool enabled) {
         p2_random_ai_enabled_ = enabled;
+        if (enabled)
+            p2_action_ai_enabled_ = false;
         clearP2RandomAiScript();
+        clearP2ActionState();
         p2_training_cycle_ = 0;
+        joypads_[P2_PORT] = {};
+    }
+
+    void setP2ActionAiEnabled(bool enabled) {
+        p2_action_ai_enabled_ = enabled;
+        if (enabled)
+            p2_random_ai_enabled_ = false;
+        clearP2RandomAiScript();
+        clearP2ActionState();
         joypads_[P2_PORT] = {};
     }
 
@@ -826,6 +838,25 @@ public:
         return rule &&
                active_action_elapsed_frames_ >= rule->queue_open_frame &&
                active_action_elapsed_frames_ < rule->queue_close_frame_exclusive;
+    }
+
+    bool p2InputReady() const {
+        return p2_active_action_id_ < 0;
+    }
+
+    bool canQueueP2Action(int32_t action_id) const {
+        if (!p2_action_ai_enabled_ ||
+            p2_active_action_id_ < 0 ||
+            p2_queued_action_id_ >= 0) {
+            return false;
+        }
+
+        const FollowUpRule *rule = action_lut_.findFollowUpRule(
+            p2_active_action_id_,
+            action_id);
+        return rule &&
+               p2_active_action_elapsed_frames_ >= rule->queue_open_frame &&
+               p2_active_action_elapsed_frames_ < rule->queue_close_frame_exclusive;
     }
 
     bool getActionStatus(kof_env_action_status *status) const {
@@ -1076,6 +1107,14 @@ public:
         p2_random_script_remaining_frames_ = 0;
     }
 
+    void clearP2ActionState() {
+        clearP2RandomAiScript();
+        p2_active_action_id_ = -1;
+        p2_queued_action_id_ = -1;
+        p2_active_action_elapsed_frames_ = 0;
+        p2_last_action_accepted_ = false;
+    }
+
     bool startP2RandomAiScript(std::vector<InputFrame> script) {
         if (script.empty())
             return false;
@@ -1098,6 +1137,98 @@ public:
         if (cooldown_frames > 0)
             script.push_back({ {}, cooldown_frames });
         return startP2RandomAiScript(std::move(script));
+    }
+
+    bool startP2ActionById(int32_t action_id, int32_t script_action_id = -1) {
+        kof_env_observation observation {};
+        const bool has_observation = getObservation(&observation);
+        const bool forward_is_right =
+            !has_observation || observation.p1_x >= observation.p2_x;
+        const CharacterActionTable *actions = action_lut_.getAction(forward_is_right);
+        if (!actions)
+            return fail("P2 character action table is missing.");
+
+        const int32_t resolved_script_action_id =
+            script_action_id >= 0 ? script_action_id : action_id;
+        const auto action_it = actions->find(resolved_script_action_id);
+        if (action_it == actions->cend())
+            return fail("P2 action id is out of range.");
+        if (!startP2RandomAiScript(action_it->second))
+            return fail("P2 action script is empty.");
+
+        p2_active_action_id_ = action_id;
+        p2_active_action_elapsed_frames_ = 0;
+        return true;
+    }
+
+    bool setP2Action(int32_t action_id) {
+        p2_last_action_accepted_ = false;
+        if (!p2_action_ai_enabled_)
+            return fail("P2 action AI is disabled.");
+
+        if (p2_active_action_id_ >= 0) {
+            if (action_id == IDLE_ACTION_ID) {
+                p2_last_action_accepted_ = true;
+                return true;
+            }
+
+            if (canQueueP2Action(action_id)) {
+                p2_queued_action_id_ = action_id;
+                p2_last_action_accepted_ = true;
+                return true;
+            }
+
+            return true;
+        }
+
+        p2_last_action_accepted_ = startP2ActionById(action_id);
+        return p2_last_action_accepted_;
+    }
+
+    void advanceP2ActionLifecycleFrame() {
+        if (p2_active_action_id_ < 0)
+            return;
+
+        ++p2_active_action_elapsed_frames_;
+        if (p2_queued_action_id_ >= 0) {
+            const FollowUpRule *rule = action_lut_.findFollowUpRule(
+                p2_active_action_id_,
+                p2_queued_action_id_);
+            if (!rule) {
+                clearP2ActionState();
+                joypads_[P2_PORT] = {};
+                return;
+            }
+
+            if (p2_active_action_elapsed_frames_ >= rule->execute_frame) {
+                const int32_t queued_action_id = p2_queued_action_id_;
+                p2_queued_action_id_ = -1;
+                if (!startP2ActionById(queued_action_id, rule->script_action_id)) {
+                    clearP2ActionState();
+                    joypads_[P2_PORT] = {};
+                }
+            }
+            return;
+        }
+
+        if (p2_random_script_.empty() &&
+            !action_lut_.hasPendingFollowUpWindow(
+                p2_active_action_id_,
+                p2_active_action_elapsed_frames_)) {
+            p2_active_action_id_ = -1;
+            p2_active_action_elapsed_frames_ = 0;
+        }
+    }
+
+    void finishP2ActionScriptFrame() {
+        if (!p2_action_ai_enabled_ || p2_random_script_.empty())
+            return;
+
+        if (p2_random_script_remaining_frames_ <= 0 &&
+            p2_random_script_index_ + 1 >= p2_random_script_.size()) {
+            clearP2RandomAiScript();
+            joypads_[P2_PORT] = {};
+        }
     }
 
     bool startP2TrainingAction() {
@@ -1174,6 +1305,30 @@ public:
     }
 
     void advanceP2RandomAiFrame() {
+        if (p2_action_ai_enabled_) {
+            if (p2_random_script_.empty()) {
+                joypads_[P2_PORT] = {};
+                return;
+            }
+
+            if (p2_random_script_remaining_frames_ <= 0) {
+                ++p2_random_script_index_;
+                if (p2_random_script_index_ >= p2_random_script_.size()) {
+                    clearP2RandomAiScript();
+                    joypads_[P2_PORT] = {};
+                    return;
+                }
+                p2_random_script_remaining_frames_ =
+                    p2_random_script_[p2_random_script_index_].frames;
+            }
+
+            if (p2_random_script_remaining_frames_ > 0) {
+                joypads_[P2_PORT] = p2_random_script_[p2_random_script_index_].state;
+                --p2_random_script_remaining_frames_;
+            }
+            return;
+        }
+
         if (!p2_random_ai_enabled_) {
             clearP2RandomAiScript();
             return;
@@ -1293,7 +1448,10 @@ public:
                 before,
                 after);
             finishActionScriptFrame();
+            finishP2ActionScriptFrame();
             advanceActionLifecycleFrame();
+            if (p2_action_ai_enabled_)
+                advanceP2ActionLifecycleFrame();
         }
 
         return true;
@@ -1363,6 +1521,15 @@ public:
             return false;
 
         return game_memory::GameMemReaderCore(ram_ptr, ram_size).p1ReadyForAction();
+    }
+
+    bool p2ReadyForAction() const {
+        size_t ram_size = 0;
+        const uint8_t *ram_ptr = systemRam(&ram_size);
+        if (!ram_ptr || ram_size == 0)
+            return false;
+
+        return game_memory::GameMemReaderCore(ram_ptr, ram_size).p2ReadyForAction();
     }
 
     uint32_t systemRamSize() const {
@@ -1609,7 +1776,7 @@ private:
         joypads_[P1_PORT] = {};
         joypads_[P2_PORT] = {};
         clearActionState();
-        clearP2RandomAiScript();
+        clearP2ActionState();
     }
 
     void installCallbacks() {
@@ -1744,6 +1911,11 @@ private:
     size_t p2_random_script_index_ = 0;
     int32_t p2_random_script_remaining_frames_ = 0;
     bool p2_random_ai_enabled_ = false;
+    bool p2_action_ai_enabled_ = false;
+    int32_t p2_active_action_id_ = -1;
+    int32_t p2_queued_action_id_ = -1;
+    int32_t p2_active_action_elapsed_frames_ = 0;
+    bool p2_last_action_accepted_ = false;
     kof_env_p2_style p2_style_ = KOF_ENV_P2_STYLE_ONIYAKI;
     uint32_t p2_training_cycle_ = 0;
     CharacterActionMapLut action_lut_;
@@ -1856,6 +2028,31 @@ void kof_env_set_p2_random_ai(kof_env_handle handle, int enabled) {
 int kof_env_set_p2_style(kof_env_handle handle, int32_t style) {
     auto *runtime = runtimeFromHandle(handle);
     return runtime && runtime->setP2Style(style) ? 1 : 0;
+}
+
+void kof_env_set_p2_action_ai(kof_env_handle handle, int enabled) {
+    if (auto *runtime = runtimeFromHandle(handle))
+        runtime->setP2ActionAiEnabled(enabled != 0);
+}
+
+int kof_env_set_p2_action(kof_env_handle handle, int32_t action_id) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->setP2Action(action_id) ? 1 : 0;
+}
+
+int kof_env_can_queue_p2_action(kof_env_handle handle, int32_t action_id) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->canQueueP2Action(action_id) ? 1 : 0;
+}
+
+int kof_env_p2_input_ready(kof_env_handle handle) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->p2InputReady() ? 1 : 0;
+}
+
+int kof_env_p2_ready_for_action(kof_env_handle handle) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->p2ReadyForAction() ? 1 : 0;
 }
 
 int kof_env_set_action(kof_env_handle handle, int32_t action_id) {

@@ -71,6 +71,7 @@ public:
     bool readP2Position(Point &position) const;
     bool readP1FacingLeft(bool &facing_left) const;
     bool p1ReadyForAction() const;
+    bool p2ReadyForAction() const;
 
 private:
     const uint8_t *ram_ = nullptr;

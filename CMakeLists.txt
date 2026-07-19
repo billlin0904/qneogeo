@@ -265,6 +265,8 @@ if(QNEOGEO_BUILD_QT_APP)
         memorysearchdialog.h
         neocdlibretrocore.cpp
         neocdlibretrocore.h
+        ppoagentbridge.cpp
+        ppoagentbridge.h
         qneogeo.ico
         qneogeo.qrc
         qneogeo.rc

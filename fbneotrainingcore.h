@@ -8,6 +8,8 @@
 
 #include <array>
 
+class PpoAgentBridge;
+
 class FbneoTrainingCore final : public LibretroCore {
     Q_OBJECT
 
@@ -27,11 +29,18 @@ public:
     bool readSystemRam(QByteArray &ram) const override;
     bool readSystemRamByte(uint32_t address, uint8_t &value) const override;
     void setP2RandomAiEnabled(bool enabled);
+    bool setP2PpoAiEnabled(bool enabled,
+                           const QString &pythonPath,
+                           const QString &scriptPath,
+                           const QString &modelPath);
 
     QString displayName() const override;
     QString coreFileName() const override;
     QString romDirectoryName() const override;
     QStringList supportedExtensions() const override;
+
+signals:
+    void p2PpoAiFailed(const QString &message);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -50,6 +59,12 @@ private:
         int (*)(kof_env_handle, unsigned, kof_env_joypad_state *);
     using kof_env_set_video_refresh_t = void (*)(kof_env_handle, kof_env_video_refresh_t, void *);
     using kof_env_set_p2_random_ai_t = void (*)(kof_env_handle, int);
+    using kof_env_set_p2_action_ai_t = void (*)(kof_env_handle, int);
+    using kof_env_set_p2_action_t = int (*)(kof_env_handle, int32_t);
+    using kof_env_can_queue_p2_action_t = int (*)(kof_env_handle, int32_t);
+    using kof_env_p2_input_ready_t = int (*)(kof_env_handle);
+    using kof_env_p2_ready_for_action_t = int (*)(kof_env_handle);
+    using kof_env_get_observation_t = int (*)(kof_env_handle, kof_env_observation *);
     using kof_env_run_frames_t = int (*)(kof_env_handle, int32_t);
     using kof_env_system_ram_size_t = uint32_t (*)(kof_env_handle);
     using kof_env_copy_system_ram_t = int (*)(kof_env_handle, void *, uint32_t);
@@ -66,6 +81,9 @@ private:
     void unloadLibrary();
     void advanceFrame();
     void updateJoypad();
+    void requestP2PpoAction();
+    QVector<float> p2ObservationVector(const kof_env_observation &observation) const;
+    QVector<bool> p2ActionMask(const kof_env_observation &observation) const;
     int p2ButtonForKey(int key) const;
     void handleVideoFrame(const void *data, unsigned width, unsigned height, size_t pitch);
 
@@ -82,7 +100,13 @@ private:
     bool game_loaded_ = false;
     bool paused_ = false;
     bool p2_random_ai_enabled_ = false;
+    bool p2_ppo_ai_enabled_ = false;
+    int32_t p2_ppo_frame_counter_ = 0;
+    QString p2_ppo_python_path_;
+    QString p2_ppo_script_path_;
+    QString p2_ppo_model_path_;
     std::array<bool, 16> p2_keyboard_joypad_state_ {};
+    PpoAgentBridge *ppo_agent_bridge_ = nullptr;
 
     kof_env_create_t kof_env_create_ = nullptr;
     kof_env_destroy_t kof_env_destroy_ = nullptr;
@@ -96,6 +120,12 @@ private:
     kof_env_get_last_joypad_for_port_t kof_env_get_last_joypad_for_port_ = nullptr;
     kof_env_set_video_refresh_t kof_env_set_video_refresh_ = nullptr;
     kof_env_set_p2_random_ai_t kof_env_set_p2_random_ai_ = nullptr;
+    kof_env_set_p2_action_ai_t kof_env_set_p2_action_ai_ = nullptr;
+    kof_env_set_p2_action_t kof_env_set_p2_action_ = nullptr;
+    kof_env_can_queue_p2_action_t kof_env_can_queue_p2_action_ = nullptr;
+    kof_env_p2_input_ready_t kof_env_p2_input_ready_ = nullptr;
+    kof_env_p2_ready_for_action_t kof_env_p2_ready_for_action_ = nullptr;
+    kof_env_get_observation_t kof_env_get_observation_ = nullptr;
     kof_env_run_frames_t kof_env_run_frames_ = nullptr;
     kof_env_system_ram_size_t kof_env_system_ram_size_ = nullptr;
     kof_env_copy_system_ram_t kof_env_copy_system_ram_ = nullptr;

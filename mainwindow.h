@@ -46,6 +46,7 @@ private:
     LibretroCore *createCore(CoreKind kind);
     void setCoreKind(CoreKind kind);
     void connectCoreSignals();
+    bool configureP2PpoAi(bool enabled);
     void updateCoreActions();
     void loadSystemOptionsIntoCore() const;
     void setSystemRegion(const QString &region);

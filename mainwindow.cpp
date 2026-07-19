@@ -363,10 +363,20 @@ MainWindow::MainWindow(QWidget *parent)
         QSettings settings(inputConfigPath(), QSettings::IniFormat);
         settings.setValue(QStringLiteral("AI/GamePlayWithP2"), enabled);
         settings.sync();
-        if (auto *training_core = dynamic_cast<FbneoTrainingCore *>(core_))
-            training_core->setP2RandomAiEnabled(enabled);
+        if (!configureP2PpoAi(enabled) && enabled) {
+            const QSignalBlocker blocker(gameplay_with_ai_p2_action_);
+            gameplay_with_ai_p2_action_->setChecked(false);
+            settings.setValue(QStringLiteral("AI/GamePlayWithP2"), false);
+            settings.sync();
+            QMessageBox::critical(
+                this,
+                QStringLiteral("GamePlay With AI (P2)"),
+                core_ ? core_->lastError()
+                      : QStringLiteral("FBNeo Training core is not active."));
+            return;
+        }
         statusBar()->showMessage(enabled
-                                     ? QStringLiteral("GamePlay With AI (P2) enabled")
+                                     ? QStringLiteral("PPO model now controls Player 2")
                                      : QStringLiteral("GamePlay With AI (P2) disabled"),
                                  2500);
     });
@@ -580,8 +590,9 @@ void MainWindow::connectCoreSignals() {
     if (!core_ || !pause_action_)
         return;
 
-    if (auto *training_core = dynamic_cast<FbneoTrainingCore *>(core_))
-        training_core->setP2RandomAiEnabled(gameplay_with_ai_p2_action_ && gameplay_with_ai_p2_action_->isChecked());
+    configureP2PpoAi(
+        gameplay_with_ai_p2_action_ &&
+        gameplay_with_ai_p2_action_->isChecked());
 
     connect(pause_action_, &QAction::toggled, core_, &LibretroCore::setPaused);
     connect(core_, &LibretroCore::pausedChanged, this, [this](bool paused) {
@@ -590,6 +601,53 @@ void MainWindow::connectCoreSignals() {
     });
     connect(core_, &LibretroCore::frameAdvanced, this, &MainWindow::updateKof98Overlay);
     connect(core_, &LibretroCore::frameAdvanced, this, &MainWindow::updateInputOverlay);
+    if (auto *training_core = dynamic_cast<FbneoTrainingCore *>(core_)) {
+        connect(training_core,
+                &FbneoTrainingCore::p2PpoAiFailed,
+                this,
+                [this](const QString &message) {
+                    if (gameplay_with_ai_p2_action_) {
+                        const QSignalBlocker blocker(gameplay_with_ai_p2_action_);
+                        gameplay_with_ai_p2_action_->setChecked(false);
+                    }
+                    QSettings settings(inputConfigPath(), QSettings::IniFormat);
+                    settings.setValue(QStringLiteral("AI/GamePlayWithP2"), false);
+                    settings.sync();
+                    statusBar()->showMessage(
+                        QStringLiteral("P2 PPO AI stopped: %1").arg(message),
+                        5000);
+                });
+    }
+}
+
+bool MainWindow::configureP2PpoAi(bool enabled) {
+    auto *training_core = dynamic_cast<FbneoTrainingCore *>(core_);
+    if (!training_core)
+        return !enabled;
+
+    QSettings settings(inputConfigPath(), QSettings::IniFormat);
+    const QString default_python =
+        QStringLiteral("C:/Users/User/anaconda3/envs/KofAI/python.exe");
+    const QString python_path =
+        settings.value(QStringLiteral("AI/PythonExecutable"), default_python)
+            .toString();
+    const QString model_path =
+        settings.value(
+                    QStringLiteral("AI/P2Model"),
+                    QDir(projectRoot()).absoluteFilePath(
+                        QStringLiteral(
+                            "trained_models/"
+                            "kof98_mixed29_guided_fight_ppo_final.zip")))
+            .toString();
+    const QString script_path =
+        QDir(projectRoot()).absoluteFilePath(
+            QStringLiteral("tools/kof_ppo_inference_bridge.py"));
+
+    return training_core->setP2PpoAiEnabled(
+        enabled,
+        python_path,
+        script_path,
+        model_path);
 }
 
 void MainWindow::updateCoreActions() {

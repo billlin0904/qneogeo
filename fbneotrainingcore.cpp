@@ -1,4 +1,5 @@
 #include "fbneotrainingcore.h"
+#include "ppoagentbridge.h"
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -11,6 +12,18 @@
 
 FbneoTrainingCore::FbneoTrainingCore(EmulatorView *videoOutput, QObject *parent)
     : LibretroCore(videoOutput, parent) {
+    ppo_agent_bridge_ = new PpoAgentBridge(this);
+    connect(ppo_agent_bridge_, &PpoAgentBridge::actionReady, this, [this](int32_t action_id) {
+        if (p2_ppo_ai_enabled_ && handle_ && kof_env_set_p2_action_)
+            kof_env_set_p2_action_(handle_, action_id);
+    });
+    connect(ppo_agent_bridge_, &PpoAgentBridge::failed, this, [this](const QString &message) {
+        p2_ppo_ai_enabled_ = false;
+        if (handle_ && kof_env_set_p2_action_ai_)
+            kof_env_set_p2_action_ai_(handle_, 0);
+        setError(QStringLiteral("P2 PPO AI: %1").arg(message));
+        emit p2PpoAiFailed(message);
+    });
     frame_timer_.setTimerType(Qt::PreciseTimer);
     connect(&frame_timer_, &QTimer::timeout, this, &FbneoTrainingCore::advanceFrame);
 }
@@ -71,6 +84,15 @@ bool FbneoTrainingCore::startGame(const QString &contentPath,
     game_loaded_ = true;
     paused_ = false;
     resetInputFrameTracking();
+    if (p2_ppo_ai_enabled_ &&
+        !ppo_agent_bridge_->start(
+            p2_ppo_python_path_,
+            p2_ppo_script_path_,
+            p2_ppo_model_path_)) {
+        game_loaded_ = false;
+        return fail(QStringLiteral("Could not start P2 PPO AI: %1")
+                        .arg(ppo_agent_bridge_->lastError()));
+    }
     frame_timer_.start(16);
     emit pausedChanged(false);
     return true;
@@ -78,6 +100,8 @@ bool FbneoTrainingCore::startGame(const QString &contentPath,
 
 void FbneoTrainingCore::stop() {
     frame_timer_.stop();
+    if (ppo_agent_bridge_)
+        ppo_agent_bridge_->stop();
     destroyRuntime();
     game_loaded_ = false;
     resetInputFrameTracking();
@@ -199,10 +223,52 @@ bool FbneoTrainingCore::readSystemRamByte(uint32_t address, uint8_t &value) cons
 
 void FbneoTrainingCore::setP2RandomAiEnabled(bool enabled) {
     p2_random_ai_enabled_ = enabled;
+    if (enabled)
+        p2_ppo_ai_enabled_ = false;
+    if (ppo_agent_bridge_ && enabled)
+        ppo_agent_bridge_->stop();
     if (handle_ && kof_env_set_p2_random_ai_)
         kof_env_set_p2_random_ai_(handle_, enabled ? 1 : 0);
     if (!enabled)
         updateJoypad();
+}
+
+bool FbneoTrainingCore::setP2PpoAiEnabled(bool enabled,
+                                          const QString &pythonPath,
+                                          const QString &scriptPath,
+                                          const QString &modelPath) {
+    p2_ppo_python_path_ = pythonPath;
+    p2_ppo_script_path_ = scriptPath;
+    p2_ppo_model_path_ = modelPath;
+    p2_ppo_ai_enabled_ = enabled;
+    p2_random_ai_enabled_ = false;
+    p2_ppo_frame_counter_ = 0;
+
+    if (handle_ && kof_env_set_p2_random_ai_)
+        kof_env_set_p2_random_ai_(handle_, 0);
+    if (handle_ && kof_env_set_p2_action_ai_)
+        kof_env_set_p2_action_ai_(handle_, enabled ? 1 : 0);
+
+    if (!enabled) {
+        if (ppo_agent_bridge_)
+            ppo_agent_bridge_->stop();
+        updateJoypad();
+        return true;
+    }
+
+    if (!game_loaded_)
+        return true;
+
+    if (!ppo_agent_bridge_ ||
+        !ppo_agent_bridge_->start(pythonPath, scriptPath, modelPath)) {
+        p2_ppo_ai_enabled_ = false;
+        if (handle_ && kof_env_set_p2_action_ai_)
+            kof_env_set_p2_action_ai_(handle_, 0);
+        return fail(QStringLiteral("Could not start P2 PPO AI: %1")
+                        .arg(ppo_agent_bridge_ ? ppo_agent_bridge_->lastError()
+                                             : QStringLiteral("bridge unavailable")));
+    }
+    return true;
 }
 
 QString FbneoTrainingCore::displayName() const {
@@ -255,6 +321,16 @@ bool FbneoTrainingCore::resolveSymbols() {
             resolveSymbol<kof_env_get_last_joypad_for_port_t>("kof_env_get_last_joypad_for_port");
         kof_env_set_video_refresh_ = resolveSymbol<kof_env_set_video_refresh_t>("kof_env_set_video_refresh");
         kof_env_set_p2_random_ai_ = resolveSymbol<kof_env_set_p2_random_ai_t>("kof_env_set_p2_random_ai");
+        kof_env_set_p2_action_ai_ = resolveSymbol<kof_env_set_p2_action_ai_t>("kof_env_set_p2_action_ai");
+        kof_env_set_p2_action_ = resolveSymbol<kof_env_set_p2_action_t>("kof_env_set_p2_action");
+        kof_env_can_queue_p2_action_ =
+            resolveSymbol<kof_env_can_queue_p2_action_t>("kof_env_can_queue_p2_action");
+        kof_env_p2_input_ready_ =
+            resolveSymbol<kof_env_p2_input_ready_t>("kof_env_p2_input_ready");
+        kof_env_p2_ready_for_action_ =
+            resolveSymbol<kof_env_p2_ready_for_action_t>("kof_env_p2_ready_for_action");
+        kof_env_get_observation_ =
+            resolveSymbol<kof_env_get_observation_t>("kof_env_get_observation");
         kof_env_run_frames_ = resolveSymbol<kof_env_run_frames_t>("kof_env_run_frames");
         kof_env_system_ram_size_ = resolveSymbol<kof_env_system_ram_size_t>("kof_env_system_ram_size");
         kof_env_copy_system_ram_ = resolveSymbol<kof_env_copy_system_ram_t>("kof_env_copy_system_ram");
@@ -277,6 +353,8 @@ bool FbneoTrainingCore::recreateRuntime() {
     kof_env_set_video_refresh_(handle_, videoRefreshCallback, this);
     if (kof_env_set_p2_random_ai_)
         kof_env_set_p2_random_ai_(handle_, p2_random_ai_enabled_ ? 1 : 0);
+    if (kof_env_set_p2_action_ai_)
+        kof_env_set_p2_action_ai_(handle_, p2_ppo_ai_enabled_ ? 1 : 0);
     return true;
 }
 
@@ -321,6 +399,12 @@ void FbneoTrainingCore::unloadLibrary() {
     kof_env_get_last_joypad_for_port_ = nullptr;
     kof_env_set_video_refresh_ = nullptr;
     kof_env_set_p2_random_ai_ = nullptr;
+    kof_env_set_p2_action_ai_ = nullptr;
+    kof_env_set_p2_action_ = nullptr;
+    kof_env_can_queue_p2_action_ = nullptr;
+    kof_env_p2_input_ready_ = nullptr;
+    kof_env_p2_ready_for_action_ = nullptr;
+    kof_env_get_observation_ = nullptr;
     kof_env_run_frames_ = nullptr;
     kof_env_system_ram_size_ = nullptr;
     kof_env_copy_system_ram_ = nullptr;
@@ -339,6 +423,14 @@ void FbneoTrainingCore::advanceFrame() {
         failFromRuntime(QStringLiteral("fbneo_training frame failed"));
         setPaused(true);
         return;
+    }
+
+    if (p2_ppo_ai_enabled_) {
+        ++p2_ppo_frame_counter_;
+        if (p2_ppo_frame_counter_ >= 4) {
+            p2_ppo_frame_counter_ = 0;
+            requestP2PpoAction();
+        }
     }
 
     auto toJoypadInput = [](const kof_env_joypad_state &state) {
@@ -406,7 +498,9 @@ void FbneoTrainingCore::updateJoypad() {
 
     kof_env_set_joypad_(handle_, &state);
 
-    if (!p2_random_ai_enabled_ && kof_env_set_joypad_for_port_) {
+    if (!p2_random_ai_enabled_ &&
+        !p2_ppo_ai_enabled_ &&
+        kof_env_set_joypad_for_port_) {
         auto p2Pressed = [this](unsigned id) -> uint8_t {
             return id < p2_keyboard_joypad_state_.size() && p2_keyboard_joypad_state_[id] ? 1 : 0;
         };
@@ -425,6 +519,114 @@ void FbneoTrainingCore::updateJoypad() {
 
         kof_env_set_joypad_for_port_(handle_, 1, &p2_state);
     }
+}
+
+void FbneoTrainingCore::requestP2PpoAction() {
+    if (!p2_ppo_ai_enabled_ ||
+        !ppo_agent_bridge_ ||
+        !ppo_agent_bridge_->isReady() ||
+        ppo_agent_bridge_->hasPendingRequest() ||
+        !handle_ ||
+        !kof_env_get_observation_) {
+        return;
+    }
+
+    kof_env_observation observation {};
+    if (!kof_env_get_observation_(handle_, &observation))
+        return;
+
+    ppo_agent_bridge_->requestAction(
+        p2ObservationVector(observation),
+        p2ActionMask(observation));
+}
+
+QVector<float> FbneoTrainingCore::p2ObservationVector(
+    const kof_env_observation &observation) const {
+    // Mirror the screen after swapping player roles so the deployed P2 sees
+    // the same left-side coordinate distribution used to train the P1 policy.
+    const int32_t p2_x =
+        observation.p2_has_position ? 320 - observation.p2_x : 0;
+    const int32_t p2_y = observation.p2_has_position ? observation.p2_y : 0;
+    const int32_t p1_x =
+        observation.p1_has_position ? 320 - observation.p1_x : 0;
+    const int32_t p1_y = observation.p1_has_position ? observation.p1_y : 0;
+    const int32_t p2_combo = qMax(0, observation.p2_combo_count);
+    const int32_t p1_combo = qMax(0, observation.p1_combo_count);
+    const int32_t p2_power_value = qMax(0, observation.p2_advanced_power_value);
+    const int32_t p2_power_stocks = qMax(0, observation.p2_advanced_power_stocks);
+    const int32_t p1_power_value = qMax(0, observation.p1_advanced_power_value);
+    const int32_t p1_power_stocks = qMax(0, observation.p1_advanced_power_stocks);
+    const bool input_ready =
+        kof_env_p2_input_ready_ &&
+        kof_env_p2_ready_for_action_ &&
+        kof_env_p2_input_ready_(handle_) != 0 &&
+        kof_env_p2_ready_for_action_(handle_) != 0;
+
+    return {
+        observation.round_time / 99.0f,
+        observation.p2_health / 103.0f,
+        observation.p1_health / 103.0f,
+        observation.p2_power / 128.0f,
+        observation.p1_power / 128.0f,
+        observation.p2_power_state / 128.0f,
+        observation.p1_power_state / 128.0f,
+        p2_power_value / 128.0f,
+        p2_power_stocks / 5.0f,
+        p1_power_value / 128.0f,
+        p1_power_stocks / 5.0f,
+        observation.p2_stun / 255.0f,
+        observation.p1_stun / 255.0f,
+        p2_combo / 99.0f,
+        p1_combo / 99.0f,
+        p2_x / 320.0f,
+        p2_y / 224.0f,
+        p1_x / 320.0f,
+        p1_y / 224.0f,
+        observation.distance_x / 320.0f,
+        -observation.distance_y / 224.0f,
+        static_cast<float>(observation.p2_has_position != 0),
+        static_cast<float>(observation.p1_has_position != 0),
+        static_cast<float>(input_ready),
+        0.0f,
+        0.0f,
+    };
+}
+
+QVector<bool> FbneoTrainingCore::p2ActionMask(
+    const kof_env_observation &observation) const {
+    constexpr int32_t ACTION_COUNT = 29;
+    constexpr int32_t OROCHINAGI_ACTION_ID = 18;
+    constexpr int32_t MUSHIKI_ACTION_ID = 19;
+    QVector<bool> mask(ACTION_COUNT, false);
+    mask[0] = true;
+
+    const bool super_available = observation.p2_advanced_power_stocks >= 1;
+    const bool input_ready =
+        kof_env_p2_input_ready_ &&
+        kof_env_p2_ready_for_action_ &&
+        kof_env_p2_input_ready_(handle_) != 0 &&
+        kof_env_p2_ready_for_action_(handle_) != 0;
+    if (input_ready) {
+        mask.fill(true);
+        if (!super_available) {
+            mask[OROCHINAGI_ACTION_ID] = false;
+            mask[MUSHIKI_ACTION_ID] = false;
+        }
+        return mask;
+    }
+
+    if (!kof_env_can_queue_p2_action_)
+        return mask;
+    for (int32_t action_id = 1; action_id < ACTION_COUNT; ++action_id) {
+        if ((action_id == OROCHINAGI_ACTION_ID ||
+             action_id == MUSHIKI_ACTION_ID) &&
+            !super_available) {
+            continue;
+        }
+        mask[action_id] =
+            kof_env_can_queue_p2_action_(handle_, action_id) != 0;
+    }
+    return mask;
 }
 
 int FbneoTrainingCore::p2ButtonForKey(int key) const {
@@ -464,7 +666,7 @@ bool FbneoTrainingCore::eventFilter(QObject *watched, QEvent *event) {
         if (button >= 0) {
             if (!key_event->isAutoRepeat()) {
                 p2_keyboard_joypad_state_[static_cast<size_t>(button)] = event->type() == QEvent::KeyPress;
-                if (!p2_random_ai_enabled_)
+                if (!p2_random_ai_enabled_ && !p2_ppo_ai_enabled_)
                     updateJoypad();
             }
             return true;
