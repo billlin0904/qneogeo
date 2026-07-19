@@ -30,7 +30,8 @@ PpoAgentBridge::PpoAgentBridge(QObject *parent)
 
 bool PpoAgentBridge::start(const QString &pythonPath,
                            const QString &scriptPath,
-                           const QString &modelPath) {
+                           const QString &modelPath,
+                           const QString &comboModelPath) {
     stop();
     if (!QFileInfo::exists(pythonPath)) {
         setFailure(QStringLiteral("Python executable not found: %1").arg(pythonPath));
@@ -44,6 +45,11 @@ bool PpoAgentBridge::start(const QString &pythonPath,
         setFailure(QStringLiteral("PPO model not found: %1").arg(modelPath));
         return false;
     }
+    if (!QFileInfo::exists(comboModelPath)) {
+        setFailure(
+            QStringLiteral("PPO combo model not found: %1").arg(comboModelPath));
+        return false;
+    }
 
     last_error_.clear();
     stderr_buffer_.clear();
@@ -54,6 +60,8 @@ bool PpoAgentBridge::start(const QString &pythonPath,
         scriptPath,
         QStringLiteral("--model"),
         modelPath,
+        QStringLiteral("--combo-model"),
+        comboModelPath,
         QStringLiteral("--device"),
         QStringLiteral("cpu"),
     });

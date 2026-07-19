@@ -11,7 +11,8 @@ public:
 
     bool start(const QString &pythonPath,
                const QString &scriptPath,
-               const QString &modelPath);
+               const QString &modelPath,
+               const QString &comboModelPath);
     void stop();
     bool isReady() const;
     bool hasPendingRequest() const;

@@ -385,4 +385,5 @@ C:/Users/User/anaconda3/envs/KofAI/python.exe
 [AI]
 PythonExecutable=C:/path/to/python.exe
 P2Model=F:/path/to/model.zip
+P2ComboModel=F:/path/to/combo_model.zip
 ```

@@ -639,6 +639,14 @@ bool MainWindow::configureP2PpoAi(bool enabled) {
                             "trained_models/"
                             "kof98_mixed29_guided_fight_ppo_final.zip")))
             .toString();
+    const QString combo_model_path =
+        settings.value(
+                    QStringLiteral("AI/P2ComboModel"),
+                    QDir(projectRoot()).absoluteFilePath(
+                        QStringLiteral(
+                            "trained_models/"
+                            "kof98_combo29_physical_ppo_final.zip")))
+            .toString();
     const QString script_path =
         QDir(projectRoot()).absoluteFilePath(
             QStringLiteral("tools/kof_ppo_inference_bridge.py"));
@@ -647,7 +655,8 @@ bool MainWindow::configureP2PpoAi(bool enabled) {
         enabled,
         python_path,
         script_path,
-        model_path);
+        model_path,
+        combo_model_path);
 }
 
 void MainWindow::updateCoreActions() {

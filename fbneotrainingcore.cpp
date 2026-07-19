@@ -88,7 +88,8 @@ bool FbneoTrainingCore::startGame(const QString &contentPath,
         !ppo_agent_bridge_->start(
             p2_ppo_python_path_,
             p2_ppo_script_path_,
-            p2_ppo_model_path_)) {
+            p2_ppo_model_path_,
+            p2_ppo_combo_model_path_)) {
         game_loaded_ = false;
         return fail(QStringLiteral("Could not start P2 PPO AI: %1")
                         .arg(ppo_agent_bridge_->lastError()));
@@ -236,10 +237,12 @@ void FbneoTrainingCore::setP2RandomAiEnabled(bool enabled) {
 bool FbneoTrainingCore::setP2PpoAiEnabled(bool enabled,
                                           const QString &pythonPath,
                                           const QString &scriptPath,
-                                          const QString &modelPath) {
+                                          const QString &modelPath,
+                                          const QString &comboModelPath) {
     p2_ppo_python_path_ = pythonPath;
     p2_ppo_script_path_ = scriptPath;
     p2_ppo_model_path_ = modelPath;
+    p2_ppo_combo_model_path_ = comboModelPath;
     p2_ppo_ai_enabled_ = enabled;
     p2_random_ai_enabled_ = false;
     p2_ppo_frame_counter_ = 0;
@@ -260,7 +263,11 @@ bool FbneoTrainingCore::setP2PpoAiEnabled(bool enabled,
         return true;
 
     if (!ppo_agent_bridge_ ||
-        !ppo_agent_bridge_->start(pythonPath, scriptPath, modelPath)) {
+        !ppo_agent_bridge_->start(
+            pythonPath,
+            scriptPath,
+            modelPath,
+            comboModelPath)) {
         p2_ppo_ai_enabled_ = false;
         if (handle_ && kof_env_set_p2_action_ai_)
             kof_env_set_p2_action_ai_(handle_, 0);

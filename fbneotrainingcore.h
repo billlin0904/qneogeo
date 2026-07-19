@@ -32,7 +32,8 @@ public:
     bool setP2PpoAiEnabled(bool enabled,
                            const QString &pythonPath,
                            const QString &scriptPath,
-                           const QString &modelPath);
+                           const QString &modelPath,
+                           const QString &comboModelPath);
 
     QString displayName() const override;
     QString coreFileName() const override;
@@ -105,6 +106,7 @@ private:
     QString p2_ppo_python_path_;
     QString p2_ppo_script_path_;
     QString p2_ppo_model_path_;
+    QString p2_ppo_combo_model_path_;
     std::array<bool, 16> p2_keyboard_joypad_state_ {};
     PpoAgentBridge *ppo_agent_bridge_ = nullptr;
 
