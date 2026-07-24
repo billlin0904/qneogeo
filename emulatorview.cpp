@@ -157,6 +157,16 @@ public:
         update();
     }
 
+    void setMemoryDiagnostics(
+        int32_t player,
+        const EmulatorView::PlayerMemoryDiagnostics &diagnostics) {
+        if (player < 0 || player >= PLAYER_COUNT)
+            return;
+
+        memory_diagnostics_[static_cast<size_t>(player)] = diagnostics;
+        update();
+    }
+
 protected:
     void paintEvent(QPaintEvent *) override {
         if (histories_[0].isEmpty() && histories_[1].isEmpty())
@@ -166,13 +176,25 @@ protected:
         constexpr int32_t PANEL_TOP = 52;
         constexpr int32_t PANEL_WIDTH_WITH_FRAMES = 252;
         constexpr int32_t PANEL_WIDTH_WITHOUT_FRAMES = 144;
-        constexpr int32_t HEADER_HEIGHT = 24;
+        constexpr int32_t BASE_HEADER_HEIGHT = 24;
         constexpr int32_t ROW_HEIGHT = 22;
         constexpr int32_t PANEL_MARGIN_BOTTOM = 12;
+        constexpr int32_t DIAGNOSTICS_PANEL_GAP = 6;
+        constexpr int32_t DIAGNOSTICS_ROW_HEIGHT = 22;
+        constexpr int32_t DIAGNOSTICS_ITEM_COUNT = 12;
         const int32_t panel_width = frame_numbers_enabled_
                                         ? PANEL_WIDTH_WITH_FRAMES
                                         : PANEL_WIDTH_WITHOUT_FRAMES;
-        const int32_t input_x = frame_numbers_enabled_ ? PANEL_X + 116 : PANEL_X + 8;
+        const int32_t left_panel_x = PANEL_X;
+        const int32_t right_panel_x = width() - panel_width - PANEL_X;
+        const int32_t diagnostics_column_count = frame_numbers_enabled_ ? 2 : 1;
+        const int32_t diagnostics_row_count =
+            (DIAGNOSTICS_ITEM_COUNT + diagnostics_column_count - 1) /
+            diagnostics_column_count;
+        const int32_t diagnostics_panel_height =
+            BASE_HEADER_HEIGHT + diagnostics_row_count * DIAGNOSTICS_ROW_HEIGHT;
+        const int32_t history_panel_top =
+            PANEL_TOP + diagnostics_panel_height + DIAGNOSTICS_PANEL_GAP;
 
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing, false);
@@ -182,7 +204,122 @@ protected:
         font.setPixelSize(12);
         font.setBold(true);
 
-        const int32_t available_height = height() - PANEL_TOP - HEADER_HEIGHT - PANEL_MARGIN_BOTTOM;
+        auto rawByteText = [](int32_t value) {
+            if (value < 0)
+                return QStringLiteral("--");
+
+            return QStringLiteral("0x%1 (%2)")
+                .arg(value, 2, 16, QLatin1Char('0'))
+                .arg(value)
+                .toUpper();
+        };
+
+        struct DiagnosticLine {
+            QString name;
+            QString value;
+            QColor color;
+        };
+
+        auto diagnosticLines = [&](int32_t player) {
+            const auto &diagnostics = memory_diagnostics_[static_cast<size_t>(player)];
+            const QString d2d3_value =
+                diagnostics.reaction_d2d3_unsigned < 0
+                    ? QStringLiteral("--")
+                    : QStringLiteral("0x%1 (%2)")
+                          .arg(diagnostics.reaction_d2d3_unsigned,
+                               4,
+                               16,
+                               QLatin1Char('0'))
+                          .arg(diagnostics.reaction_d2d3_signed)
+                          .toUpper();
+            const QString d4_bytes =
+                diagnostics.d4_high < 0 || diagnostics.d5_low < 0
+                    ? QStringLiteral("--/--")
+                    : QStringLiteral("%1/%2")
+                          .arg(diagnostics.d4_high, 2, 16, QLatin1Char('0'))
+                          .arg(diagnostics.d5_low, 2, 16, QLatin1Char('0'))
+                          .toUpper();
+            const QString d4_signed =
+                diagnostics.d4_high < 0 || diagnostics.d5_low < 0
+                    ? QStringLiteral("--")
+                    : QString::number(diagnostics.d4_signed);
+            return std::array<DiagnosticLine, 12> {{
+                { QStringLiteral("STOP"), rawByteText(diagnostics.hit_guard_stop), QColor(255, 213, 79) },
+                { QStringLiteral("D2"), rawByteText(diagnostics.reaction_d2), QColor(0, 255, 140) },
+                { QStringLiteral("D3"), rawByteText(diagnostics.reaction_d3), QColor(0, 255, 140) },
+                { QStringLiteral("D2:3"), d2d3_value, QColor(128, 255, 170) },
+                { QStringLiteral("E0"), rawByteText(diagnostics.reaction_e0), QColor(128, 222, 234) },
+                { QStringLiteral("E1"), rawByteText(diagnostics.reaction_e1), QColor(128, 222, 234) },
+                { QStringLiteral("E2"), rawByteText(diagnostics.reaction_e2), QColor(128, 222, 234) },
+                { QStringLiteral("E3"), rawByteText(diagnostics.reaction_e3), QColor(64, 224, 255) },
+                { QStringLiteral("D4/5"), d4_bytes, QColor(224, 160, 255) },
+                { QStringLiteral("D4S"), d4_signed, QColor(224, 160, 255) },
+                { QStringLiteral("E7"), rawByteText(diagnostics.recovery_control_e7), QColor(255, 171, 64) },
+                { QStringLiteral("GUARD"), rawByteText(diagnostics.guard_crush), QColor(255, 128, 128) },
+            }};
+        };
+
+        auto drawDiagnosticsPanel = [&](int32_t player, int32_t panel_x) {
+            const auto lines = diagnosticLines(player);
+            const QRect panel_rect(panel_x,
+                                   PANEL_TOP,
+                                   panel_width,
+                                   diagnostics_panel_height);
+            painter.fillRect(panel_rect, QColor(0, 0, 0, 220));
+            painter.setPen(QPen(QColor(255, 255, 255, 100), 1));
+            painter.drawRect(panel_rect.adjusted(0, 0, -1, -1));
+            painter.setFont(font);
+            painter.setPen(Qt::white);
+            painter.drawText(QRect(panel_x + 8,
+                                   PANEL_TOP,
+                                   panel_width - 16,
+                                   BASE_HEADER_HEIGHT),
+                             Qt::AlignVCenter | Qt::AlignLeft,
+                             QStringLiteral("P%1 RAM").arg(player + 1));
+
+            QFont value_font = font;
+            value_font.setPixelSize(11);
+            painter.setFont(value_font);
+            const int32_t column_width = panel_width / diagnostics_column_count;
+            for (int32_t index = 0; index < static_cast<int32_t>(lines.size()); ++index) {
+                const auto &line = lines[static_cast<size_t>(index)];
+                const int32_t column = index / diagnostics_row_count;
+                const int32_t row = index % diagnostics_row_count;
+                const int32_t column_x = panel_x + column * column_width;
+                const int32_t row_y = PANEL_TOP + BASE_HEADER_HEIGHT +
+                                      row * DIAGNOSTICS_ROW_HEIGHT;
+                if ((row & 1) != 0) {
+                    painter.fillRect(QRect(column_x + 1,
+                                           row_y,
+                                           column_width - 2,
+                                           DIAGNOSTICS_ROW_HEIGHT),
+                                     QColor(255, 255, 255, 12));
+                }
+                painter.setPen(line.color);
+                painter.drawText(QRect(column_x + 7,
+                                       row_y,
+                                       43,
+                                       DIAGNOSTICS_ROW_HEIGHT),
+                                 Qt::AlignVCenter | Qt::AlignLeft,
+                                 line.name);
+                painter.drawText(QRect(column_x + 50,
+                                       row_y,
+                                       column_width - 57,
+                                       DIAGNOSTICS_ROW_HEIGHT),
+                                 Qt::AlignVCenter | Qt::AlignRight,
+                                 line.value);
+            }
+            if (diagnostics_column_count > 1) {
+                painter.setPen(QPen(QColor(255, 255, 255, 48), 1));
+                painter.drawLine(panel_x + column_width,
+                                 PANEL_TOP + BASE_HEADER_HEIGHT,
+                                 panel_x + column_width,
+                                 PANEL_TOP + diagnostics_panel_height - 1);
+            }
+        };
+
+        const int32_t available_height =
+            height() - history_panel_top - BASE_HEADER_HEIGHT - PANEL_MARGIN_BOTTOM;
         const int32_t max_visible_count = std::max<int32_t>(1, available_height / ROW_HEIGHT);
         auto drawHistory = [&](const QVector<Entry> &history, int32_t player, int32_t panel_x) {
             if (history.isEmpty())
@@ -193,16 +330,19 @@ protected:
                 max_visible_count);
             const int32_t first_visible = static_cast<int32_t>(history.size()) - visible_count;
             const QRect panel_rect(panel_x,
-                                   PANEL_TOP,
+                                   history_panel_top,
                                    panel_width,
-                                   HEADER_HEIGHT + visible_count * ROW_HEIGHT);
+                                   BASE_HEADER_HEIGHT + visible_count * ROW_HEIGHT);
 
             painter.fillRect(panel_rect, QColor(0, 0, 0, 176));
             painter.setPen(QPen(QColor(255, 255, 255, 100), 1));
             painter.drawRect(panel_rect.adjusted(0, 0, -1, -1));
             painter.setFont(font);
             painter.setPen(Qt::white);
-            painter.drawText(QRect(panel_x + 8, PANEL_TOP, panel_width - 16, HEADER_HEIGHT),
+            painter.drawText(QRect(panel_x + 8,
+                                   history_panel_top,
+                                   panel_width - 16,
+                                   BASE_HEADER_HEIGHT),
                              Qt::AlignVCenter | Qt::AlignLeft,
                              frame_numbers_enabled_
                                  ? QStringLiteral("P%1 INPUT / FRAME").arg(player + 1)
@@ -211,7 +351,8 @@ protected:
             const int32_t input_x = frame_numbers_enabled_ ? panel_x + 116 : panel_x + 8;
             for (int32_t row = 0; row < visible_count; ++row) {
                 const Entry &entry = history.at(first_visible + row);
-                const int32_t row_y = PANEL_TOP + HEADER_HEIGHT + row * ROW_HEIGHT;
+                const int32_t row_y =
+                    history_panel_top + BASE_HEADER_HEIGHT + row * ROW_HEIGHT;
                 if ((row & 1) != 0)
                     painter.fillRect(QRect(panel_x + 1, row_y, panel_width - 2, ROW_HEIGHT),
                                      QColor(255, 255, 255, 12));
@@ -244,8 +385,10 @@ protected:
             }
         };
 
-        drawHistory(histories_[0], 0, PANEL_X);
-        drawHistory(histories_[1], 1, width() - panel_width - PANEL_X);
+        drawDiagnosticsPanel(0, left_panel_x);
+        drawDiagnosticsPanel(1, right_panel_x);
+        drawHistory(histories_[0], 0, left_panel_x);
+        drawHistory(histories_[1], 1, right_panel_x);
     }
 
 private:
@@ -312,6 +455,7 @@ private:
     }
 
     std::array<QVector<Entry>, PLAYER_COUNT> histories_;
+    std::array<EmulatorView::PlayerMemoryDiagnostics, PLAYER_COUNT> memory_diagnostics_;
     bool frame_numbers_enabled_ = true;
 };
 
@@ -454,6 +598,14 @@ void EmulatorView::submitInputFrame(int32_t player,
         overlay->show();
         overlay->raise();
     }
+}
+
+void EmulatorView::setPlayerMemoryDiagnostics(
+    int32_t player,
+    const PlayerMemoryDiagnostics &diagnostics) {
+    auto *overlay = static_cast<InputHistoryOverlayWidget *>(input_overlay_widget_);
+    if (overlay)
+        overlay->setMemoryDiagnostics(player, diagnostics);
 }
 
 void EmulatorView::clearInputHistory() {

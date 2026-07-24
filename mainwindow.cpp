@@ -1,4 +1,5 @@
 #include "inputmappingwidget.h"
+#include "koframtracelogger.h"
 #include "emulatorview.h"
 #include "fbneolibretrocore.h"
 #include "fbneotrainingcore.h"
@@ -15,6 +16,7 @@
 #include <QCheckBox>
 #include <QCoreApplication>
 #include <QDir>
+#include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QEvent>
@@ -52,8 +54,11 @@ MainWindow::MainWindow(QWidget *parent)
     , pause_when_inactive_action_(nullptr)
     , gameplay_with_ai_p2_action_(nullptr)
     , show_fps_action_(nullptr)
+    , show_health_action_(nullptr)
+    , show_power_action_(nullptr)
     , show_input_history_action_(nullptr)
     , show_hitboxes_action_(nullptr)
+    , record_ram_trace_action_(nullptr)
     , neocd_core_action_(nullptr)
     , fbneo_core_action_(nullptr)
     , fbneo_training_core_action_(nullptr)
@@ -63,7 +68,8 @@ MainWindow::MainWindow(QWidget *parent)
     , fps_label_(nullptr)
     , health_label_(nullptr)
     , combo_label_(nullptr)
-    , power_label_(nullptr) {
+    , power_label_(nullptr)
+    , ram_trace_logger_(std::make_unique<KofRamTraceLogger>()) {
     ui_->setupUi(this);
     setWindowTitle(QStringLiteral("qneogeo"));
 
@@ -235,17 +241,36 @@ MainWindow::MainWindow(QWidget *parent)
     auto *tools_menu = menuBar()->addMenu(QStringLiteral("Tools"));
     gameplay_with_ai_p2_action_ = tools_menu->addAction(QStringLiteral("GamePlay With AI (P2)"));
     gameplay_with_ai_p2_action_->setCheckable(true);
+    gameplay_ai_pure_policy_action_ = tools_menu->addAction(QStringLiteral("P2 AI Pure Policy"));
+    gameplay_ai_pure_policy_action_->setCheckable(true);
     {
         QSettings settings(inputConfigPath(), QSettings::IniFormat);
         gameplay_with_ai_p2_action_->setChecked(
             settings.value(QStringLiteral("AI/GamePlayWithP2"), false).toBool());
+        gameplay_ai_pure_policy_action_->setChecked(
+            settings.value(QStringLiteral("AI/P2PurePolicy"), true).toBool());
     }
     auto *memory_search_action = tools_menu->addAction(QStringLiteral("Memory View"));
+    record_ram_trace_action_ = tools_menu->addAction(QStringLiteral("Record KOF98 RAM Trace"));
+    record_ram_trace_action_->setCheckable(true);
 
     auto *video_menu = menuBar()->addMenu(QStringLiteral("Video"));
     show_fps_action_ = video_menu->addAction(QStringLiteral("Show FPS"));
     show_fps_action_->setCheckable(true);
     show_fps_action_->setChecked(true);
+    show_health_action_ = video_menu->addAction(QStringLiteral("Show Player Health"));
+    show_health_action_->setCheckable(true);
+    show_power_action_ = video_menu->addAction(QStringLiteral("Show Player Power"));
+    show_power_action_->setCheckable(true);
+    {
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        show_health_action_->setChecked(
+            settings.value(QStringLiteral("Video/ShowPlayerHealth"), true).toBool());
+        show_power_action_->setChecked(
+            settings.value(QStringLiteral("Video/ShowPlayerPower"), true).toBool());
+        health_label_->setVisible(show_health_action_->isChecked());
+        power_label_->setVisible(show_power_action_->isChecked());
+    }
     show_input_history_action_ = video_menu->addAction(QStringLiteral("Show Input History"));
     show_input_history_action_->setCheckable(true);
     show_input_history_action_->setChecked(true);
@@ -359,6 +384,8 @@ MainWindow::MainWindow(QWidget *parent)
         });
     }
     connect(memory_search_action, &QAction::triggered, this, &MainWindow::showMemorySearchDialog);
+    connect(record_ram_trace_action_, &QAction::toggled,
+            this, &MainWindow::setRamTraceEnabled);
     connect(gameplay_with_ai_p2_action_, &QAction::toggled, this, [this](bool enabled) {
         QSettings settings(inputConfigPath(), QSettings::IniFormat);
         settings.setValue(QStringLiteral("AI/GamePlayWithP2"), enabled);
@@ -380,11 +407,48 @@ MainWindow::MainWindow(QWidget *parent)
                                      : QStringLiteral("GamePlay With AI (P2) disabled"),
                                  2500);
     });
+    connect(gameplay_ai_pure_policy_action_, &QAction::toggled, this, [this](bool enabled) {
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        settings.setValue(QStringLiteral("AI/P2PurePolicy"), enabled);
+        settings.sync();
+        if (!gameplay_with_ai_p2_action_->isChecked())
+            return;
+
+        if (!configureP2PpoAi(true)) {
+            const QSignalBlocker blocker(gameplay_ai_pure_policy_action_);
+            gameplay_ai_pure_policy_action_->setChecked(!enabled);
+            settings.setValue(QStringLiteral("AI/P2PurePolicy"), !enabled);
+            settings.sync();
+            configureP2PpoAi(true);
+            QMessageBox::critical(
+                this,
+                QStringLiteral("P2 AI Pure Policy"),
+                core_ ? core_->lastError()
+                      : QStringLiteral("FBNeo Training core is not active."));
+            return;
+        }
+        statusBar()->showMessage(
+            enabled
+                ? QStringLiteral("P2 AI uses one pure Fight policy")
+                : QStringLiteral("P2 AI combo switching and overrides enabled"),
+            2500);
+    });
 
     connect(show_fps_action_, &QAction::toggled, fps_label_, &QLabel::setVisible);
-    connect(show_fps_action_, &QAction::toggled, health_label_, &QLabel::setVisible);
-    connect(show_fps_action_, &QAction::toggled, combo_label_, &QLabel::setVisible);
-    connect(show_fps_action_, &QAction::toggled, power_label_, &QLabel::setVisible);
+    connect(show_health_action_, &QAction::toggled, this, [this](bool enabled) {
+        health_label_->setVisible(enabled);
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        settings.setValue(QStringLiteral("Video/ShowPlayerHealth"), enabled);
+        settings.sync();
+        updateOverlayLabelPositions();
+    });
+    connect(show_power_action_, &QAction::toggled, this, [this](bool enabled) {
+        power_label_->setVisible(enabled);
+        QSettings settings(inputConfigPath(), QSettings::IniFormat);
+        settings.setValue(QStringLiteral("Video/ShowPlayerPower"), enabled);
+        settings.sync();
+        updateOverlayLabelPositions();
+    });
     connect(show_input_history_action_, &QAction::toggled,
             emulator_view_, &EmulatorView::setInputOverlayEnabled);
     connect(show_input_frame_numbers_action_, &QAction::toggled, this, [this](bool enabled) {
@@ -415,6 +479,8 @@ MainWindow::MainWindow(QWidget *parent)
 }
 
 MainWindow::~MainWindow() {
+    stopRamTrace();
+
     if (core_) {
         core_->stop();
         delete core_;
@@ -444,6 +510,8 @@ bool MainWindow::event(QEvent *event) {
             auto_paused_for_focus_loss_ = false;
             core_->setPaused(false);
         }
+    } else if (event->type() == QEvent::Resize) {
+        QTimer::singleShot(0, this, &MainWindow::updateOverlayLabelPositions);
     }
 
     return QMainWindow::event(event);
@@ -542,6 +610,7 @@ void MainWindow::setCoreKind(CoreKind kind) {
     }
 
     switching_core_ = true;
+    stopRamTrace(QStringLiteral("RAM trace stopped because the core changed"));
 
     if (memory_search_dialog_)
         memory_search_dialog_->setCore(nullptr);
@@ -656,7 +725,8 @@ bool MainWindow::configureP2PpoAi(bool enabled) {
         python_path,
         script_path,
         model_path,
-        combo_model_path);
+        combo_model_path,
+        gameplay_ai_pure_policy_action_->isChecked());
 }
 
 void MainWindow::updateCoreActions() {
@@ -848,6 +918,8 @@ void MainWindow::autoLoadStartupState() {
 }
 
 void MainWindow::loadGame(const QString &path) {
+    stopRamTrace(QStringLiteral("RAM trace stopped because the game changed"));
+
     if (!core_->loadCore(corePath()) || !core_->startGame(path, systemDirectory(), saveDirectory())) {
         QMessageBox::critical(this,
                               QStringLiteral("qneogeo"),
@@ -1046,15 +1118,35 @@ void MainWindow::updateInputOverlay() {
 
 void MainWindow::updateKof98Overlay() {
     if (!emulator_view_ || !core_ || !core_->isGameLoaded()) {
-        if (emulator_view_)
+        if (emulator_view_) {
             emulator_view_->setHitboxOverlay({}, {});
+            emulator_view_->setPlayerMemoryDiagnostics(0, {});
+            emulator_view_->setPlayerMemoryDiagnostics(1, {});
+        }
         return;
     }
 
     QByteArray ram;
     if (!core_->readSystemRam(ram)) {
         emulator_view_->setHitboxOverlay({}, {});
+        emulator_view_->setPlayerMemoryDiagnostics(0, {});
+        emulator_view_->setPlayerMemoryDiagnostics(1, {});
         return;
+    }
+
+    if (ram_trace_logger_ && ram_trace_logger_->isActive()) {
+        QString error;
+        if (!ram_trace_logger_->writeFrame(core_->emulatedFrameCount(),
+                                           ram,
+                                           emulator_view_->sourceSize(),
+                                           core_->lastP1Input(),
+                                           core_->lastP2Input(),
+                                           error)) {
+            stopRamTrace();
+            QMessageBox::warning(this,
+                                 QStringLiteral("KOF98 RAM Trace"),
+                                 error);
+        }
     }
 
     GameMemReader mem_reader(std::move(ram), emulator_view_->sourceSize());
@@ -1112,23 +1204,136 @@ void MainWindow::updateKof98Overlay() {
         power_label_->adjustSize();
     }
 
+    auto toViewDiagnostics = [](const game_memory::PlayerReactionDebugState &state) {
+        EmulatorView::PlayerMemoryDiagnostics diagnostics;
+        diagnostics.hit_guard_stop = state.hit_guard_stop;
+        diagnostics.reaction_d2 = state.reaction_d2;
+        diagnostics.reaction_d3 = state.reaction_d3;
+        diagnostics.reaction_d2d3_unsigned = state.reaction_d2d3_unsigned;
+        diagnostics.reaction_d2d3_signed = state.reaction_d2d3_signed;
+        diagnostics.reaction_e0 = state.reaction_e0;
+        diagnostics.reaction_e1 = state.reaction_e1;
+        diagnostics.reaction_e2 = state.reaction_e2;
+        diagnostics.reaction_e3 = state.reaction_e3;
+        diagnostics.d4_high = state.d4_high;
+        diagnostics.d5_low = state.d5_low;
+        diagnostics.d4_signed = state.d4_signed;
+        diagnostics.recovery_control_e7 = state.recovery_control_e7;
+        diagnostics.guard_crush = state.guard_crush;
+        return diagnostics;
+    };
+
+    const auto p1_diagnostics = toViewDiagnostics(mem_reader.readP1ReactionDebugState());
+    emulator_view_->setPlayerMemoryDiagnostics(0, p1_diagnostics);
+
+    const auto p2_diagnostics = toViewDiagnostics(mem_reader.readP2ReactionDebugState());
+    emulator_view_->setPlayerMemoryDiagnostics(1, p2_diagnostics);
+
     updateOverlayLabelPositions();
 }
 
 void MainWindow::updateOverlayLabelPositions() {
-    if (!fps_label_)
+    if (!fps_label_ || !emulator_view_)
         return;
 
-    int32_t x = fps_label_->x() + fps_label_->width() + 8;
-    const int32_t y = fps_label_->y();
-    if (health_label_) {
-        health_label_->move(x, y);
-        x = health_label_->x() + health_label_->width() + 8;
+    constexpr int32_t LABEL_SPACING = 8;
+    constexpr int32_t OVERLAY_MARGIN = 10;
+    fps_label_->move(OVERLAY_MARGIN, OVERLAY_MARGIN);
+
+    const std::array<QLabel *, 3> status_labels {{
+        health_label_,
+        combo_label_,
+        power_label_,
+    }};
+    int32_t visible_count = 0;
+    int32_t total_width = 0;
+    for (QLabel *label : status_labels) {
+        if (!label || !label->isVisible())
+            continue;
+
+        total_width += label->width();
+        ++visible_count;
     }
-    if (combo_label_)
-        combo_label_->move(x, y);
-    if (combo_label_)
-        x = combo_label_->x() + combo_label_->width() + 8;
-    if (power_label_)
-        power_label_->move(x, y);
+    if (visible_count == 0)
+        return;
+
+    total_width += (visible_count - 1) * LABEL_SPACING;
+    int32_t x = std::max(OVERLAY_MARGIN,
+                         (emulator_view_->width() - total_width) / 2);
+    int32_t y = OVERLAY_MARGIN;
+    const int32_t fps_right = fps_label_->isVisible()
+        ? fps_label_->geometry().right() + LABEL_SPACING
+        : OVERLAY_MARGIN;
+    if (x < fps_right)
+        y = fps_label_->geometry().bottom() + LABEL_SPACING;
+
+    for (QLabel *label : status_labels) {
+        if (!label || !label->isVisible())
+            continue;
+
+        label->move(x, y);
+        x += label->width() + LABEL_SPACING;
+    }
+}
+
+void MainWindow::setRamTraceEnabled(bool enabled) {
+    if (!ram_trace_logger_ || !record_ram_trace_action_)
+        return;
+
+    if (!enabled) {
+        const QString path = ram_trace_logger_->filePath();
+        stopRamTrace(path.isEmpty()
+                         ? QString()
+                         : QStringLiteral("RAM trace saved: %1")
+                               .arg(QDir::toNativeSeparators(path)));
+        return;
+    }
+
+    if (!core_ || !core_->isGameLoaded()) {
+        const QSignalBlocker blocker(record_ram_trace_action_);
+        record_ram_trace_action_->setChecked(false);
+        QMessageBox::information(this,
+                                 QStringLiteral("KOF98 RAM Trace"),
+                                 QStringLiteral("請先載入 KOF98，再開始逐幀記錄。"));
+        return;
+    }
+
+    QString game_name = gameDisplayName(current_game_path_);
+    if (game_name.isEmpty())
+        game_name = QStringLiteral("kof98");
+    game_name.replace(QRegularExpression(QStringLiteral(R"([^A-Za-z0-9_-]+)")),
+                      QStringLiteral("_"));
+
+    const QString timestamp = QDateTime::currentDateTime().toString(
+        QStringLiteral("yyyyMMdd_HHmmss"));
+    const QString path = QDir(projectRoot()).absoluteFilePath(
+        QStringLiteral("logs/ram_traces/%1_%2.csv").arg(game_name, timestamp));
+
+    QString error;
+    if (!ram_trace_logger_->start(path, error)) {
+        const QSignalBlocker blocker(record_ram_trace_action_);
+        record_ram_trace_action_->setChecked(false);
+        QMessageBox::warning(this,
+                             QStringLiteral("KOF98 RAM Trace"),
+                             error);
+        return;
+    }
+
+    statusBar()->showMessage(
+        QStringLiteral("Recording KOF98 RAM trace: %1")
+            .arg(QDir::toNativeSeparators(path)),
+        5000);
+}
+
+void MainWindow::stopRamTrace(const QString &status_message) {
+    if (ram_trace_logger_)
+        ram_trace_logger_->stop();
+
+    if (record_ram_trace_action_ && record_ram_trace_action_->isChecked()) {
+        const QSignalBlocker blocker(record_ram_trace_action_);
+        record_ram_trace_action_->setChecked(false);
+    }
+
+    if (!status_message.isEmpty() && statusBar())
+        statusBar()->showMessage(status_message, 5000);
 }

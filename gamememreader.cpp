@@ -135,6 +135,46 @@ int32_t GameMemReader::readP2ComboCount() const {
     return makeCore(ram_, source_size_).readP2ComboCount();
 }
 
+int32_t GameMemReader::readP1HitGuardStopRaw() const {
+    return makeCore(ram_, source_size_).readP1HitGuardStopRaw();
+}
+
+int32_t GameMemReader::readP2HitGuardStopRaw() const {
+    return makeCore(ram_, source_size_).readP2HitGuardStopRaw();
+}
+
+int32_t GameMemReader::readP1RecoveryControlRaw() const {
+    return makeCore(ram_, source_size_).readP1RecoveryControlRaw();
+}
+
+int32_t GameMemReader::readP2RecoveryControlRaw() const {
+    return makeCore(ram_, source_size_).readP2RecoveryControlRaw();
+}
+
+int32_t GameMemReader::readP1BlockStateRaw() const {
+    return makeCore(ram_, source_size_).readP1BlockStateRaw();
+}
+
+int32_t GameMemReader::readP2BlockStateRaw() const {
+    return makeCore(ram_, source_size_).readP2BlockStateRaw();
+}
+
+int32_t GameMemReader::readP1ReactionD2Raw() const {
+    return makeCore(ram_, source_size_).readP1ReactionD2Raw();
+}
+
+int32_t GameMemReader::readP2ReactionD2Raw() const {
+    return makeCore(ram_, source_size_).readP2ReactionD2Raw();
+}
+
+game_memory::PlayerReactionDebugState GameMemReader::readP1ReactionDebugState() const {
+    return makeCore(ram_, source_size_).readP1ReactionDebugState();
+}
+
+game_memory::PlayerReactionDebugState GameMemReader::readP2ReactionDebugState() const {
+    return makeCore(ram_, source_size_).readP2ReactionDebugState();
+}
+
 bool GameMemReader::readP1Position(QPoint &position) const {
     game_memory::Point core_position;
     if (!makeCore(ram_, source_size_).readP1Position(core_position))

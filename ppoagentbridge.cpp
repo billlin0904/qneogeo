@@ -31,7 +31,8 @@ PpoAgentBridge::PpoAgentBridge(QObject *parent)
 bool PpoAgentBridge::start(const QString &pythonPath,
                            const QString &scriptPath,
                            const QString &modelPath,
-                           const QString &comboModelPath) {
+                           const QString &comboModelPath,
+                           bool purePolicy) {
     stop();
     if (!QFileInfo::exists(pythonPath)) {
         setFailure(QStringLiteral("Python executable not found: %1").arg(pythonPath));
@@ -45,7 +46,7 @@ bool PpoAgentBridge::start(const QString &pythonPath,
         setFailure(QStringLiteral("PPO model not found: %1").arg(modelPath));
         return false;
     }
-    if (!QFileInfo::exists(comboModelPath)) {
+    if (!purePolicy && !QFileInfo::exists(comboModelPath)) {
         setFailure(
             QStringLiteral("PPO combo model not found: %1").arg(comboModelPath));
         return false;
@@ -55,16 +56,21 @@ bool PpoAgentBridge::start(const QString &pythonPath,
     stderr_buffer_.clear();
     stdout_buffer_.clear();
     process_.setProgram(pythonPath);
-    process_.setArguments({
+    QStringList arguments {
         QStringLiteral("-u"),
         scriptPath,
         QStringLiteral("--model"),
         modelPath,
-        QStringLiteral("--combo-model"),
-        comboModelPath,
         QStringLiteral("--device"),
         QStringLiteral("cpu"),
-    });
+    };
+    if (purePolicy) {
+        arguments.append(QStringLiteral("--pure-policy"));
+    } else {
+        arguments.append(QStringLiteral("--combo-model"));
+        arguments.append(comboModelPath);
+    }
+    process_.setArguments(arguments);
     process_.start();
     if (!process_.waitForStarted(3000)) {
         setFailure(process_.errorString());
@@ -75,6 +81,8 @@ bool PpoAgentBridge::start(const QString &pythonPath,
 
 void PpoAgentBridge::stop() {
     ready_ = false;
+    observation_size_ = 0;
+    observation_schema_id_.clear();
     pending_request_id_ = 0;
     stdout_buffer_.clear();
     if (process_.state() == QProcess::NotRunning)
@@ -91,6 +99,14 @@ bool PpoAgentBridge::isReady() const {
     return ready_ && process_.state() == QProcess::Running;
 }
 
+int PpoAgentBridge::observationSize() const {
+    return observation_size_;
+}
+
+QString PpoAgentBridge::observationSchemaId() const {
+    return observation_schema_id_;
+}
+
 bool PpoAgentBridge::hasPendingRequest() const {
     return pending_request_id_ != 0;
 }
@@ -99,6 +115,13 @@ bool PpoAgentBridge::requestAction(const QVector<float> &observation,
                                    const QVector<bool> &mask) {
     if (!isReady() || hasPendingRequest())
         return false;
+    if (observation.size() != observation_size_) {
+        setFailure(
+            QStringLiteral("PPO observation size mismatch: expected %1, got %2.")
+                .arg(observation_size_)
+                .arg(observation.size()));
+        return false;
+    }
 
     QJsonArray observation_json;
     for (float value : observation)
@@ -161,15 +184,31 @@ void PpoAgentBridge::processMessage(const QByteArray &line) {
     if (type == QStringLiteral("ready")) {
         const int observation_size =
             object.value(QStringLiteral("observation_size")).toInt();
+        const QString observation_schema_id =
+            object.value(QStringLiteral("observation_schema_id")).toString();
         const int action_count = object.value(QStringLiteral("action_count")).toInt();
-        if (observation_size != 26 || action_count != 29) {
+        const QString schema_v1 =
+            QStringLiteral("kof98-observation-v1-26");
+        const QString schema_v2 =
+            QStringLiteral("kof98-observation-v2-140");
+        const QString schema_v3 =
+            QStringLiteral("kof98-observation-v3-event-140");
+        const bool schema_matches_size =
+            (observation_size == 26 && observation_schema_id == schema_v1) ||
+            (observation_size == 140 &&
+             (observation_schema_id == schema_v2 ||
+              observation_schema_id == schema_v3));
+        if (!schema_matches_size || action_count != 29) {
             setFailure(
-                QStringLiteral("PPO model ABI mismatch: expected 26 observations "
-                               "and 29 actions, got %1 and %2.")
+                QStringLiteral("PPO model ABI mismatch: unsupported schema "
+                               "%1 with %2 observations and %3 actions.")
+                    .arg(observation_schema_id)
                     .arg(observation_size)
                     .arg(action_count));
             return;
         }
+        observation_size_ = observation_size;
+        observation_schema_id_ = observation_schema_id;
         ready_ = true;
         emit ready();
         return;
@@ -197,6 +236,8 @@ void PpoAgentBridge::setFailure(const QString &message) {
     const bool changed = last_error_ != message;
     last_error_ = message;
     ready_ = false;
+    observation_size_ = 0;
+    observation_schema_id_.clear();
     pending_request_id_ = 0;
     if (changed)
         emit failed(message);

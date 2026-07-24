@@ -33,7 +33,8 @@ public:
                            const QString &pythonPath,
                            const QString &scriptPath,
                            const QString &modelPath,
-                           const QString &comboModelPath);
+                           const QString &comboModelPath,
+                           bool purePolicy);
 
     QString displayName() const override;
     QString coreFileName() const override;
@@ -66,6 +67,12 @@ private:
     using kof_env_p2_input_ready_t = int (*)(kof_env_handle);
     using kof_env_p2_ready_for_action_t = int (*)(kof_env_handle);
     using kof_env_get_observation_t = int (*)(kof_env_handle, kof_env_observation *);
+    using kof_env_get_strategy_state_v1_t =
+        int (*)(kof_env_handle, kof_env_strategy_state_v1 *);
+    using kof_env_get_combat_timing_state_v1_t =
+        int (*)(kof_env_handle, kof_env_combat_timing_state_v1 *);
+    using kof_env_get_step_events_v5_t =
+        int (*)(kof_env_handle, kof_env_step_events_v5 *);
     using kof_env_run_frames_t = int (*)(kof_env_handle, int32_t);
     using kof_env_system_ram_size_t = uint32_t (*)(kof_env_handle);
     using kof_env_copy_system_ram_t = int (*)(kof_env_handle, void *, uint32_t);
@@ -82,9 +89,11 @@ private:
     void unloadLibrary();
     void advanceFrame();
     void updateJoypad();
+    void updateP2GenericCombatState();
     void requestP2PpoAction();
-    QVector<float> p2ObservationVector(const kof_env_observation &observation) const;
+    QVector<float> p2ObservationVector(const kof_env_observation &observation);
     QVector<bool> p2ActionMask(const kof_env_observation &observation) const;
+    void resetPpoObservationState();
     int p2ButtonForKey(int key) const;
     void handleVideoFrame(const void *data, unsigned width, unsigned height, size_t pitch);
 
@@ -93,6 +102,35 @@ private:
                                      unsigned height,
                                      size_t pitch,
                                      void *userData);
+
+    enum class DefensePhase : int32_t {
+        Neutral = 0,
+        Pressure = 1,
+        BlockContact = 2,
+        BlockReaction = 3,
+        PostBlock = 4,
+    };
+
+    enum class ConfirmPhase : int32_t {
+        Neutral = 0,
+        StarterPending = 1,
+        StarterHit = 2,
+        StarterBlocked = 3,
+        FollowupStarted = 4,
+    };
+
+    struct P2GenericCombatState {
+        DefensePhase defense_phase = DefensePhase::Neutral;
+        ConfirmPhase confirm_phase = ConfirmPhase::Neutral;
+        int32_t defense_phase_age_frames = 0;
+        int32_t confirm_phase_age_frames = 0;
+        int32_t starter_action_id = -1;
+        uint32_t starter_action_serial = 0;
+        int32_t pending_followup_action_id = -1;
+        uint32_t pending_followup_action_serial = 0;
+        bool queue_window_open = false;
+        bool last_action_accepted = false;
+    };
 
     QLibrary library_;
     QTimer frame_timer_;
@@ -103,10 +141,19 @@ private:
     bool p2_random_ai_enabled_ = false;
     bool p2_ppo_ai_enabled_ = false;
     int32_t p2_ppo_frame_counter_ = 0;
+    P2GenericCombatState p2_generic_combat_state_;
+    kof_env_combat_timing_state_v1 p2_combat_timing_state_ {};
+    bool has_p2_combat_timing_state_ = false;
+    uint32_t p2_event_epoch_ = 0;
+    bool has_p2_event_epoch_ = false;
+    bool p2_last_action_accepted_ = false;
+    kof_env_observation ppo_previous_observation_ {};
+    bool has_ppo_previous_observation_ = false;
     QString p2_ppo_python_path_;
     QString p2_ppo_script_path_;
     QString p2_ppo_model_path_;
     QString p2_ppo_combo_model_path_;
+    bool p2_ppo_pure_policy_ = true;
     std::array<bool, 16> p2_keyboard_joypad_state_ {};
     PpoAgentBridge *ppo_agent_bridge_ = nullptr;
 
@@ -128,6 +175,10 @@ private:
     kof_env_p2_input_ready_t kof_env_p2_input_ready_ = nullptr;
     kof_env_p2_ready_for_action_t kof_env_p2_ready_for_action_ = nullptr;
     kof_env_get_observation_t kof_env_get_observation_ = nullptr;
+    kof_env_get_strategy_state_v1_t kof_env_get_strategy_state_v1_ = nullptr;
+    kof_env_get_combat_timing_state_v1_t
+        kof_env_get_combat_timing_state_v1_ = nullptr;
+    kof_env_get_step_events_v5_t kof_env_get_step_events_v5_ = nullptr;
     kof_env_run_frames_t kof_env_run_frames_ = nullptr;
     kof_env_system_ram_size_t kof_env_system_ram_size_ = nullptr;
     kof_env_copy_system_ram_t kof_env_copy_system_ram_ = nullptr;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "emulatorview.h"
+#include "gamememreadercore.h"
 
 #include <QByteArray>
 #include <QPoint>
@@ -38,6 +39,16 @@ public:
     int32_t readP2Stun() const;
     int32_t readP1ComboCount() const;
     int32_t readP2ComboCount() const;
+    int32_t readP1HitGuardStopRaw() const;
+    int32_t readP2HitGuardStopRaw() const;
+    int32_t readP1RecoveryControlRaw() const;
+    int32_t readP2RecoveryControlRaw() const;
+    int32_t readP1BlockStateRaw() const;
+    int32_t readP2BlockStateRaw() const;
+    int32_t readP1ReactionD2Raw() const;
+    int32_t readP2ReactionD2Raw() const;
+    game_memory::PlayerReactionDebugState readP1ReactionDebugState() const;
+    game_memory::PlayerReactionDebugState readP2ReactionDebugState() const;
     bool readP1Position(QPoint &position) const;
     bool readP2Position(QPoint &position) const;
 

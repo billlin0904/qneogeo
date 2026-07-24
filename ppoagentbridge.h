@@ -12,9 +12,12 @@ public:
     bool start(const QString &pythonPath,
                const QString &scriptPath,
                const QString &modelPath,
-               const QString &comboModelPath);
+               const QString &comboModelPath,
+               bool purePolicy);
     void stop();
     bool isReady() const;
+    int observationSize() const;
+    QString observationSchemaId() const;
     bool hasPendingRequest() const;
     bool requestAction(const QVector<float> &observation,
                        const QVector<bool> &mask);
@@ -37,5 +40,7 @@ private:
     QString last_error_;
     qint64 next_request_id_ = 1;
     qint64 pending_request_id_ = 0;
+    int observation_size_ = 0;
+    QString observation_schema_id_;
     bool ready_ = false;
 };

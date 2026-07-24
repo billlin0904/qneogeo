@@ -21,8 +21,16 @@ constexpr uint32_t KOF98_P2_PLAYER_BASE = 0x108300;
 constexpr uint32_t KOF98_PLAYER_POS_X_OFFSET = 0x18;
 constexpr uint32_t KOF98_PLAYER_POS_Y_OFFSET = 0x26;
 constexpr uint32_t KOF98_PLAYER_FLIP_X_OFFSET = 0x31;
-constexpr uint32_t KOF98_PLAYER_STATUS_OFFSET = 0x7C;
+constexpr uint32_t KOF98_PLAYER_HITBOX_ACTIVE_MASK_OFFSET = 0x7C;
+constexpr uint32_t KOF98_PLAYER_REACTION_D2_OFFSET = 0xD2;
+constexpr uint32_t KOF98_PLAYER_REACTION_D3_OFFSET = 0xD3;
+constexpr uint32_t KOF98_PLAYER_D4_CANDIDATE_OFFSET = 0xD4;
+constexpr uint32_t KOF98_PLAYER_REACTION_FLAGS_OFFSET = 0xE0;
+constexpr uint32_t KOF98_PLAYER_BLOCK_STATE_OFFSET = 0xE3;
+constexpr uint32_t KOF98_PLAYER_RECOVERY_CONTROL_OFFSET = 0xE7;
+constexpr uint32_t KOF98_PLAYER_HIT_GUARD_STOP_OFFSET = 0x125;
 constexpr uint32_t KOF98_PLAYER_HEALTH_OFFSET = 0x138;
+constexpr uint32_t KOF98_PLAYER_GUARD_CRUSH_VALUE_OFFSET = 0x147;
 constexpr uint32_t KOF98_PLAYER_POWER_VALUE_OFFSET = 0xE9;
 constexpr uint32_t KOF98_PLAYER_POWER_STATE_OFFSET = 0xEB;
 constexpr uint32_t KOF98_PLAYER_STUN_OFFSET = 0x13E;
@@ -120,7 +128,7 @@ struct ObjectRef {
     int32_t pos_x = 0;
     int32_t pos_y = 0;
     int32_t flip_x = 1;
-    uint8_t status = 0;
+    uint8_t hitbox_active_mask = 0;
 };
 
 constexpr std::array<int32_t, 63> KOF98_BOX_TYPES {{
@@ -190,6 +198,54 @@ int32_t readRawByteOrNegative(const RamView &ram, uint32_t address) {
     return static_cast<int32_t>(value);
 }
 
+PlayerReactionDebugState readPlayerReactionDebugState(const RamView &ram,
+                                                       uint32_t player_base) {
+    PlayerReactionDebugState state;
+    state.hit_guard_stop = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_HIT_GUARD_STOP_OFFSET);
+    state.reaction_d2 = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_REACTION_D2_OFFSET);
+    state.reaction_d3 = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_REACTION_D3_OFFSET);
+    uint16_t reaction_d2d3 = 0;
+    if (ram.readU16Be(player_base + KOF98_PLAYER_REACTION_D2_OFFSET,
+                      reaction_d2d3)) {
+        state.reaction_d2d3_unsigned = static_cast<int32_t>(reaction_d2d3);
+        state.reaction_d2d3_signed =
+            static_cast<int32_t>(static_cast<int16_t>(reaction_d2d3));
+    }
+    state.reaction_e0 = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_REACTION_FLAGS_OFFSET);
+    state.reaction_e1 = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_REACTION_FLAGS_OFFSET + 1);
+    state.reaction_e2 = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_REACTION_FLAGS_OFFSET + 2);
+    state.reaction_e3 = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_REACTION_FLAGS_OFFSET + 3);
+    state.d4_high = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_D4_CANDIDATE_OFFSET);
+    state.d5_low = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_D4_CANDIDATE_OFFSET + 1);
+    ram.readS16Be(player_base + KOF98_PLAYER_D4_CANDIDATE_OFFSET,
+                  state.d4_signed);
+    state.recovery_control_e7 = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_RECOVERY_CONTROL_OFFSET);
+    state.guard_crush = readByteOrNegative(
+        ram,
+        player_base + KOF98_PLAYER_GUARD_CRUSH_VALUE_OFFSET);
+    return state;
+}
+
 int32_t readHealthByte(const RamView &ram,
                        uint32_t primary_address,
                        uint32_t alternate_address,
@@ -217,7 +273,7 @@ bool defineBox(const RamView &ram, const ObjectRef &object, const BoxEntry &entr
 
     int32_t type = entry.type;
     if (type == HitboxUndefined) {
-        if (!hasBit(object.status, entry.active_bit))
+        if (!hasBit(object.hitbox_active_mask, entry.active_bit))
             return false;
 
         type = boxTypeFromId(id);
@@ -335,7 +391,9 @@ HitboxOverlay GameMemReaderCore::getHitboxOverlay() const {
         uint8_t flip_byte = 0;
         if (!ram.readS16Be(object.base + KOF98_PLAYER_POS_X_OFFSET, raw_x) ||
             !ram.readS16Be(object.base + KOF98_PLAYER_POS_Y_OFFSET, raw_y) ||
-            !ram.readU8(object.base + KOF98_PLAYER_STATUS_OFFSET, object.status) ||
+            !ram.readU8(
+                object.base + KOF98_PLAYER_HITBOX_ACTIVE_MASK_OFFSET,
+                object.hitbox_active_mask) ||
             !ram.readU8(object.base + KOF98_PLAYER_FLIP_X_OFFSET, flip_byte)) {
             continue;
         }
@@ -438,6 +496,108 @@ int32_t GameMemReaderCore::readP2ComboCount() const {
     return readRawByteOrNegative(ram, KOF98_P2_COMBO_COUNT_ADDRESS);
 }
 
+int32_t GameMemReaderCore::readP1HitboxActiveMask() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P1_PLAYER_BASE + KOF98_PLAYER_HITBOX_ACTIVE_MASK_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP2HitboxActiveMask() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P2_PLAYER_BASE + KOF98_PLAYER_HITBOX_ACTIVE_MASK_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP1GuardCrushValue() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P1_PLAYER_BASE + KOF98_PLAYER_GUARD_CRUSH_VALUE_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP2GuardCrushValue() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P2_PLAYER_BASE + KOF98_PLAYER_GUARD_CRUSH_VALUE_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP1HitGuardStopRaw() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P1_PLAYER_BASE + KOF98_PLAYER_HIT_GUARD_STOP_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP2HitGuardStopRaw() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P2_PLAYER_BASE + KOF98_PLAYER_HIT_GUARD_STOP_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP1RecoveryControlRaw() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P1_PLAYER_BASE + KOF98_PLAYER_RECOVERY_CONTROL_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP2RecoveryControlRaw() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P2_PLAYER_BASE + KOF98_PLAYER_RECOVERY_CONTROL_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP1BlockStateRaw() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P1_PLAYER_BASE + KOF98_PLAYER_BLOCK_STATE_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP2BlockStateRaw() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P2_PLAYER_BASE + KOF98_PLAYER_BLOCK_STATE_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP1ReactionD2Raw() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P1_PLAYER_BASE + KOF98_PLAYER_REACTION_D2_OFFSET);
+}
+
+int32_t GameMemReaderCore::readP2ReactionD2Raw() const {
+    const RamView ram(ram_, ram_size_);
+    return readByteOrNegative(
+        ram,
+        KOF98_P2_PLAYER_BASE + KOF98_PLAYER_REACTION_D2_OFFSET);
+}
+
+PlayerReactionDebugState GameMemReaderCore::readP1ReactionDebugState() const {
+    const RamView ram(ram_, ram_size_);
+    return readPlayerReactionDebugState(ram, KOF98_P1_PLAYER_BASE);
+}
+
+PlayerReactionDebugState GameMemReaderCore::readP2ReactionDebugState() const {
+    const RamView ram(ram_, ram_size_);
+    return readPlayerReactionDebugState(ram, KOF98_P2_PLAYER_BASE);
+}
+
+int32_t GameMemReaderCore::readP1Status() const {
+    return readP1HitboxActiveMask();
+}
+
+int32_t GameMemReaderCore::readP2Status() const {
+    return readP2HitboxActiveMask();
+}
+
 bool GameMemReaderCore::readP1Position(Point &position) const {
     const RamView ram(ram_, ram_size_);
     return readPlayerPosition(ram, KOF98_P1_PLAYER_BASE, source_width_, position);
@@ -452,6 +612,16 @@ bool GameMemReaderCore::readP1FacingLeft(bool &facing_left) const {
     const RamView ram(ram_, ram_size_);
     uint8_t flip_byte = 0;
     if (!ram.readU8(KOF98_P1_PLAYER_BASE + KOF98_PLAYER_FLIP_X_OFFSET, flip_byte))
+        return false;
+
+    facing_left = (flip_byte & 0x01) == 0;
+    return true;
+}
+
+bool GameMemReaderCore::readP2FacingLeft(bool &facing_left) const {
+    const RamView ram(ram_, ram_size_);
+    uint8_t flip_byte = 0;
+    if (!ram.readU8(KOF98_P2_PLAYER_BASE + KOF98_PLAYER_FLIP_X_OFFSET, flip_byte))
         return false;
 
     facing_left = (flip_byte & 0x01) == 0;

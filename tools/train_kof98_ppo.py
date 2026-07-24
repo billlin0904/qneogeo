@@ -1,3 +1,21 @@
+"""KOF98 PPO 訓練入口:環境編組、超參數 preset、指標記錄、run manifest。
+
+訓練流水線(每階段 resume 上一階段的模型):
+    strict combo → guided combo → (physical combo, 已因觀測混疊結案)
+    → mixed(combo 留存 + fight 實戰)→ reward/curriculum 迭代
+
+Mixed 模式的環境編組(--num-envs N, --combo-ratio R):
+    Combo 環境  = N×R 個，每次 reset 以錯開的 round-robin 輪替全部
+                 --combo-scenario，因此 4 個 env 也能覆蓋 11 套課表。
+    Fight 環境  = 其餘。依序配置舊 combo-route teacher、可重複指定的
+                 targeted curriculum，剩下的才是真正 physical 實戰；
+                 指定 --targeted-fight-envs 時，Targeted curriculum 與
+                 Physical P2 style 都會在 reset 時輪替，降低 FBNeo 記憶體用量。
+
+可重現性:每次 run 寫出 run_manifest_*.json(git commit + dirty、
+套件版本、DLL/ROM/state 的 SHA-256、全部生效參數)。比較實驗時
+應以「相同模擬幀數」為準,不是相同 timesteps(見 kof/emulated_frames)。
+"""
 from __future__ import annotations
 
 import argparse
@@ -20,11 +38,28 @@ from kof98_env import (
     ActionMaskLevel,
     COMBO_SCENARIOS,
     DEFAULT_COMBO_SCENARIO_NAME,
-    FIGHT_REWARD_VERSION,
+    FightCurriculum,
+    FightRewardVersion,
     IDLE_ACTION_ID,
     Kof98Env,
+    KofEnvClient,
     P2Style,
     TrainingProfile,
+)
+from kof98_model_transfer import (
+    assert_legacy_policy_equivalence,
+    assert_v2_v3_policy_equivalence,
+    transplant_policy_observation_inputs,
+    transplant_v2_policy_to_v3,
+)
+from kof98_curriculum import LevelRecipe, load_level_recipes
+from kof98_observation import (
+    OBSERVATION_V1_SIZE,
+    OBSERVATION_V2_SIZE,
+    OBSERVATION_SCHEMA_V2_ID,
+    ObservationVersion,
+    observation_schema_id,
+    observation_size,
 )
 
 # Hyperparameters were tuned at action_repeat=6. The repeat4 preset keeps the
@@ -43,6 +78,13 @@ FIGHT_OUTCOME_NAMES = (
     "draw_timeout",
     "draw_ko",
 )
+TACTICAL_ACTION_IDS = (1, 2, 3, 4, 5, 8, 11, 16)
+TACTICAL_CONDITION_TAGS = {
+    "guard": "guard_given_pressure",
+    "anti_air": "oniyaki_hit_given_airborne",
+    "approach": "safe_entry_given_far",
+    "confirm": "followup_hit_given_confirm",
+}
 
 DEFAULT_GUIDED_FIGHT_SCENARIOS = (
     "kyo_close_c_seventy_five_shiki_kai_red_kick",
@@ -51,11 +93,27 @@ DEFAULT_GUIDED_FIGHT_SCENARIOS = (
     "kyo_forward_b_red_kick",
 )
 
+KYO29_COMBO_SUITE = (
+    ("kyo_corner_dokugami", 1),
+    ("kyo_forward_b_kototsuki", 3),
+    ("kyo_forward_b_orochinagi", 1),
+    ("kyo_forward_b_red_kick", 1),
+    ("kyo_forward_b_aragami", 1),
+    ("kyo_close_c_seventy_five_shiki_kai_orochinagi", 1),
+    ("kyo_close_c_seventy_five_shiki_kai_red_kick", 1),
+    ("kyo_close_c_seventy_five_shiki_kai_kototsuki", 3),
+    ("kyo_close_c_seventy_five_shiki_kai_aragami", 1),
+    ("kyo_corner_seventy_five_shiki_kai_aragami_chain", 1),
+    ("kyo_crouch_b_crouch_a_mushiki", 1),
+)
+
 
 def default_project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+# 單一環境工廠。SubprocVecEnv 用 spawn 啟動子行程,每個子行程各載一份
+# fbneo_training.dll(完整模擬器實例),因此環境數受記憶體/CPU 限制。
 def make_env(
     root: Path,
     combo_state_path: Optional[Path],
@@ -65,9 +123,16 @@ def make_env(
     action_mask_level: ActionMaskLevel,
     action_repeat: int,
     seed: int,
+    combo_scenario_rotation: Optional[list[tuple[str, Path]]] = None,
+    combo_rotation_offset: int = 0,
+    combo_rotation_stride: int = 1,
     p2_training_ai: bool = False,
     p2_style: P2Style = P2Style.ONIYAKI,
     fight_guided: bool = False,
+    fight_curriculum: FightCurriculum = FightCurriculum.NONE,
+    fight_rotation: Optional[list[tuple[FightCurriculum, P2Style]]] = None,
+    fight_rotation_offset: int = 0,
+    fight_rotation_stride: int = 1,
     hitbox_reward: bool = True,
     viewer: bool = False,
     viewer_scale: int = 3,
@@ -75,6 +140,12 @@ def make_env(
     viewer_speed: float = 1.0,
     viewer_hitboxes: bool = False,
     viewer_terminal_tail_frames: int = 90,
+    observation_version: ObservationVersion = ObservationVersion.V1,
+    observation_event_features: bool = True,
+    fight_reward_version: FightRewardVersion | None = None,
+    level_recipe_rotation: Optional[list[LevelRecipe]] = None,
+    level_recipe_rotation_offset: int = 0,
+    level_recipe_rotation_stride: int = 1,
 ) -> Callable[[], Kof98Env]:
     def _init() -> Kof98Env:
         env = Kof98Env(
@@ -90,9 +161,22 @@ def make_env(
             p2_training_ai=p2_training_ai,
             p2_style=p2_style,
             fight_guided=fight_guided,
+            fight_curriculum=fight_curriculum,
+            fight_rotation=fight_rotation,
+            fight_rotation_offset=fight_rotation_offset,
+            fight_rotation_stride=fight_rotation_stride,
             training_profile=training_profile,
             combo_scenario=combo_scenario,
+            combo_scenario_rotation=combo_scenario_rotation,
+            combo_rotation_offset=combo_rotation_offset,
+            combo_rotation_stride=combo_rotation_stride,
             action_mask_level=action_mask_level,
+            observation_version=observation_version,
+            observation_event_features=observation_event_features,
+            fight_reward_version=fight_reward_version,
+            level_recipe_rotation=level_recipe_rotation,
+            level_recipe_rotation_offset=level_recipe_rotation_offset,
+            level_recipe_rotation_stride=level_recipe_rotation_stride,
         )
         if viewer:
             env = TrainingViewerWrapper(
@@ -218,6 +302,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--combo-suite",
+        choices=("single", "kyo29"),
+        default="single",
+        help="Named combo scenario/state bundle. Explicit --combo-scenario entries take precedence.",
+    )
+    parser.add_argument(
         "--fight-state",
         type=Path,
         default=None,
@@ -255,6 +345,49 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--targeted-fight-curriculum",
+        action="append",
+        choices=tuple(
+            curriculum.value
+            for curriculum in FightCurriculum
+            if curriculum not in (FightCurriculum.NONE, FightCurriculum.COMBO_ROUTE)
+        ),
+        default=None,
+        help=(
+            "Targeted Fight curriculum assigned to the first Fight environments. "
+            "Repeat to add defense, anti_air, approach and hit_confirm teachers."
+        ),
+    )
+    parser.add_argument(
+        "--targeted-fight-envs",
+        type=int,
+        default=None,
+        help=(
+            "Resident Targeted Fight worker count. When set, the curricula "
+            "from --targeted-fight-curriculum rotate on reset instead of "
+            "requiring one FBNeo process per curriculum."
+        ),
+    )
+    parser.add_argument(
+        "--level-recipe-bank",
+        type=Path,
+        default=None,
+        help=(
+            "V3 reverse-curriculum Level Recipe JSON. Recipe workers replay "
+            "safe states with deterministic P2 preludes and always use the "
+            "full physical action mask."
+        ),
+    )
+    parser.add_argument(
+        "--level-recipe-envs",
+        type=int,
+        default=None,
+        help=(
+            "Fight worker count assigned to --level-recipe-bank. Defaults to "
+            "the smaller of recipe count and available Fight workers."
+        ),
+    )
+    parser.add_argument(
         "--mask-level",
         choices=tuple(level.value for level in ActionMaskLevel),
         default=ActionMaskLevel.STRICT.value,
@@ -271,8 +404,9 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(style.value for style in P2Style),
         default=None,
         help=(
-            "P2 behavior style assigned round-robin to Fight environments. "
-            "Repeat to select a subset; defaults to all four styles."
+            "P2 behavior styles for Fight environments. They are assigned "
+            "round-robin normally and rotate on reset when "
+            "--targeted-fight-envs enables resident-worker rotation."
         ),
     )
     parser.add_argument(
@@ -323,6 +457,12 @@ def parse_args() -> argparse.Namespace:
         help="Stable-Baselines3 device, e.g. cuda or cpu.",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=98,
+        help="Random seed used by PPO and vector environments (default: 98).",
+    )
+    parser.add_argument(
         "--log-dir",
         type=Path,
         default=None,
@@ -343,10 +483,118 @@ def parse_args() -> argparse.Namespace:
         help="Model checkpoint directory.",
     )
     parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=31_250,
+        help=(
+            "Checkpoint interval in aggregate PPO timesteps "
+            "(default: 31250)."
+        ),
+    )
+    parser.add_argument(
+        "--relative-checkpoints",
+        action="store_true",
+        help=(
+            "Name checkpoints by timesteps elapsed in this run and preserve "
+            "a step-0 copy. Intended for paired pilot experiments."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
         help="Resume from an existing PPO .zip model.",
+    )
+    parser.add_argument(
+        "--allow-action-set-migration",
+        action="store_true",
+        help=(
+            "Explicitly accept a checkpoint created before the current DLL "
+            "action-set/schema metadata. Use only for an intentional fine-tune."
+        ),
+    )
+    parser.add_argument(
+        "--observation-version",
+        choices=tuple(version.value for version in ObservationVersion),
+        default=ObservationVersion.V1.value,
+        help=(
+            "Observation ABI. v1 is 26 values, v2 is the legacy 140-value "
+            "strategy state, and v3 reuses 140 values for generic timing/events."
+        ),
+    )
+    parser.add_argument(
+        "--disable-observation-event-features",
+        action="store_true",
+        help=(
+            "Keep V3's 32 repurposed event/timing columns at zero. This is "
+            "the StrategyV4-A migration control group, not a deployment mode."
+        ),
+    )
+    parser.add_argument(
+        "--fight-reward-version",
+        choices=("auto",) + tuple(version.value for version in FightRewardVersion),
+        default="auto",
+        help="Fight objective. auto selects legacy for v1 and symmetric HP/outcome for v2.",
+    )
+    parser.add_argument(
+        "--migrate-from",
+        type=Path,
+        default=None,
+        help=(
+            "Create V2 from a V1 checkpoint, or V3 from a V2 checkpoint. "
+            "Both migrations preserve policy output before fine-tuning."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-model",
+        type=Path,
+        default=None,
+        help="Legacy teacher used for temporary kickstart policy regularisation.",
+    )
+    parser.add_argument(
+        "--teacher-weight",
+        type=float,
+        default=0.10,
+        help="Initial kickstart cross-entropy weight.",
+    )
+    parser.add_argument(
+        "--teacher-decay-steps",
+        type=int,
+        default=2_000_000,
+        help="Linearly decay teacher regularisation to zero over this many steps.",
+    )
+    parser.add_argument(
+        "--teacher-batch-size",
+        type=int,
+        default=2048,
+        help="Maximum rollout samples used for each teacher update.",
+    )
+    parser.add_argument(
+        "--oracle-teacher-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Auxiliary recipe-Oracle imitation weight. It keeps the full "
+            "physical mask and decays to zero; use only with a level bank."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-teacher-decay-steps",
+        type=int,
+        default=600_000,
+        help="Linearly decay recipe-Oracle imitation over this many steps.",
+    )
+    parser.add_argument(
+        "--oracle-teacher-batch-size",
+        type=int,
+        default=2048,
+        help="Maximum recipe observations used per auxiliary update.",
+    )
+    parser.add_argument(
+        "--oracle-teacher-updates",
+        type=int,
+        default=4,
+        help="Auxiliary Oracle gradient updates after each PPO rollout.",
     )
     parser.add_argument(
         "--save-name",
@@ -443,6 +691,8 @@ def package_version_or_none(name: str) -> Optional[str]:
         return None
 
 
+# Run manifest:實驗的身分證。工作樹常是 dirty 狀態,單靠 commit hash
+# 無法重現 —— 所以連檔案雜湊、套件版本、生效參數全部落盤。
 def write_run_manifest(
     manifest_path: Path,
     args: argparse.Namespace,
@@ -486,6 +736,8 @@ def write_run_manifest(
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+# 依 --profile/--combo-ratio 決定每個平行環境是 COMBO 還是 FIGHT。
+# combo_env_count = int(N*R+0.5),夾在 [1, N-1]。
 def build_training_profiles(
     mode: str,
     num_envs: int,
@@ -617,17 +869,53 @@ def close_vec_env_safely(env) -> None:
 
 def main() -> int:
     args = parse_args()
+    observation_version = ObservationVersion(args.observation_version)
+    fight_reward_version = (
+        None
+        if args.fight_reward_version == "auto"
+        else FightRewardVersion(args.fight_reward_version)
+    )
+    effective_fight_reward_version = fight_reward_version or (
+        FightRewardVersion.SYMMETRIC_V2
+        if observation_version is not ObservationVersion.V1
+        else FightRewardVersion.LEGACY_COMBO4
+    )
+    if args.resume is not None and args.migrate_from is not None:
+        print("Use either --resume or --migrate-from, not both.", file=sys.stderr)
+        return 2
+    if (
+        args.migrate_from is not None
+        and observation_version is ObservationVersion.V1
+    ):
+        print(
+            "--migrate-from requires --observation-version v2 or v3.",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        args.teacher_model is not None
+        and observation_version is ObservationVersion.V1
+    ):
+        print(
+            "--teacher-model requires --observation-version v2 or v3.",
+            file=sys.stderr,
+        )
+        return 2
 
+    print("Loading Stable-Baselines3 and training dependencies...", flush=True)
     try:
         from sb3_contrib import MaskablePPO
         from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
         from stable_baselines3.common.monitor import Monitor
         from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+        from kof98_kickstart import KickstartTeacherCallback
+        from kof98_oracle_teacher import OracleCurriculumCallback
     except ImportError as error:
         print("Install training dependencies first:", file=sys.stderr)
         print("  pip install stable-baselines3 sb3-contrib gymnasium tensorboard", file=sys.stderr)
         print(f"Import error: {error}", file=sys.stderr)
         return 1
+    print("Training dependencies loaded.", flush=True)
 
     if stable_baselines3_major_version() < 2:
         print("stable-baselines3 2.x is required because Kof98Env uses the Gymnasium API.", file=sys.stderr)
@@ -648,15 +936,126 @@ def main() -> int:
         def action_masks(self):
             return self.env.action_masks()
 
-    class TrainingMetricsCallback(BaseCallback):
-        def __init__(self):
+    class RelativeCheckpointCallback(BaseCallback):
+        """Save run-relative 0/N checkpoints even when resuming a model."""
+
+        def __init__(
+            self,
+            interval_timesteps: int,
+            total_timesteps: int,
+            save_path: Path,
+            name_prefix: str,
+        ):
             super().__init__()
+            self.interval_timesteps = max(1, int(interval_timesteps))
+            self.total_timesteps = max(0, int(total_timesteps))
+            self.save_path = Path(save_path)
+            self.name_prefix = str(name_prefix)
+            self.start_num_timesteps = 0
+            self.next_checkpoint = self.interval_timesteps
+
+        def _save_relative_checkpoint(self, relative_timesteps: int) -> None:
+            checkpoint_path = self.save_path / (
+                f"{self.name_prefix}_pilot_"
+                f"{int(relative_timesteps):06d}_steps.zip"
+            )
+            self.model.save(str(checkpoint_path))
+            print(f"Saved relative checkpoint: {checkpoint_path}", flush=True)
+
+        def _on_training_start(self) -> None:
+            self.start_num_timesteps = int(self.model.num_timesteps)
+            self.next_checkpoint = self.interval_timesteps
+            self._save_relative_checkpoint(0)
+
+        def _on_step(self) -> bool:
+            relative_timesteps = (
+                int(self.model.num_timesteps) - self.start_num_timesteps
+            )
+            while (
+                self.next_checkpoint <= self.total_timesteps
+                and relative_timesteps >= self.next_checkpoint
+            ):
+                self._save_relative_checkpoint(self.next_checkpoint)
+                self.next_checkpoint += self.interval_timesteps
+            return True
+
+    class TrainingMetricsCallback(BaseCallback):
+        """自訂 TensorBoard 指標。命名空間:
+
+        kof/          全體共用(reward 分項總和、模擬幀數累計…)
+        kof_combo/<scenario>/   各連段課程的成功率/替代率
+        kof_fight_physical/     自由實戰(真正的考試成績)
+        kof_fight_guided/       teacher 引導環境(上課成績,不可混讀!)
+        kof_fight_targeted/     防禦/對空/接近/hit-confirm 局部課程
+        kof_fight_*/<style>/    再按 P2 風格細分(勝率、4plus、teacher 完成數)
+
+        讀圖注意:
+        - per-rollout 局數很少(個位數),單點劇烈跳動是小樣本雜訊,
+          看 last-N 平均或平滑曲線。
+        - action rate 的分母要用 available_steps(mask 開放時),
+          不是總步數 —— 否則不同 action_repeat 的 run 無法互比。
+        - 每 rollout 結束歸零(reset_rollout_metrics);cumulative_* 例外。
+        """
+
+        def __init__(self, fight_assignments: list[dict]):
+            super().__init__()
+            self.active_mode_styles: dict[str, set[str]] = {
+                "guided": set(),
+                "targeted": set(),
+                "physical": set(),
+            }
+            self.active_targeted_curricula: set[str] = set()
+            for assignment in fight_assignments:
+                mode = str(assignment["mode"])
+                style = str(assignment["style"])
+                if mode in self.active_mode_styles:
+                    self.active_mode_styles[mode].add(style)
+                if mode == "targeted":
+                    self.active_targeted_curricula.add(
+                        str(assignment["curriculum"]),
+                    )
             self.cumulative_frames = 0.0
             self.cumulative_fight_frames = 0.0
+            self.cumulative_mode_tactical_metrics = {
+                mode: {
+                    condition: {"opportunities": 0.0, "successes": 0.0}
+                    for condition in TACTICAL_CONDITION_TAGS
+                }
+                for mode, styles in self.active_mode_styles.items()
+                if styles
+            }
+            self.cumulative_mode_approach_progress = {
+                mode: 0.0
+                for mode, styles in self.active_mode_styles.items()
+                if styles
+            }
+            self.cumulative_mode_approach_forward_frames = {
+                mode: 0.0
+                for mode, styles in self.active_mode_styles.items()
+                if styles
+            }
             self.env_fight_max_combo: dict[int, float] = {}
             self.env_fight_damage_dealt: dict[int, float] = {}
             self.env_fight_damage_taken: dict[int, float] = {}
             self.reset_rollout_metrics()
+
+        @staticmethod
+        def _empty_event_metrics() -> dict[str, float]:
+            return {
+                "steps": 0.0,
+                "frames": 0.0,
+                "p1_reaction_active": 0.0,
+                "p1_reaction_remaining_valid": 0.0,
+                "p2_reaction_active": 0.0,
+                "p2_reaction_remaining_valid": 0.0,
+                "defense_non_neutral": 0.0,
+                "confirm_non_neutral": 0.0,
+                "block_contact": 0.0,
+                "clean_hit": 0.0,
+                "blockstun_end": 0.0,
+                "starter_hit": 0.0,
+                "starter_blocked": 0.0,
+            }
 
         def reset_rollout_metrics(self) -> None:
             self.step_count = 0
@@ -680,34 +1079,65 @@ def main() -> int:
             self.fight_episode_damage_dealt_total = 0.0
             self.fight_episode_damage_taken_total = 0.0
             self.fight_mode_metrics = {
-                "guided": {
+                mode: {
                     "episodes": 0.0,
                     "wins": 0.0,
                     "combo_4plus": 0.0,
                     "episode_max_total": 0.0,
                     "teacher_completions": 0.0,
-                },
-                "physical": {
-                    "episodes": 0.0,
-                    "wins": 0.0,
-                    "combo_4plus": 0.0,
-                    "episode_max_total": 0.0,
-                    "teacher_completions": 0.0,
-                },
+                }
+                for mode, styles in self.active_mode_styles.items()
+                if styles
+            }
+            self.fight_mode_action_available = {
+                mode: np.zeros(ACTION_COUNT, dtype=np.float64)
+                for mode in self.fight_mode_metrics
+            }
+            self.fight_mode_action_selected = {
+                mode: np.zeros(ACTION_COUNT, dtype=np.float64)
+                for mode in self.fight_mode_metrics
+            }
+            self.fight_mode_free_decision_steps = {
+                mode: 0.0
+                for mode in self.fight_mode_metrics
+            }
+            self.fight_mode_free_action_selected = {
+                mode: np.zeros(ACTION_COUNT, dtype=np.float64)
+                for mode in self.fight_mode_metrics
             }
             self.fight_style_metrics = {
                 mode: {
-                    style.value: {
+                    style: {
                         "episodes": 0.0,
                         "wins": 0.0,
                         "combo_4plus": 0.0,
                         "episode_max_total": 0.0,
                         "teacher_completions": 0.0,
                     }
-                    for style in P2Style
+                    for style in styles
                 }
-                for mode in ("guided", "physical")
+                for mode, styles in self.active_mode_styles.items()
+                if styles
             }
+            self.fight_curriculum_metrics = {
+                curriculum: {
+                    "opportunities": 0.0,
+                    "successes": 0.0,
+                    "guard_successes": 0.0,
+                    "counter_opportunities": 0.0,
+                    "counter_successes": 0.0,
+                    "reward_machine_successes": 0.0,
+                    "reward_machine_failures": 0.0,
+                    "reward_machine_timeouts": 0.0,
+                    "reward_total": 0.0,
+                    "episodes": 0.0,
+                    "wins": 0.0,
+                    "combo_4plus": 0.0,
+                    "episode_max_total": 0.0,
+                }
+                for curriculum in self.active_targeted_curricula
+            }
+            self.level_recipe_metrics: dict[str, dict[str, float]] = {}
             self.p1_damage = 0.0
             self.p2_damage = 0.0
             self.p1_attack_overlap = 0.0
@@ -771,7 +1201,9 @@ def main() -> int:
             self.reward_safety = 0.0
             self.reward_cancel = 0.0
             self.reward_fast_win = 0.0
+            self.reward_outcome = 0.0
             self.reward_time = 0.0
+            self.reward_curriculum = 0.0
             self.combo_episodes = 0.0
             self.combo_successes = 0.0
             self.combo_episode_max_total = 0.0
@@ -789,6 +1221,18 @@ def main() -> int:
             self.reward_wrong_action = 0.0
             self.reward_alternate = 0.0
             self.combo_alternate_successes = 0.0
+            self.runtime_step_event_dropped = 0.0
+            self.runtime_batch_epoch_mismatch = 0.0
+            self.runtime_chip_hit_block_conflict = 0.0
+            self.runtime_nonfinite_observation = 0.0
+            self.runtime_event_feature_enabled_steps = 0.0
+            self.runtime_event_feature_nonzero_steps = 0.0
+            self.runtime_event_feature_nonzero_total = 0.0
+            self.fight_event_metrics = self._empty_event_metrics()
+            self.fight_mode_event_metrics = {
+                mode: self._empty_event_metrics()
+                for mode in self.fight_mode_metrics
+            }
 
         def _on_step(self) -> bool:
             infos = self.locals.get("infos", [])
@@ -813,11 +1257,15 @@ def main() -> int:
                         },
                     )
                 elif training_profile == TrainingProfile.FIGHT.value:
-                    fight_mode = (
-                        "guided"
-                        if bool(info.get("fight_guided", 0.0))
-                        else "physical"
+                    curriculum_name = str(
+                        info.get("fight_curriculum", FightCurriculum.NONE.value)
                     )
+                    if curriculum_name == FightCurriculum.COMBO_ROUTE.value:
+                        fight_mode = "guided"
+                    elif curriculum_name != FightCurriculum.NONE.value:
+                        fight_mode = "targeted"
+                    else:
+                        fight_mode = "physical"
                     p2_style = str(info.get("p2_style", P2Style.ONIYAKI.value))
                     if p2_style not in self.fight_style_metrics[fight_mode]:
                         p2_style = P2Style.ONIYAKI.value
@@ -830,18 +1278,140 @@ def main() -> int:
                     self.fight_style_metrics[fight_mode][p2_style][
                         "teacher_completions"
                     ] += teacher_completion
+                    curriculum_metrics = self.fight_curriculum_metrics.get(
+                        curriculum_name
+                    )
+                    recipe_name = str(info.get("level_recipe", ""))
+                    recipe_metrics = None
+                    if recipe_name:
+                        recipe_metrics = self.level_recipe_metrics.setdefault(
+                            recipe_name,
+                            {
+                                "episodes": 0.0,
+                                "successes": 0.0,
+                                "failures": 0.0,
+                                "timeouts": 0.0,
+                                "reward_total": 0.0,
+                                "frames_total": 0.0,
+                            },
+                        )
+                        recipe_metrics["successes"] += float(
+                            info.get("reward_machine_success", 0.0)
+                        )
+                        recipe_metrics["failures"] += float(
+                            info.get("reward_machine_failure", 0.0)
+                        )
+                        recipe_metrics["timeouts"] += float(
+                            info.get("reward_machine_timeout", 0.0)
+                        )
+                        recipe_metrics["reward_total"] += float(
+                            info.get("reward_curriculum", 0.0)
+                        )
+                        recipe_metrics["frames_total"] += frame_count
+                    if curriculum_metrics is not None:
+                        curriculum_metrics["opportunities"] += float(
+                            info.get("curriculum_opportunity", 0.0)
+                        )
+                        curriculum_metrics["successes"] += float(
+                            info.get("curriculum_success", 0.0)
+                        )
+                        curriculum_metrics["guard_successes"] += float(
+                            info.get("curriculum_guard_success", 0.0)
+                        )
+                        curriculum_metrics["counter_opportunities"] += float(
+                            info.get("curriculum_counter_opportunity", 0.0)
+                        )
+                        curriculum_metrics["counter_successes"] += float(
+                            info.get("curriculum_counter_success", 0.0)
+                        )
+                        curriculum_metrics["reward_machine_successes"] += float(
+                            info.get("reward_machine_success", 0.0)
+                        )
+                        curriculum_metrics["reward_machine_failures"] += float(
+                            info.get("reward_machine_failure", 0.0)
+                        )
+                        curriculum_metrics["reward_machine_timeouts"] += float(
+                            info.get("reward_machine_timeout", 0.0)
+                        )
+                        curriculum_metrics["reward_total"] += float(
+                            info.get("reward_curriculum", 0.0)
+                        )
                     self.fight_step_count += 1
                     self.fight_frames_total += frame_count
                     self.cumulative_fight_frames += frame_count
-                    self.fight_free_decision_steps += float(info.get("free_decision", 0.0))
+                    for event_metrics in (
+                        self.fight_event_metrics,
+                        self.fight_mode_event_metrics[fight_mode],
+                    ):
+                        event_metrics["steps"] += 1.0
+                        event_metrics["frames"] += frame_count
+                        for metric_name in (
+                            "p1_reaction_active",
+                            "p1_reaction_remaining_valid",
+                            "p2_reaction_active",
+                            "p2_reaction_remaining_valid",
+                            "defense_non_neutral",
+                            "confirm_non_neutral",
+                        ):
+                            event_metrics[metric_name] += float(
+                                info.get(metric_name, 0.0)
+                            )
+                        event_metrics["block_contact"] += float(
+                            info.get("step_block_contact_count", 0.0)
+                        )
+                        event_metrics["clean_hit"] += float(
+                            info.get("step_clean_hit_count", 0.0)
+                        )
+                        event_metrics["blockstun_end"] += float(
+                            info.get("step_blockstun_ended_count", 0.0)
+                        )
+                        event_metrics["starter_hit"] += float(
+                            info.get("step_starter_hit_count", 0.0)
+                        )
+                        event_metrics["starter_blocked"] += float(
+                            info.get("step_starter_blocked_count", 0.0)
+                        )
+                    free_decision = float(info.get("free_decision", 0.0))
+                    self.fight_free_decision_steps += free_decision
+                    self.fight_mode_free_decision_steps[fight_mode] += free_decision
                     self.fight_queue_decision_steps += float(info.get("queue_decision", 0.0))
                     self.fight_forced_idle_steps += float(info.get("forced_idle", 0.0))
                     availability = info.get("action_availability")
                     if availability is not None:
-                        self.fight_action_available += np.asarray(availability, dtype=np.float64)
+                        availability_array = np.asarray(
+                            availability,
+                            dtype=np.float64,
+                        )
+                        self.fight_action_available += availability_array
+                        self.fight_mode_action_available[
+                            fight_mode
+                        ] += availability_array
                     selected_action = int(info.get("action", -1))
                     if 0 <= selected_action < ACTION_COUNT:
                         self.fight_action_selected[selected_action] += 1.0
+                        self.fight_mode_action_selected[
+                            fight_mode
+                        ][selected_action] += 1.0
+                        if free_decision > 0.0:
+                            self.fight_mode_free_action_selected[
+                                fight_mode
+                            ][selected_action] += free_decision
+                    tactical_metrics = self.cumulative_mode_tactical_metrics[
+                        fight_mode
+                    ]
+                    for condition in TACTICAL_CONDITION_TAGS:
+                        tactical_metrics[condition]["opportunities"] += float(
+                            info.get(f"tactical_{condition}_opportunity", 0.0)
+                        )
+                        tactical_metrics[condition]["successes"] += float(
+                            info.get(f"tactical_{condition}_success", 0.0)
+                        )
+                    self.cumulative_mode_approach_progress[fight_mode] += float(
+                        info.get("tactical_approach_step_progress", 0.0)
+                    )
+                    self.cumulative_mode_approach_forward_frames[fight_mode] += float(
+                        info.get("tactical_approach_step_forward_frames", 0.0)
+                    )
                     queued_actions = info.get("queued_followup_actions")
                     started_actions = info.get("started_followup_actions")
                     hit_actions = info.get("hit_followup_actions")
@@ -885,6 +1455,8 @@ def main() -> int:
                         + float(info.get("p1_damage", 0.0))
                     )
                     if index < len(dones) and dones[index]:
+                        if recipe_metrics is not None:
+                            recipe_metrics["episodes"] += 1.0
                         self.fight_episodes += 1.0
                         outcome = str(info.get("fight_outcome", ""))
                         if outcome in self.fight_outcome_counts:
@@ -902,6 +1474,13 @@ def main() -> int:
                         if episode_max_combo >= 4.0:
                             mode_metrics["combo_4plus"] += 1.0
                             style_metrics["combo_4plus"] += 1.0
+                        if curriculum_metrics is not None:
+                            curriculum_metrics["episodes"] += 1.0
+                            curriculum_metrics["episode_max_total"] += episode_max_combo
+                            if outcome in ("win_ko", "win_timeout"):
+                                curriculum_metrics["wins"] += 1.0
+                            if episode_max_combo >= 4.0:
+                                curriculum_metrics["combo_4plus"] += 1.0
                         self.fight_episode_max_combo_total += episode_max_combo
                         if episode_max_combo >= 2.0:
                             self.fight_combo_2plus_episodes += 1.0
@@ -975,12 +1554,44 @@ def main() -> int:
                 self.reward_safety += float(info.get("reward_safety", 0.0))
                 self.reward_cancel += float(info.get("reward_cancel", 0.0))
                 self.reward_fast_win += float(info.get("reward_fast_win", 0.0))
+                self.reward_outcome += float(info.get("reward_outcome", 0.0))
                 self.reward_time += float(info.get("reward_time", 0.0))
+                self.reward_curriculum += float(
+                    info.get("reward_curriculum", 0.0)
+                )
                 self.reward_damage += float(info.get("reward_damage", 0.0))
                 self.reward_combo_milestone += float(info.get("reward_combo_milestone", 0.0))
                 self.reward_combo_target += float(info.get("reward_combo_target", 0.0))
                 self.reward_timeout += float(info.get("reward_timeout", 0.0))
                 self.reward_ko_without_combo += float(info.get("reward_ko_without_combo", 0.0))
+                self.runtime_step_event_dropped += float(
+                    info.get("step_event_dropped", 0.0)
+                )
+                self.runtime_batch_epoch_mismatch += float(
+                    info.get("step_event_batch_epoch_mismatch", 0.0)
+                )
+                self.runtime_chip_hit_block_conflict += float(
+                    info.get("step_event_chip_hit_block_conflict", 0.0)
+                )
+                if "observation_finite" in info:
+                    self.runtime_nonfinite_observation += float(
+                        not bool(info["observation_finite"])
+                    )
+                event_features_enabled = float(
+                    info.get("observation_event_features_enabled", 0.0)
+                )
+                event_feature_nonzero_count = float(
+                    info.get("observation_event_nonzero_count", 0.0)
+                )
+                self.runtime_event_feature_enabled_steps += (
+                    event_features_enabled
+                )
+                self.runtime_event_feature_nonzero_steps += float(
+                    event_feature_nonzero_count > 0.0
+                )
+                self.runtime_event_feature_nonzero_total += (
+                    event_feature_nonzero_count
+                )
                 if is_combo_profile:
                     self.input_ready += float(info.get("input_ready", 0.0))
                     self.combo_phase += float(info.get("combo_phase", 0.0))
@@ -1007,6 +1618,61 @@ def main() -> int:
             combo_count = max(1, self.combo_step_count)
             self.logger.record("kof/profile_combo_step_rate", self.combo_step_count / count)
             self.logger.record("kof/profile_fight_step_rate", self.fight_step_count / count)
+            self.logger.record(
+                "kof_runtime/dropped_event_total",
+                self.runtime_step_event_dropped,
+            )
+            self.logger.record(
+                "kof_runtime/batch_epoch_mismatch_total",
+                self.runtime_batch_epoch_mismatch,
+            )
+            self.logger.record(
+                "kof_runtime/chip_hit_block_conflict_total",
+                self.runtime_chip_hit_block_conflict,
+            )
+            self.logger.record(
+                "kof_runtime/nonfinite_observation_total",
+                self.runtime_nonfinite_observation,
+            )
+            self.logger.record(
+                "kof_runtime/event_vector_enabled_step_rate",
+                self.runtime_event_feature_enabled_steps / count,
+            )
+            self.logger.record(
+                "kof_runtime/event_vector_nonzero_step_rate",
+                self.runtime_event_feature_nonzero_steps / count,
+            )
+            self.logger.record(
+                "kof_runtime/event_vector_nonzero_mean",
+                self.runtime_event_feature_nonzero_total / count,
+            )
+            fight_event_steps = max(1.0, self.fight_event_metrics["steps"])
+            fight_event_frames = max(1.0, self.fight_event_metrics["frames"])
+            for metric_name in (
+                "p1_reaction_active",
+                "p1_reaction_remaining_valid",
+                "p2_reaction_active",
+                "p2_reaction_remaining_valid",
+                "defense_non_neutral",
+                "confirm_non_neutral",
+            ):
+                self.logger.record(
+                    f"kof_event_source/{metric_name}_rate",
+                    self.fight_event_metrics[metric_name] / fight_event_steps,
+                )
+            for metric_name in (
+                "block_contact",
+                "clean_hit",
+                "blockstun_end",
+                "starter_hit",
+                "starter_blocked",
+            ):
+                self.logger.record(
+                    f"kof_event_source/{metric_name}_per_1k_frames",
+                    self.fight_event_metrics[metric_name]
+                    * 1000.0
+                    / fight_event_frames,
+                )
             self.logger.record("kof/p1_damage_total", self.p1_damage)
             self.logger.record("kof/p2_damage_total", self.p2_damage)
             self.logger.record("kof/p1_attack_overlap_rate", self.p1_attack_overlap / count)
@@ -1089,7 +1755,12 @@ def main() -> int:
             self.logger.record("kof/reward_safety_total", self.reward_safety)
             self.logger.record("kof/reward_cancel_total", self.reward_cancel)
             self.logger.record("kof/reward_fast_win_total", self.reward_fast_win)
+            self.logger.record("kof/reward_outcome_total", self.reward_outcome)
             self.logger.record("kof/reward_time_total", self.reward_time)
+            self.logger.record(
+                "kof/reward_curriculum_total",
+                self.reward_curriculum,
+            )
             self.logger.record("kof/combo_episodes_total", self.combo_episodes)
             self.logger.record("kof/combo_success_rate", self.combo_successes / max(1.0, self.combo_episodes))
             self.logger.record("kof/combo_episode_max_mean", self.combo_episode_max_total / max(1.0, self.combo_episodes))
@@ -1173,6 +1844,9 @@ def main() -> int:
             for fight_mode, metrics in self.fight_mode_metrics.items():
                 mode_episode_count = max(1.0, metrics["episodes"])
                 prefix = f"kof_fight_{fight_mode}"
+                mode_event_metrics = self.fight_mode_event_metrics[fight_mode]
+                mode_event_steps = max(1.0, mode_event_metrics["steps"])
+                mode_event_frames = max(1.0, mode_event_metrics["frames"])
                 self.logger.record(f"{prefix}/episodes_total", metrics["episodes"])
                 self.logger.record(
                     f"{prefix}/win_rate",
@@ -1189,6 +1863,105 @@ def main() -> int:
                 self.logger.record(
                     f"{prefix}/teacher_completions_total",
                     metrics["teacher_completions"],
+                )
+                for metric_name in (
+                    "p1_reaction_active",
+                    "p1_reaction_remaining_valid",
+                    "p2_reaction_active",
+                    "p2_reaction_remaining_valid",
+                    "defense_non_neutral",
+                    "confirm_non_neutral",
+                ):
+                    self.logger.record(
+                        f"{prefix}/{metric_name}_rate",
+                        mode_event_metrics[metric_name] / mode_event_steps,
+                        exclude="stdout",
+                    )
+                for metric_name in (
+                    "block_contact",
+                    "clean_hit",
+                    "blockstun_end",
+                    "starter_hit",
+                    "starter_blocked",
+                ):
+                    self.logger.record(
+                        f"{prefix}/{metric_name}_per_1k_frames",
+                        mode_event_metrics[metric_name]
+                        * 1000.0
+                        / mode_event_frames,
+                        exclude="stdout",
+                    )
+                free_decision_count = max(
+                    1.0,
+                    self.fight_mode_free_decision_steps[fight_mode],
+                )
+                self.logger.record(
+                    f"{prefix}/free_decision_steps",
+                    self.fight_mode_free_decision_steps[fight_mode],
+                    exclude="stdout",
+                )
+                for action_id in TACTICAL_ACTION_IDS:
+                    available_steps = self.fight_mode_action_available[
+                        fight_mode
+                    ][action_id]
+                    selected_total = self.fight_mode_action_selected[
+                        fight_mode
+                    ][action_id]
+                    self.logger.record(
+                        f"{prefix}/action_{action_id}_selection_rate_when_available",
+                        selected_total / max(1.0, available_steps),
+                        exclude="stdout",
+                    )
+                    self.logger.record(
+                        f"{prefix}/action_{action_id}_free_decision_rate",
+                        self.fight_mode_free_action_selected[
+                            fight_mode
+                        ][action_id] / free_decision_count,
+                        exclude="stdout",
+                    )
+                self.logger.record(
+                    f"{prefix}/crouch_b_close_c_free_decision_rate",
+                    (
+                        self.fight_mode_free_action_selected[fight_mode][11]
+                        + self.fight_mode_free_action_selected[fight_mode][8]
+                    ) / free_decision_count,
+                    exclude="stdout",
+                )
+                for condition, tag_name in TACTICAL_CONDITION_TAGS.items():
+                    tactical_metrics = self.cumulative_mode_tactical_metrics[
+                        fight_mode
+                    ][condition]
+                    opportunity_count = max(
+                        1.0,
+                        tactical_metrics["opportunities"],
+                    )
+                    self.logger.record(
+                        f"{prefix}/{tag_name}_opportunities_cumulative",
+                        tactical_metrics["opportunities"],
+                        exclude="stdout",
+                    )
+                    self.logger.record(
+                        f"{prefix}/{tag_name}_rate",
+                        tactical_metrics["successes"] / opportunity_count,
+                        exclude="stdout",
+                    )
+                approach_opportunities = max(
+                    1.0,
+                    self.cumulative_mode_tactical_metrics[fight_mode]["approach"][
+                        "opportunities"
+                    ],
+                )
+                self.logger.record(
+                    f"{prefix}/approach_p1_progress_mean",
+                    self.cumulative_mode_approach_progress[fight_mode]
+                    / approach_opportunities,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/approach_forward_frames_mean",
+                    self.cumulative_mode_approach_forward_frames[fight_mode]
+                    / approach_opportunities,
+                    exclude="stdout",
                 )
                 for p2_style, style_metrics in self.fight_style_metrics[
                     fight_mode
@@ -1215,6 +1988,98 @@ def main() -> int:
                         f"{style_prefix}/teacher_completions_total",
                         style_metrics["teacher_completions"],
                     )
+            for curriculum_name, metrics in self.fight_curriculum_metrics.items():
+                prefix = f"kof_fight_targeted/{curriculum_name}"
+                episode_count = max(1.0, metrics["episodes"])
+                opportunity_count = max(1.0, metrics["opportunities"])
+                self.logger.record(
+                    f"{prefix}/opportunities_total",
+                    metrics["opportunities"],
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/success_per_opportunity_step",
+                    metrics["successes"] / opportunity_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/episode_success_rate",
+                    metrics["reward_machine_successes"] / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/episode_failure_rate",
+                    metrics["reward_machine_failures"] / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/episode_timeout_rate",
+                    metrics["reward_machine_timeouts"] / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/reward_total",
+                    metrics["reward_total"],
+                    exclude="stdout",
+                )
+                if curriculum_name == FightCurriculum.DEFENSE.value:
+                    counter_opportunity_count = max(
+                        1.0,
+                        metrics["counter_opportunities"],
+                    )
+                    self.logger.record(
+                        f"{prefix}/block_contact_success_per_opportunity_step",
+                        metrics["guard_successes"] / opportunity_count,
+                        exclude="stdout",
+                    )
+                    self.logger.record(
+                        f"{prefix}/counter_hit_success_per_opportunity_step",
+                        metrics["counter_successes"] / counter_opportunity_count,
+                        exclude="stdout",
+                    )
+                self.logger.record(
+                    f"{prefix}/win_rate",
+                    metrics["wins"] / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/combo_4plus_episode_rate",
+                    metrics["combo_4plus"] / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/episode_max_combo_mean",
+                    metrics["episode_max_total"] / episode_count,
+                    exclude="stdout",
+                )
+            for recipe_name, metrics in self.level_recipe_metrics.items():
+                prefix = f"kof_level/{recipe_name}"
+                episode_count = max(1.0, metrics["episodes"])
+                self.logger.record(
+                    f"{prefix}/episode_success_rate",
+                    metrics["successes"] / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/failure_rate",
+                    metrics["failures"] / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/timeout_rate",
+                    metrics["timeouts"] / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/episode_frames_mean",
+                    metrics["frames_total"] / episode_count,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"{prefix}/reward_total",
+                    metrics["reward_total"],
+                    exclude="stdout",
+                )
             for action_id in range(ACTION_COUNT):
                 available_steps = float(self.fight_action_available[action_id])
                 selected_total = float(self.fight_action_selected[action_id])
@@ -1288,10 +2153,16 @@ def main() -> int:
         combo_state_path = root / "saves" / "states" / "kof98.slot1.state"
     elif not combo_state_path.is_absolute():
         combo_state_path = root / combo_state_path
+    combo_scenario_arguments = args.combo_scenario
+    if combo_scenario_arguments is None and args.combo_suite == "kyo29":
+        combo_scenario_arguments = [
+            f"{scenario_name}=saves\\states\\kof98.slot{slot}.state"
+            for scenario_name, slot in KYO29_COMBO_SUITE
+        ]
     try:
         combo_scenario_specs = resolve_combo_scenario_specs(
             root,
-            args.combo_scenario,
+            combo_scenario_arguments,
             combo_state_path,
         )
     except ValueError as error:
@@ -1303,15 +2174,137 @@ def main() -> int:
     elif not fight_state_path.is_absolute():
         fight_state_path = root / fight_state_path
 
-    validate_file(root / "build-vs2026-x64" / "Release" / "fbneo_training.dll", "fbneo_training.dll")
+    training_dll_path = root / "build-vs2026-x64" / "Release" / "fbneo_training.dll"
+    validate_file(training_dll_path, "fbneo_training.dll")
     validate_file(root / "downloads" / "fbneo_libretro" / "fbneo_libretro.dll", "fbneo_libretro.dll")
     validate_file(root / "roms" / "fbneo" / "kof98.zip", "kof98.zip")
+    try:
+        contract_client = KofEnvClient(training_dll_path)
+        runtime_contract = contract_client.contract_metadata()
+        contract_client.close()
+    except (OSError, RuntimeError) as error:
+        print(f"fbneo_training contract check failed: {error}", file=sys.stderr)
+        return 2
     combo_env_count = training_profiles.count(TrainingProfile.COMBO)
     fight_env_count = training_profiles.count(TrainingProfile.FIGHT)
+    if (
+        fight_env_count
+        and effective_action_repeat != runtime_contract["p1_hold_chunk_frames"]
+    ):
+        print(
+            "Fight training with action-set version "
+            f"{runtime_contract['action_set_version']} requires action_repeat="
+            f"{runtime_contract['p1_hold_chunk_frames']} so P1 hold chunks end "
+            "on a decision boundary. Use --preset repeat4.",
+            file=sys.stderr,
+        )
+        return 2
     if args.guided_fight_envs < 0 or args.guided_fight_envs > fight_env_count:
         print(
             "--guided-fight-envs must be between 0 and the number of Fight environments "
             f"({fight_env_count}).",
+            file=sys.stderr,
+        )
+        return 2
+    level_recipe_bank_path: Optional[Path] = None
+    level_recipes: list[LevelRecipe] = []
+    if args.level_recipe_bank is not None:
+        if args.targeted_fight_curriculum or args.targeted_fight_envs is not None:
+            print(
+                "--level-recipe-bank replaces the legacy Targeted Fight "
+                "curriculum flags; do not combine them.",
+                file=sys.stderr,
+            )
+            return 2
+        level_recipe_bank_path = (
+            args.level_recipe_bank
+            if args.level_recipe_bank.is_absolute()
+            else root / args.level_recipe_bank
+        ).resolve()
+        validate_file(level_recipe_bank_path, "Level Recipe bank")
+        try:
+            level_recipes = load_level_recipes(level_recipe_bank_path)
+        except (KeyError, TypeError, ValueError, OSError) as error:
+            print(f"Invalid Level Recipe bank: {error}", file=sys.stderr)
+            return 2
+        if not level_recipes:
+            print("Level Recipe bank contains no recipes.", file=sys.stderr)
+            return 2
+        if observation_version is ObservationVersion.V1:
+            print(
+                "--level-recipe-bank requires --observation-version v2 or v3 so the "
+                "policy can observe measured strategy state.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.fight_reward_version == "auto":
+            fight_reward_version = FightRewardVersion.SYMMETRIC_TACTICAL_V3
+            effective_fight_reward_version = fight_reward_version
+        elif (
+            fight_reward_version
+            is not FightRewardVersion.SYMMETRIC_TACTICAL_V3
+        ):
+            print(
+                "--level-recipe-bank requires --fight-reward-version "
+                f"{FightRewardVersion.SYMMETRIC_TACTICAL_V3.value}.",
+                file=sys.stderr,
+            )
+            return 2
+        for recipe in level_recipes:
+            validate_file(recipe.base_state, f"Level Recipe state for {recipe.name}")
+        targeted_fight_curricula = tuple(
+            dict.fromkeys(FightCurriculum(recipe.task.value) for recipe in level_recipes)
+        )
+        available_recipe_workers = max(0, fight_env_count - args.guided_fight_envs)
+        targeted_fight_env_count = (
+            min(len(level_recipes), available_recipe_workers)
+            if args.level_recipe_envs is None
+            else args.level_recipe_envs
+        )
+        fight_rotation_enabled = True
+    else:
+        if args.level_recipe_envs is not None:
+            print("--level-recipe-envs requires --level-recipe-bank.", file=sys.stderr)
+            return 2
+        targeted_fight_curricula = tuple(
+            FightCurriculum(value)
+            for value in (args.targeted_fight_curriculum or [])
+        )
+        targeted_fight_env_count = (
+            len(targeted_fight_curricula)
+            if args.targeted_fight_envs is None
+            else args.targeted_fight_envs
+        )
+        fight_rotation_enabled = args.targeted_fight_envs is not None
+    if targeted_fight_env_count < 0:
+        print("--targeted-fight-envs must be 0 or greater.", file=sys.stderr)
+        return 2
+    if level_recipes and targeted_fight_env_count == 0:
+        print(
+            "--level-recipe-bank requires at least one available Fight worker.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.oracle_teacher_weight < 0.0:
+        print("--oracle-teacher-weight must be non-negative.", file=sys.stderr)
+        return 2
+    if args.oracle_teacher_weight > 0.0 and not level_recipes:
+        print(
+            "--oracle-teacher-weight requires --level-recipe-bank.",
+            file=sys.stderr,
+        )
+        return 2
+    if targeted_fight_env_count and not targeted_fight_curricula:
+        print(
+            "Targeted Fight workers require either a Level Recipe bank or at "
+            "least one --targeted-fight-curriculum.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.guided_fight_envs + targeted_fight_env_count > fight_env_count:
+        print(
+            "Guided and targeted Fight environments exceed the number of Fight "
+            f"environments ({fight_env_count}).",
             file=sys.stderr,
         )
         return 2
@@ -1325,25 +2318,179 @@ def main() -> int:
             or [style.value for style in P2Style]
         )
     )
-    p2_style_assignments = [
-        {
+    targeted_style = {
+        FightCurriculum.DEFENSE: P2Style.POKE,
+        FightCurriculum.ANTI_AIR: P2Style.JUMP_IN,
+        FightCurriculum.APPROACH: P2Style.GUARD,
+        FightCurriculum.HIT_CONFIRM: P2Style.POKE,
+    }
+
+    def targeted_worker_index(fight_index: int) -> Optional[int]:
+        targeted_index = fight_index - args.guided_fight_envs
+        if 0 <= targeted_index < targeted_fight_env_count:
+            return targeted_index
+        return None
+
+    def physical_worker_index(fight_index: int) -> Optional[int]:
+        physical_index = (
+            fight_index
+            - args.guided_fight_envs
+            - targeted_fight_env_count
+        )
+        return physical_index if physical_index >= 0 else None
+
+    def fight_curriculum_for_index(fight_index: int) -> FightCurriculum:
+        if fight_index < args.guided_fight_envs:
+            return FightCurriculum.COMBO_ROUTE
+        targeted_index = targeted_worker_index(fight_index)
+        if targeted_index is not None:
+            if level_recipes:
+                return FightCurriculum(
+                    level_recipes[targeted_index % len(level_recipes)].task.value
+                )
+            return targeted_fight_curricula[
+                targeted_index % len(targeted_fight_curricula)
+            ]
+        return FightCurriculum.NONE
+
+    def p2_style_for_index(fight_index: int) -> P2Style:
+        curriculum = fight_curriculum_for_index(fight_index)
+        physical_index = physical_worker_index(fight_index)
+        style_index = (
+            physical_index
+            if fight_rotation_enabled and physical_index is not None
+            else fight_index
+        )
+        return targeted_style.get(
+            curriculum,
+            p2_styles[style_index % len(p2_styles)],
+        )
+
+    targeted_fight_rotation = (
+        []
+        if level_recipes
+        else [
+            (curriculum, targeted_style[curriculum])
+            for curriculum in targeted_fight_curricula
+        ]
+    )
+    physical_fight_rotation = [
+        (FightCurriculum.NONE, style)
+        for style in p2_styles
+    ]
+
+    def fight_rotation_for_index(
+        fight_index: int,
+    ) -> Optional[list[tuple[FightCurriculum, P2Style]]]:
+        if not fight_rotation_enabled:
+            return None
+        if targeted_worker_index(fight_index) is not None:
+            if level_recipes:
+                return None
+            return targeted_fight_rotation
+        if physical_worker_index(fight_index) is not None:
+            return physical_fight_rotation
+        return None
+
+    def fight_rotation_offset_for_index(fight_index: int) -> int:
+        targeted_index = targeted_worker_index(fight_index)
+        if targeted_index is not None:
+            return targeted_index
+        physical_index = physical_worker_index(fight_index)
+        return physical_index if physical_index is not None else 0
+
+    def level_recipe_rotation_for_index(
+        fight_index: int,
+    ) -> Optional[list[LevelRecipe]]:
+        if level_recipes and targeted_worker_index(fight_index) is not None:
+            return level_recipes
+        return None
+
+    def level_recipe_rotation_offset_for_index(fight_index: int) -> int:
+        targeted_index = targeted_worker_index(fight_index)
+        return targeted_index if targeted_index is not None else 0
+
+    p2_style_assignments = []
+    for fight_index in range(fight_env_count):
+        fight_rotation = fight_rotation_for_index(fight_index)
+        p2_style_assignments.append({
             "fight_index": fight_index,
             "mode": (
                 "guided"
                 if fight_index < args.guided_fight_envs
-                else "physical"
+                else (
+                    "targeted"
+                    if fight_curriculum_for_index(fight_index)
+                    is not FightCurriculum.NONE
+                    else "physical"
+                )
             ),
-            "style": p2_styles[fight_index % len(p2_styles)].value,
+            "curriculum": fight_curriculum_for_index(fight_index).value,
+            "style": p2_style_for_index(fight_index).value,
             "guided_scenario": (
                 guided_fight_scenarios[
                     fight_index % len(guided_fight_scenarios)
                 ]
-                if fight_index < args.guided_fight_envs
+                if fight_curriculum_for_index(fight_index) in (
+                    FightCurriculum.COMBO_ROUTE,
+                    FightCurriculum.HIT_CONFIRM,
+                )
                 else None
             ),
-        }
-        for fight_index in range(fight_env_count)
-    ]
+            "rotation": [
+                {
+                    "curriculum": curriculum.value,
+                    "style": style.value,
+                }
+                for curriculum, style in (fight_rotation or [])
+            ],
+            "level_recipes": [
+                recipe.name
+                for recipe in (
+                    level_recipe_rotation_for_index(fight_index) or []
+                )
+            ],
+        })
+
+    metrics_fight_assignments = list(p2_style_assignments)
+    if level_recipes and targeted_fight_env_count:
+        metrics_fight_assignments.extend(
+            {
+                "fight_index": -1,
+                "mode": "targeted",
+                "curriculum": curriculum.value,
+                "style": targeted_style[curriculum].value,
+                "guided_scenario": None,
+            }
+            for curriculum in targeted_fight_curricula
+        )
+    elif fight_rotation_enabled and targeted_fight_env_count:
+        metrics_fight_assignments.extend(
+            {
+                "fight_index": -1,
+                "mode": "targeted",
+                "curriculum": curriculum.value,
+                "style": targeted_style[curriculum].value,
+                "guided_scenario": None,
+            }
+            for curriculum in targeted_fight_curricula
+        )
+    physical_fight_env_count = (
+        fight_env_count
+        - args.guided_fight_envs
+        - targeted_fight_env_count
+    )
+    if fight_rotation_enabled and physical_fight_env_count:
+        metrics_fight_assignments.extend(
+            {
+                "fight_index": -1,
+                "mode": "physical",
+                "curriculum": FightCurriculum.NONE.value,
+                "style": style.value,
+                "guided_scenario": None,
+            }
+            for style in p2_styles
+        )
     if combo_env_count:
         for scenario_name, scenario_state_path in combo_scenario_specs:
             validate_file(scenario_state_path, f"Combo state for {scenario_name}")
@@ -1354,11 +2501,30 @@ def main() -> int:
     print(
         f"Training environments: Combo={combo_env_count}, "
         f"Guided Fight={args.guided_fight_envs}, "
-        f"Physical Fight={fight_env_count - args.guided_fight_envs}"
+        f"Targeted Fight={targeted_fight_env_count}, "
+        f"Physical Fight={physical_fight_env_count}"
     )
     if fight_env_count:
         print(
             "P2 styles: "
+            + ", ".join(style.value for style in p2_styles)
+        )
+    if fight_rotation_enabled and targeted_fight_env_count:
+        if level_recipes:
+            print(
+                "Level Recipe rotation: "
+                + ", ".join(recipe.name for recipe in level_recipes)
+            )
+        else:
+            print(
+                "Targeted curriculum rotation: "
+                + ", ".join(
+                    curriculum.value for curriculum in targeted_fight_curricula
+                )
+            )
+    if fight_rotation_enabled and physical_fight_env_count:
+        print(
+            "Physical P2 style rotation: "
             + ", ".join(style.value for style in p2_styles)
         )
 
@@ -1379,6 +2545,22 @@ def main() -> int:
     if args.resume:
         resume_path = args.resume if args.resume.is_absolute() else root / args.resume
         validate_file(resume_path, "Resume model")
+    migrate_path: Optional[Path] = None
+    if args.migrate_from:
+        migrate_path = (
+            args.migrate_from
+            if args.migrate_from.is_absolute()
+            else root / args.migrate_from
+        )
+        validate_file(migrate_path, "V1 migration source model")
+    teacher_path: Optional[Path] = None
+    if args.teacher_model:
+        teacher_path = (
+            args.teacher_model
+            if args.teacher_model.is_absolute()
+            else root / args.teacher_model
+        )
+        validate_file(teacher_path, "Teacher model")
 
     manifest_files: dict[str, Path] = {
         "fbneo_training_dll": root / "build-vs2026-x64" / "Release" / "fbneo_training.dll",
@@ -1390,8 +2572,18 @@ def main() -> int:
             manifest_files[f"combo_state_{scenario_name}"] = scenario_state_path
     if fight_env_count:
         manifest_files["fight_state"] = fight_state_path
+    if level_recipe_bank_path is not None:
+        manifest_files["level_recipe_bank"] = level_recipe_bank_path
+        for recipe in level_recipes:
+            manifest_files[
+                f"level_state_{recipe.name}"
+            ] = recipe.base_state
     if resume_path is not None:
         manifest_files["resume_model"] = resume_path
+    if migrate_path is not None:
+        manifest_files["migration_source_model"] = migrate_path
+    if teacher_path is not None:
+        manifest_files["teacher_model"] = teacher_path
     manifest_path = log_dir / (
         f"run_manifest_{args.save_name}_"
         f"{run_timestamp}.json"
@@ -1407,16 +2599,67 @@ def main() -> int:
             "gae_lambda": effective_gae_lambda,
             "n_steps": effective_n_steps,
             "timesteps": args.timesteps,
+            "checkpoint_every": args.checkpoint_every,
+            "relative_checkpoints": args.relative_checkpoints,
+            "seed": args.seed,
             "num_envs": args.num_envs,
             "profile": args.profile,
             "combo_ratio": args.combo_ratio,
             "guided_fight_envs": args.guided_fight_envs,
             "guided_fight_scenarios": guided_fight_scenarios,
+            "targeted_fight_envs": targeted_fight_env_count,
+            "level_recipe_bank": (
+                str(level_recipe_bank_path)
+                if level_recipe_bank_path is not None
+                else None
+            ),
+            "level_recipe_envs": (
+                targeted_fight_env_count if level_recipes else 0
+            ),
+            "level_recipes": [
+                recipe.to_dict() for recipe in level_recipes
+            ],
+            "fight_rotation_enabled": fight_rotation_enabled,
+            "targeted_fight_curricula": [
+                curriculum.value for curriculum in targeted_fight_curricula
+            ],
+            "targeted_fight_rotation": [
+                {
+                    "curriculum": curriculum.value,
+                    "style": style.value,
+                }
+                for curriculum, style in (
+                    targeted_fight_rotation if fight_rotation_enabled else []
+                )
+            ],
+            "physical_p2_style_rotation": [
+                style.value
+                for _, style in (
+                    physical_fight_rotation if fight_rotation_enabled else []
+                )
+            ],
             "p2_styles": tuple(style.value for style in p2_styles),
             "p2_style_assignments": p2_style_assignments,
             "mask_level": args.mask_level,
             "p2_training_ai": args.p2_training_ai,
-            "fight_reward_version": FIGHT_REWARD_VERSION,
+            "fight_reward_version": effective_fight_reward_version.value,
+            "observation_version": observation_version.value,
+            "observation_schema_id": observation_schema_id(observation_version),
+            "observation_size": observation_size(observation_version),
+            "observation_event_features": (
+                not args.disable_observation_event_features
+            ),
+            "runtime_contract": runtime_contract,
+            "allow_action_set_migration": args.allow_action_set_migration,
+            "migration_source_model": str(migrate_path) if migrate_path else None,
+            "teacher_model": str(teacher_path) if teacher_path else None,
+            "teacher_weight": args.teacher_weight,
+            "teacher_decay_steps": args.teacher_decay_steps,
+            "teacher_batch_size": args.teacher_batch_size,
+            "oracle_teacher_weight": args.oracle_teacher_weight,
+            "oracle_teacher_decay_steps": args.oracle_teacher_decay_steps,
+            "oracle_teacher_batch_size": args.oracle_teacher_batch_size,
+            "oracle_teacher_updates": args.oracle_teacher_updates,
             "tensorboard_run_name": tensorboard_run_name,
         },
         manifest_files=manifest_files,
@@ -1427,8 +2670,22 @@ def main() -> int:
     if args.tensorboard:
         start_tensorboard(log_dir, args.tensorboard_port)
 
+    # 環境編組:Combo env 在每次 reset 輪替全部 scenario;Targeted Fight
+    # 輪替完整 curriculum pool;Physical Fight 輪替完整 P2 style pool。
     environment_specs: list[
-        tuple[TrainingProfile, str, Path, bool, P2Style]
+        tuple[
+            TrainingProfile,
+            str,
+            Path,
+            FightCurriculum,
+            P2Style,
+            int,
+            Optional[list[tuple[FightCurriculum, P2Style]]],
+            int,
+            int,
+            Optional[list[LevelRecipe]],
+            int,
+        ]
     ] = []
     combo_spec_index = 0
     fight_spec_index = 0
@@ -1437,17 +2694,45 @@ def main() -> int:
             scenario_name, scenario_state_path = combo_scenario_specs[
                 combo_spec_index % len(combo_scenario_specs)
             ]
+            combo_rotation_offset = combo_spec_index
             combo_spec_index += 1
-            fight_guided = False
+            fight_curriculum = FightCurriculum.NONE
             p2_style = P2Style.ONIYAKI
+            fight_rotation = None
+            fight_rotation_offset = 0
+            fight_rotation_stride = 1
+            level_recipe_rotation = None
+            level_recipe_rotation_offset = 0
         else:
-            fight_guided = fight_spec_index < args.guided_fight_envs
-            p2_style = p2_styles[fight_spec_index % len(p2_styles)]
+            combo_rotation_offset = 0
+            fight_curriculum = fight_curriculum_for_index(fight_spec_index)
+            p2_style = p2_style_for_index(fight_spec_index)
+            fight_rotation = fight_rotation_for_index(fight_spec_index)
+            fight_rotation_offset = fight_rotation_offset_for_index(
+                fight_spec_index
+            )
+            fight_rotation_stride = 1
+            level_recipe_rotation = level_recipe_rotation_for_index(
+                fight_spec_index
+            )
+            level_recipe_rotation_offset = (
+                level_recipe_rotation_offset_for_index(fight_spec_index)
+            )
+            needs_guided_scenario = fight_curriculum in (
+                FightCurriculum.COMBO_ROUTE,
+                FightCurriculum.HIT_CONFIRM,
+            ) or any(
+                curriculum in (
+                    FightCurriculum.COMBO_ROUTE,
+                    FightCurriculum.HIT_CONFIRM,
+                )
+                for curriculum, _ in (fight_rotation or [])
+            )
             scenario_name = (
                 guided_fight_scenarios[
                     fight_spec_index % len(guided_fight_scenarios)
                 ]
-                if fight_guided
+                if needs_guided_scenario
                 else combo_scenario_specs[0][0]
             )
             scenario_state_path = combo_scenario_specs[0][1]
@@ -1457,8 +2742,14 @@ def main() -> int:
                 training_profile,
                 scenario_name,
                 scenario_state_path,
-                fight_guided,
+                fight_curriculum,
                 p2_style,
+                combo_rotation_offset,
+                fight_rotation,
+                fight_rotation_offset,
+                fight_rotation_stride,
+                level_recipe_rotation,
+                level_recipe_rotation_offset,
             )
         )
 
@@ -1467,8 +2758,14 @@ def main() -> int:
         training_profile: TrainingProfile,
         combo_scenario: str,
         scenario_state_path: Path,
-        fight_guided: bool,
+        fight_curriculum: FightCurriculum,
         p2_style: P2Style,
+        combo_rotation_offset: int,
+        fight_rotation: Optional[list[tuple[FightCurriculum, P2Style]]],
+        fight_rotation_offset: int,
+        fight_rotation_stride: int,
+        level_recipe_rotation: Optional[list[LevelRecipe]],
+        level_recipe_rotation_offset: int,
     ) -> Callable:
         def _init():
             return MaskableMonitor(make_env(
@@ -1477,12 +2774,26 @@ def main() -> int:
                 fight_state_path=fight_state_path,
                 training_profile=training_profile,
                 combo_scenario=combo_scenario,
+                combo_scenario_rotation=(
+                    combo_scenario_specs
+                    if training_profile is TrainingProfile.COMBO
+                    else None
+                ),
+                combo_rotation_offset=combo_rotation_offset,
+                combo_rotation_stride=max(1, combo_env_count),
                 action_mask_level=ActionMaskLevel(args.mask_level),
                 action_repeat=effective_action_repeat,
                 seed=seed,
                 p2_training_ai=args.p2_training_ai,
                 p2_style=p2_style,
-                fight_guided=fight_guided,
+                fight_guided=fight_curriculum is FightCurriculum.COMBO_ROUTE,
+                fight_curriculum=fight_curriculum,
+                fight_rotation=fight_rotation,
+                fight_rotation_offset=fight_rotation_offset,
+                fight_rotation_stride=fight_rotation_stride,
+                level_recipe_rotation=level_recipe_rotation,
+                level_recipe_rotation_offset=level_recipe_rotation_offset,
+                level_recipe_rotation_stride=1,
                 hitbox_reward=not args.no_hitbox_reward,
                 viewer=args.viewer,
                 viewer_scale=args.viewer_scale,
@@ -1490,6 +2801,11 @@ def main() -> int:
                 viewer_speed=args.viewer_speed,
                 viewer_hitboxes=args.viewer_hitboxes,
                 viewer_terminal_tail_frames=args.viewer_terminal_tail_frames,
+                observation_version=observation_version,
+                observation_event_features=(
+                    not args.disable_observation_event_features
+                ),
+                fight_reward_version=fight_reward_version,
             )())
 
         return _init
@@ -1500,15 +2816,27 @@ def main() -> int:
             training_profile,
             combo_scenario,
             scenario_state_path,
-            fight_guided,
+            fight_curriculum,
             p2_style,
+            combo_rotation_offset,
+            fight_rotation,
+            fight_rotation_offset,
+            fight_rotation_stride,
+            level_recipe_rotation,
+            level_recipe_rotation_offset,
         )
         for seed, (
             training_profile,
             combo_scenario,
             scenario_state_path,
-            fight_guided,
+            fight_curriculum,
             p2_style,
+            combo_rotation_offset,
+            fight_rotation,
+            fight_rotation_offset,
+            fight_rotation_stride,
+            level_recipe_rotation,
+            level_recipe_rotation_offset,
         )
         in enumerate(environment_specs)
     ]
@@ -1517,29 +2845,51 @@ def main() -> int:
     else:
         env = MaskableSubprocVecEnv(env_fns, start_method="spawn")
 
-    checkpoint_callback = CheckpointCallback(
-        save_freq=max(1, 31_250 // max(1, len(env_fns))),
-        save_path=str(save_dir),
-        name_prefix=args.save_name,
-    )
-    callback = CallbackList([checkpoint_callback, TrainingMetricsCallback()])
-
-    if resume_path is not None:
-        model = MaskablePPO.load(
-            str(resume_path),
-            env=env,
-            device=args.device,
-            tensorboard_log=str(log_dir),
-            gamma=effective_gamma,
-            gae_lambda=effective_gae_lambda,
-            n_steps=effective_n_steps,
-        )
-        print(
-            f"Resumed with gamma={effective_gamma}, "
-            f"gae_lambda={effective_gae_lambda}, n_steps={effective_n_steps}"
+    if args.checkpoint_every <= 0:
+        raise ValueError("--checkpoint-every must be greater than zero")
+    if args.relative_checkpoints:
+        checkpoint_callback = RelativeCheckpointCallback(
+            interval_timesteps=args.checkpoint_every,
+            total_timesteps=args.timesteps,
+            save_path=save_dir,
+            name_prefix=args.save_name,
         )
     else:
-        model = MaskablePPO(
+        checkpoint_callback = CheckpointCallback(
+            save_freq=max(
+                1,
+                args.checkpoint_every // max(1, len(env_fns)),
+            ),
+            save_path=str(save_dir),
+            name_prefix=args.save_name,
+        )
+    callbacks = [
+        checkpoint_callback,
+        TrainingMetricsCallback(metrics_fight_assignments),
+    ]
+    if teacher_path is not None:
+        callbacks.append(
+            KickstartTeacherCallback(
+                teacher_path,
+                legacy_observation_size=OBSERVATION_V1_SIZE,
+                initial_weight=args.teacher_weight,
+                decay_timesteps=args.teacher_decay_steps,
+                batch_size=args.teacher_batch_size,
+            )
+        )
+    if level_recipes and args.oracle_teacher_weight > 0.0:
+        callbacks.append(
+            OracleCurriculumCallback(
+                initial_weight=args.oracle_teacher_weight,
+                decay_timesteps=args.oracle_teacher_decay_steps,
+                batch_size=args.oracle_teacher_batch_size,
+                updates_per_rollout=args.oracle_teacher_updates,
+            )
+        )
+    callback = CallbackList(callbacks)
+
+    def create_new_model():
+        return MaskablePPO(
             "MlpPolicy",
             env,
             device=args.device,
@@ -1554,13 +2904,148 @@ def main() -> int:
             clip_range=0.2,
             target_kl=0.03,
             tensorboard_log=str(log_dir),
+            seed=args.seed,
         )
+
+    expected_model_contract = {
+        "kof_action_set_version": runtime_contract["action_set_version"],
+        "kof_action_count": runtime_contract["action_count"],
+        "kof_observation_schema_id": observation_schema_id(observation_version),
+    }
+
+    def stamp_model_contract(target_model) -> None:
+        for name, value in expected_model_contract.items():
+            setattr(target_model, name, value)
+
+    def validate_resume_contract(target_model) -> None:
+        mismatches = []
+        for name, expected_value in expected_model_contract.items():
+            actual_value = getattr(target_model, name, None)
+            if actual_value != expected_value:
+                mismatches.append(
+                    f"{name}: checkpoint={actual_value!r}, runtime={expected_value!r}"
+                )
+        if not mismatches:
+            return
+        details = "; ".join(mismatches)
+        if not args.allow_action_set_migration:
+            raise ValueError(
+                "Checkpoint contract does not match this training runtime: "
+                f"{details}. Add --allow-action-set-migration only when this "
+                "semantic change is intentional."
+            )
+        print(f"Explicit action-set/schema migration accepted: {details}")
+
+    if resume_path is not None:
+        model = MaskablePPO.load(
+            str(resume_path),
+            env=env,
+            device=args.device,
+            tensorboard_log=str(log_dir),
+            gamma=effective_gamma,
+            gae_lambda=effective_gae_lambda,
+            n_steps=effective_n_steps,
+        )
+        validate_resume_contract(model)
+        stamp_model_contract(model)
+        print(
+            f"Resumed with gamma={effective_gamma}, "
+            f"gae_lambda={effective_gae_lambda}, n_steps={effective_n_steps}"
+        )
+    elif migrate_path is not None:
+        source_model = MaskablePPO.load(str(migrate_path), device="cpu")
+        source_shape = tuple(source_model.observation_space.shape)
+        if int(source_model.action_space.n) != ACTION_COUNT:
+            raise ValueError(
+                f"Migration source has {source_model.action_space.n} actions; "
+                f"expected {ACTION_COUNT}"
+            )
+        model = create_new_model()
+        stamp_model_contract(model)
+        if observation_version is ObservationVersion.V2:
+            source_schema = getattr(
+                source_model,
+                "kof_observation_schema_id",
+                None,
+            )
+            if (
+                source_shape == (OBSERVATION_V2_SIZE,)
+                and source_schema == OBSERVATION_SCHEMA_V2_ID
+            ):
+                model.policy.load_state_dict(
+                    source_model.policy.state_dict(),
+                    strict=True,
+                )
+                migration_message = (
+                    "Cloned V2 policy exactly with a fresh optimizer for "
+                    "controlled A/B comparison."
+                )
+            elif source_shape != (OBSERVATION_V1_SIZE,):
+                raise ValueError(
+                    "V2 migration source must be either a stamped V2 "
+                    "140-value checkpoint or a V1 26-value checkpoint; "
+                    f"got shape={source_shape}, schema={source_schema!r}"
+                )
+            else:
+                report = transplant_policy_observation_inputs(
+                    source_model,
+                    model,
+                    legacy_observation_size=OBSERVATION_V1_SIZE,
+                )
+                assert_legacy_policy_equivalence(
+                    source_model,
+                    model,
+                    legacy_observation_size=OBSERVATION_V1_SIZE,
+                    target_observation_size=observation_size(observation_version),
+                )
+                migration_message = (
+                    "Migrated V1 policy without changing legacy outputs: "
+                    f"{len(report.copied_tensors)} tensors copied, "
+                    f"{len(report.expanded_tensors)} input tensors widened."
+                )
+        else:
+            source_schema = getattr(
+                source_model,
+                "kof_observation_schema_id",
+                None,
+            )
+            if source_shape != (OBSERVATION_V2_SIZE,):
+                raise ValueError(
+                    "V2->V3 migration source must use the 140-value "
+                    f"observation, got {source_shape}"
+                )
+            if source_schema != OBSERVATION_SCHEMA_V2_ID:
+                raise ValueError(
+                    "V2->V3 migration requires a checkpoint stamped with "
+                    f"{OBSERVATION_SCHEMA_V2_ID!r}, got {source_schema!r}"
+                )
+            report = transplant_v2_policy_to_v3(source_model, model)
+            assert_v2_v3_policy_equivalence(source_model, model)
+            migration_message = (
+                "Migrated V2 policy to V3 with deterministic-equivalent "
+                "neutral outputs: "
+                f"{len(report.copied_tensors)} tensors copied, "
+                f"{len(report.transformed_tensors)} first-layer tensors "
+                "bias-folded/zeroed; 10,000 float32 samples passed."
+            )
+        model.num_timesteps = int(source_model.num_timesteps)
+        model._n_updates = int(getattr(source_model, "_n_updates", 0))
+        print(migration_message)
+    else:
+        model = create_new_model()
+        stamp_model_contract(model)
+
+    # MaskablePPO.load() restores the checkpoint's original seed. Explicitly
+    # reseed both policy sampling and vector environments so paired B/C runs
+    # share a seed while the three pilot pairs remain independent.
+    model.set_random_seed(args.seed)
+    print(f"PPO/vector RNG seed: {args.seed}", flush=True)
 
     try:
         model.learn(
             total_timesteps=args.timesteps,
             callback=callback,
-            reset_num_timesteps=args.resume is None,
+            reset_num_timesteps=resume_path is None and migrate_path is None,
             tb_log_name=tensorboard_run_name,
         )
         final_path = save_dir / f"{args.save_name}_final.zip"

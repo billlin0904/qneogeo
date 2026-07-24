@@ -14,8 +14,11 @@ FbneoTrainingCore::FbneoTrainingCore(EmulatorView *videoOutput, QObject *parent)
     : LibretroCore(videoOutput, parent) {
     ppo_agent_bridge_ = new PpoAgentBridge(this);
     connect(ppo_agent_bridge_, &PpoAgentBridge::actionReady, this, [this](int32_t action_id) {
-        if (p2_ppo_ai_enabled_ && handle_ && kof_env_set_p2_action_)
-            kof_env_set_p2_action_(handle_, action_id);
+        p2_last_action_accepted_ =
+            p2_ppo_ai_enabled_ &&
+            handle_ &&
+            kof_env_set_p2_action_ &&
+            kof_env_set_p2_action_(handle_, action_id) != 0;
     });
     connect(ppo_agent_bridge_, &PpoAgentBridge::failed, this, [this](const QString &message) {
         p2_ppo_ai_enabled_ = false;
@@ -84,12 +87,14 @@ bool FbneoTrainingCore::startGame(const QString &contentPath,
     game_loaded_ = true;
     paused_ = false;
     resetInputFrameTracking();
+    resetPpoObservationState();
     if (p2_ppo_ai_enabled_ &&
         !ppo_agent_bridge_->start(
             p2_ppo_python_path_,
             p2_ppo_script_path_,
             p2_ppo_model_path_,
-            p2_ppo_combo_model_path_)) {
+            p2_ppo_combo_model_path_,
+            p2_ppo_pure_policy_)) {
         game_loaded_ = false;
         return fail(QStringLiteral("Could not start P2 PPO AI: %1")
                         .arg(ppo_agent_bridge_->lastError()));
@@ -106,6 +111,7 @@ void FbneoTrainingCore::stop() {
     destroyRuntime();
     game_loaded_ = false;
     resetInputFrameTracking();
+    resetPpoObservationState();
 
     if (videoOutput())
         videoOutput()->clearFrame();
@@ -130,6 +136,7 @@ bool FbneoTrainingCore::reset() {
         return failFromRuntime(QStringLiteral("fbneo_training reset failed"));
 
     resetInputFrameTracking();
+    resetPpoObservationState();
 
     if (resume_after_reset)
         frame_timer_.start(16);
@@ -185,8 +192,10 @@ bool FbneoTrainingCore::loadState(const QString &statePath) {
 
     const std::wstring state_path_w = QFileInfo(statePath).absoluteFilePath().toStdWString();
     const bool loaded = kof_env_load_state_(handle_, state_path_w.c_str()) != 0;
-    if (loaded)
+    if (loaded) {
         resetInputFrameTracking();
+        resetPpoObservationState();
+    }
 
     if (timer_was_active && !paused_)
         frame_timer_.start(16);
@@ -238,14 +247,16 @@ bool FbneoTrainingCore::setP2PpoAiEnabled(bool enabled,
                                           const QString &pythonPath,
                                           const QString &scriptPath,
                                           const QString &modelPath,
-                                          const QString &comboModelPath) {
+                                          const QString &comboModelPath,
+                                          bool purePolicy) {
     p2_ppo_python_path_ = pythonPath;
     p2_ppo_script_path_ = scriptPath;
     p2_ppo_model_path_ = modelPath;
     p2_ppo_combo_model_path_ = comboModelPath;
+    p2_ppo_pure_policy_ = purePolicy;
     p2_ppo_ai_enabled_ = enabled;
     p2_random_ai_enabled_ = false;
-    p2_ppo_frame_counter_ = 0;
+    resetPpoObservationState();
 
     if (handle_ && kof_env_set_p2_random_ai_)
         kof_env_set_p2_random_ai_(handle_, 0);
@@ -267,7 +278,8 @@ bool FbneoTrainingCore::setP2PpoAiEnabled(bool enabled,
             pythonPath,
             scriptPath,
             modelPath,
-            comboModelPath)) {
+            comboModelPath,
+            purePolicy)) {
         p2_ppo_ai_enabled_ = false;
         if (handle_ && kof_env_set_p2_action_ai_)
             kof_env_set_p2_action_ai_(handle_, 0);
@@ -338,6 +350,15 @@ bool FbneoTrainingCore::resolveSymbols() {
             resolveSymbol<kof_env_p2_ready_for_action_t>("kof_env_p2_ready_for_action");
         kof_env_get_observation_ =
             resolveSymbol<kof_env_get_observation_t>("kof_env_get_observation");
+        kof_env_get_strategy_state_v1_ =
+            resolveSymbol<kof_env_get_strategy_state_v1_t>(
+                "kof_env_get_strategy_state_v1");
+        kof_env_get_combat_timing_state_v1_ =
+            resolveSymbol<kof_env_get_combat_timing_state_v1_t>(
+                "kof_env_get_combat_timing_state_v1");
+        kof_env_get_step_events_v5_ =
+            resolveSymbol<kof_env_get_step_events_v5_t>(
+                "kof_env_get_step_events_v5");
         kof_env_run_frames_ = resolveSymbol<kof_env_run_frames_t>("kof_env_run_frames");
         kof_env_system_ram_size_ = resolveSymbol<kof_env_system_ram_size_t>("kof_env_system_ram_size");
         kof_env_copy_system_ram_ = resolveSymbol<kof_env_copy_system_ram_t>("kof_env_copy_system_ram");
@@ -412,6 +433,9 @@ void FbneoTrainingCore::unloadLibrary() {
     kof_env_p2_input_ready_ = nullptr;
     kof_env_p2_ready_for_action_ = nullptr;
     kof_env_get_observation_ = nullptr;
+    kof_env_get_strategy_state_v1_ = nullptr;
+    kof_env_get_combat_timing_state_v1_ = nullptr;
+    kof_env_get_step_events_v5_ = nullptr;
     kof_env_run_frames_ = nullptr;
     kof_env_system_ram_size_ = nullptr;
     kof_env_copy_system_ram_ = nullptr;
@@ -433,6 +457,7 @@ void FbneoTrainingCore::advanceFrame() {
     }
 
     if (p2_ppo_ai_enabled_) {
+        updateP2GenericCombatState();
         ++p2_ppo_frame_counter_;
         if (p2_ppo_frame_counter_ >= 4) {
             p2_ppo_frame_counter_ = 0;
@@ -528,6 +553,169 @@ void FbneoTrainingCore::updateJoypad() {
     }
 }
 
+void FbneoTrainingCore::updateP2GenericCombatState() {
+    if (!handle_ ||
+        !kof_env_get_combat_timing_state_v1_ ||
+        !kof_env_get_step_events_v5_) {
+        return;
+    }
+
+    kof_env_combat_timing_state_v1 timing {};
+    timing.struct_size = sizeof(timing);
+    timing.version = KOF_ENV_COMBAT_TIMING_STATE_VERSION_1;
+    if (!kof_env_get_combat_timing_state_v1_(handle_, &timing))
+        return;
+
+    kof_env_step_events_v5 batch {};
+    batch.struct_size = sizeof(batch);
+    batch.version = KOF_ENV_STEP_EVENTS_VERSION_5;
+    if (!kof_env_get_step_events_v5_(handle_, &batch))
+        return;
+
+    if (has_p2_event_epoch_ && batch.batch_event_epoch != p2_event_epoch_)
+        p2_generic_combat_state_ = {};
+    p2_event_epoch_ = batch.batch_event_epoch;
+    has_p2_event_epoch_ = true;
+    p2_combat_timing_state_ = timing;
+    has_p2_combat_timing_state_ = true;
+
+    auto setDefensePhase = [this](DefensePhase phase) {
+        if (p2_generic_combat_state_.defense_phase != phase) {
+            p2_generic_combat_state_.defense_phase = phase;
+            p2_generic_combat_state_.defense_phase_age_frames = 0;
+        }
+    };
+    auto setConfirmPhase = [this](ConfirmPhase phase) {
+        if (p2_generic_combat_state_.confirm_phase != phase) {
+            p2_generic_combat_state_.confirm_phase = phase;
+            p2_generic_combat_state_.confirm_phase_age_frames = 0;
+        }
+    };
+
+    ++p2_generic_combat_state_.defense_phase_age_frames;
+    ++p2_generic_combat_state_.confirm_phase_age_frames;
+
+    constexpr int32_t P2 = 2;
+    constexpr int32_t P1 = 1;
+    constexpr int32_t ATTACK_ACTION_MIN = 6;
+    const uint32_t event_count =
+        qMin(batch.event_count,
+             static_cast<uint32_t>(KOF_ENV_STEP_EVENT_CAPACITY_V5));
+    for (uint32_t index = 0; index < event_count; ++index) {
+        const kof_env_step_event_v5 &event = batch.events[index];
+        if (event.event_epoch != p2_event_epoch_)
+            continue;
+
+        if (event.event_type == KOF_ENV_STEP_EVENT_CLEAN_HIT &&
+            event.target_player == P2) {
+            setDefensePhase(DefensePhase::Neutral);
+        } else if (event.event_type == KOF_ENV_STEP_EVENT_BLOCK_CONTACT &&
+                   event.target_player == P2) {
+            setDefensePhase(DefensePhase::BlockContact);
+        } else if (event.event_type == KOF_ENV_STEP_EVENT_BLOCKSTUN_STARTED &&
+                   event.target_player == P2) {
+            setDefensePhase(DefensePhase::BlockReaction);
+        } else if (event.event_type == KOF_ENV_STEP_EVENT_BLOCKSTUN_ENDED &&
+                   event.target_player == P2) {
+            setDefensePhase(DefensePhase::PostBlock);
+        }
+
+        if (event.event_type == KOF_ENV_STEP_EVENT_ACTION_STARTED &&
+            event.source_player == P2 &&
+            event.action_id >= ATTACK_ACTION_MIN) {
+            if (p2_generic_combat_state_.confirm_phase ==
+                ConfirmPhase::StarterHit) {
+                setConfirmPhase(ConfirmPhase::FollowupStarted);
+            } else if (p2_generic_combat_state_.confirm_phase ==
+                       ConfirmPhase::StarterPending) {
+                if (event.action_serial !=
+                    p2_generic_combat_state_.starter_action_serial) {
+                    p2_generic_combat_state_.pending_followup_action_id =
+                        event.action_id;
+                    p2_generic_combat_state_.pending_followup_action_serial =
+                        event.action_serial;
+                }
+            } else if (p2_generic_combat_state_.confirm_phase ==
+                       ConfirmPhase::Neutral) {
+                p2_generic_combat_state_.starter_action_id = event.action_id;
+                p2_generic_combat_state_.starter_action_serial =
+                    event.action_serial;
+                setConfirmPhase(ConfirmPhase::StarterPending);
+            }
+        } else if (event.event_type == KOF_ENV_STEP_EVENT_COMBO_HIT &&
+                   event.source_player == P2 &&
+                   event.target_player == P1) {
+            if (p2_generic_combat_state_.confirm_phase ==
+                    ConfirmPhase::StarterPending &&
+                event.action_id ==
+                    p2_generic_combat_state_.starter_action_id &&
+                event.action_serial ==
+                    p2_generic_combat_state_.starter_action_serial) {
+                if (p2_generic_combat_state_
+                        .pending_followup_action_serial != 0) {
+                    setConfirmPhase(ConfirmPhase::FollowupStarted);
+                } else {
+                    setConfirmPhase(ConfirmPhase::StarterHit);
+                }
+            } else if (p2_generic_combat_state_.confirm_phase ==
+                       ConfirmPhase::FollowupStarted) {
+                p2_generic_combat_state_.confirm_phase_age_frames = 0;
+            }
+        } else if (event.event_type == KOF_ENV_STEP_EVENT_BLOCK_CONTACT &&
+                   event.source_player == P2 &&
+                   event.target_player == P1 &&
+                   p2_generic_combat_state_.confirm_phase ==
+                       ConfirmPhase::StarterPending &&
+                   event.action_id ==
+                       p2_generic_combat_state_.starter_action_id &&
+                   event.action_serial ==
+                       p2_generic_combat_state_.starter_action_serial) {
+            p2_generic_combat_state_.pending_followup_action_id = -1;
+            p2_generic_combat_state_.pending_followup_action_serial = 0;
+            setConfirmPhase(ConfirmPhase::StarterBlocked);
+        }
+    }
+
+    if (timing.p2.reaction_valid &&
+        timing.p2.reaction_kind == KOF_ENV_REACTION_GUARD &&
+        p2_generic_combat_state_.defense_phase !=
+            DefensePhase::PostBlock) {
+        setDefensePhase(DefensePhase::BlockReaction);
+    }
+
+    constexpr int32_t PHASE_TIMEOUT_FRAMES = 60;
+    constexpr int32_t POST_BLOCK_TIMEOUT_FRAMES = 36;
+    const int32_t defense_timeout =
+        p2_generic_combat_state_.defense_phase == DefensePhase::PostBlock
+        ? POST_BLOCK_TIMEOUT_FRAMES
+        : PHASE_TIMEOUT_FRAMES;
+    if (p2_generic_combat_state_.defense_phase_age_frames >
+        defense_timeout) {
+        setDefensePhase(DefensePhase::Neutral);
+    }
+    if (p2_generic_combat_state_.confirm_phase_age_frames >
+        PHASE_TIMEOUT_FRAMES) {
+        p2_generic_combat_state_.starter_action_id = -1;
+        p2_generic_combat_state_.starter_action_serial = 0;
+        p2_generic_combat_state_.pending_followup_action_id = -1;
+        p2_generic_combat_state_.pending_followup_action_serial = 0;
+        setConfirmPhase(ConfirmPhase::Neutral);
+    }
+
+    p2_generic_combat_state_.queue_window_open = false;
+    if (kof_env_can_queue_p2_action_) {
+        constexpr int32_t ACTION_COUNT = 29;
+        for (int32_t action_id = 1; action_id < ACTION_COUNT; ++action_id) {
+            if (kof_env_can_queue_p2_action_(handle_, action_id)) {
+                p2_generic_combat_state_.queue_window_open = true;
+                break;
+            }
+        }
+    }
+    p2_generic_combat_state_.last_action_accepted =
+        p2_last_action_accepted_;
+}
+
 void FbneoTrainingCore::requestP2PpoAction() {
     if (!p2_ppo_ai_enabled_ ||
         !ppo_agent_bridge_ ||
@@ -542,13 +730,27 @@ void FbneoTrainingCore::requestP2PpoAction() {
     if (!kof_env_get_observation_(handle_, &observation))
         return;
 
-    ppo_agent_bridge_->requestAction(
+    const bool requested = ppo_agent_bridge_->requestAction(
         p2ObservationVector(observation),
         p2ActionMask(observation));
+    if (requested)
+        p2_last_action_accepted_ = false;
 }
 
 QVector<float> FbneoTrainingCore::p2ObservationVector(
-    const kof_env_observation &observation) const {
+    const kof_env_observation &observation) {
+    constexpr int32_t LEGACY_OBSERVATION_SIZE = 26;
+    constexpr int32_t STRATEGY_OBSERVATION_SIZE = 140;
+    constexpr int32_t ACTION_COUNT = 29;
+    constexpr int32_t ACTION_ONE_HOT_SIZE = ACTION_COUNT + 1;
+    constexpr int32_t AIRBORNE_Y_THRESHOLD = 185;
+    constexpr float ACTION_TIME_SCALE_FRAMES = 180.0f;
+    constexpr int32_t COMBAT_PHASE_COUNT = 6;
+    const QString observation_schema =
+        ppo_agent_bridge_
+        ? ppo_agent_bridge_->observationSchemaId()
+        : QString();
+
     // Mirror the screen after swapping player roles so the deployed P2 sees
     // the same left-side coordinate distribution used to train the P1 policy.
     const int32_t p2_x =
@@ -569,7 +771,7 @@ QVector<float> FbneoTrainingCore::p2ObservationVector(
         kof_env_p2_input_ready_(handle_) != 0 &&
         kof_env_p2_ready_for_action_(handle_) != 0;
 
-    return {
+    QVector<float> result {
         observation.round_time / 99.0f,
         observation.p2_health / 103.0f,
         observation.p1_health / 103.0f,
@@ -597,6 +799,250 @@ QVector<float> FbneoTrainingCore::p2ObservationVector(
         0.0f,
         0.0f,
     };
+
+    const int expected_size = ppo_agent_bridge_
+        ? ppo_agent_bridge_->observationSize()
+        : LEGACY_OBSERVATION_SIZE;
+    if (expected_size == LEGACY_OBSERVATION_SIZE) {
+        ppo_previous_observation_ = observation;
+        has_ppo_previous_observation_ = true;
+        return result;
+    }
+    if (expected_size != STRATEGY_OBSERVATION_SIZE ||
+        !kof_env_get_strategy_state_v1_) {
+        return result;
+    }
+
+    kof_env_strategy_state_v1 state {};
+    state.struct_size = sizeof(state);
+    state.version = KOF_ENV_STRATEGY_STATE_VERSION_1;
+    if (!kof_env_get_strategy_state_v1_(handle_, &state))
+        return result;
+
+    auto normalizedStatus = [](int32_t value) {
+        return qMax(0, value) / 255.0f;
+    };
+    auto airborne = [](int32_t y, uint8_t has_position) {
+        return has_position != 0 && y >= 0 && y < AIRBORNE_Y_THRESHOLD;
+    };
+    auto edgeDistance = [](int32_t x, uint8_t has_position) {
+        if (!has_position)
+            return 0.0f;
+        const float clamped = qBound(0.0f, static_cast<float>(x), 320.0f);
+        return qMin(clamped, 320.0f - clamped) / 160.0f;
+    };
+    auto normalizedActionTime = [](int32_t frames) {
+        return qMin(qMax(0, frames) / ACTION_TIME_SCALE_FRAMES, 1.0f);
+    };
+    auto velocity = [this](int32_t current, int32_t previous, bool valid) {
+        if (!has_ppo_previous_observation_ || !valid)
+            return 0.0f;
+        return qBound(-1.0f, (current - previous) / 4.0f / 16.0f, 1.0f);
+    };
+
+    const int32_t previous_p2_x = has_ppo_previous_observation_
+        ? 320 - ppo_previous_observation_.p2_x
+        : p2_x;
+    const int32_t previous_p1_x = has_ppo_previous_observation_
+        ? 320 - ppo_previous_observation_.p1_x
+        : p1_x;
+    const bool p2_velocity_valid =
+        observation.p2_has_position &&
+        has_ppo_previous_observation_ &&
+        ppo_previous_observation_.p2_has_position;
+    const bool p1_velocity_valid =
+        observation.p1_has_position &&
+        has_ppo_previous_observation_ &&
+        ppo_previous_observation_.p1_has_position;
+
+    result.append({
+        normalizedStatus(state.p2_status),
+        normalizedStatus(state.p1_status),
+        static_cast<float>(state.p2_ready != 0),
+        static_cast<float>(state.p1_ready != 0),
+        static_cast<float>(airborne(observation.p2_y, observation.p2_has_position)),
+        static_cast<float>(airborne(observation.p1_y, observation.p1_has_position)),
+        velocity(p2_x, previous_p2_x, p2_velocity_valid),
+        velocity(observation.p2_y,
+                 ppo_previous_observation_.p2_y,
+                 p2_velocity_valid),
+        velocity(p1_x, previous_p1_x, p1_velocity_valid),
+        velocity(observation.p1_y,
+                 ppo_previous_observation_.p1_y,
+                 p1_velocity_valid),
+        edgeDistance(p2_x, observation.p2_has_position),
+        edgeDistance(p1_x, observation.p1_has_position),
+        normalizedActionTime(state.p2_action_elapsed_frames),
+        normalizedActionTime(state.p2_action_remaining_frames),
+        0.0f,
+        0.0f,
+        static_cast<float>(state.p2_facing_left == 0),
+        1.0f,
+    });
+
+    auto appendActionOneHot = [&result](int32_t action_id) {
+        const int32_t selected =
+            action_id >= 0 && action_id < ACTION_COUNT
+            ? action_id
+            : ACTION_COUNT;
+        for (int32_t index = 0; index < ACTION_ONE_HOT_SIZE; ++index)
+            result.append(index == selected ? 1.0f : 0.0f);
+    };
+    appendActionOneHot(state.p2_active_action_id);
+    appendActionOneHot(state.p2_queued_action_id);
+    appendActionOneHot(-1);
+
+    int32_t combat_phase = 0;
+    if (p2_combo >= 2)
+        combat_phase = 3;
+    else if (p2_combo == 1)
+        combat_phase = 2;
+    else if (observation.p1_health > 0 &&
+             state.p1_ready == 0 &&
+             observation.p1_has_position &&
+             observation.p1_y >= AIRBORNE_Y_THRESHOLD)
+        combat_phase = 5;
+    else if (observation.p1_has_position &&
+             observation.p2_has_position &&
+             qAbs(observation.distance_x) > 100)
+        combat_phase = 1;
+    for (int32_t phase = 0; phase < COMBAT_PHASE_COUNT; ++phase)
+        result.append(phase == combat_phase ? 1.0f : 0.0f);
+
+    if (observation_schema ==
+        QStringLiteral("kof98-observation-v3-event-140")) {
+        constexpr float REACTION_TIME_SCALE_FRAMES = 60.0f;
+        constexpr float RECOVERY_TIME_SCALE_FRAMES = 60.0f;
+        constexpr float FRAME_ADVANTAGE_SCALE_FRAMES = 30.0f;
+        constexpr float PHASE_AGE_SCALE_FRAMES = 180.0f;
+        constexpr int32_t DEFENSE_PHASE_COUNT = 5;
+        constexpr int32_t CONFIRM_PHASE_COUNT = 5;
+
+        auto normalizedNonNegative = [](int32_t value, float scale) {
+            return qBound(0.0f, qMax(0, value) / scale, 1.0f);
+        };
+        QVector<float> timing_values;
+        timing_values.reserve(32);
+        auto appendReaction = [&timing_values, &normalizedNonNegative](
+                                  const kof_env_player_timing_state_v1 &player) {
+            const bool valid = player.reaction_valid != 0;
+            const bool remaining_valid =
+                player.reaction_remaining_valid != 0;
+            const int32_t kind =
+                valid ? player.reaction_kind : KOF_ENV_REACTION_NONE;
+            timing_values.append({
+                static_cast<float>(remaining_valid),
+                normalizedNonNegative(
+                    valid && remaining_valid
+                        ? player.reaction_remaining
+                        : 0,
+                    REACTION_TIME_SCALE_FRAMES),
+                static_cast<float>(kind == KOF_ENV_REACTION_GUARD),
+                static_cast<float>(kind == KOF_ENV_REACTION_HIT),
+            });
+        };
+
+        const kof_env_player_timing_state_v1 empty_player {};
+        const kof_env_player_timing_state_v1 &self_timing =
+            has_p2_combat_timing_state_
+            ? p2_combat_timing_state_.p2
+            : empty_player;
+        const kof_env_player_timing_state_v1 &opponent_timing =
+            has_p2_combat_timing_state_
+            ? p2_combat_timing_state_.p1
+            : empty_player;
+        appendReaction(self_timing);
+        appendReaction(opponent_timing);
+        timing_values.append({
+            static_cast<float>(self_timing.actionable_valid != 0),
+            static_cast<float>(
+                self_timing.actionable_valid != 0 &&
+                self_timing.actionable != 0),
+            static_cast<float>(opponent_timing.actionable_valid != 0),
+            static_cast<float>(
+                opponent_timing.actionable_valid != 0 &&
+                opponent_timing.actionable != 0),
+            static_cast<float>(self_timing.recovery_valid != 0),
+            normalizedNonNegative(
+                self_timing.recovery_valid
+                    ? self_timing.recovery_remaining
+                    : 0,
+                RECOVERY_TIME_SCALE_FRAMES),
+            static_cast<float>(opponent_timing.recovery_valid != 0),
+            normalizedNonNegative(
+                opponent_timing.recovery_valid
+                    ? opponent_timing.recovery_remaining
+                    : 0,
+                RECOVERY_TIME_SCALE_FRAMES),
+        });
+
+        const bool advantage_valid =
+            has_p2_combat_timing_state_ &&
+            p2_combat_timing_state_.frame_advantage_valid != 0;
+        const float p2_advantage =
+            advantage_valid
+            ? qBound(
+                  -1.0f,
+                  -p2_combat_timing_state_.frame_advantage /
+                      FRAME_ADVANTAGE_SCALE_FRAMES,
+                  1.0f)
+            : 0.0f;
+        timing_values.append({
+            static_cast<float>(advantage_valid),
+            p2_advantage,
+        });
+
+        for (int32_t phase = 0; phase < DEFENSE_PHASE_COUNT; ++phase) {
+            timing_values.append(
+                phase == static_cast<int32_t>(
+                    p2_generic_combat_state_.defense_phase)
+                ? 1.0f
+                : 0.0f);
+        }
+        for (int32_t phase = 0; phase < CONFIRM_PHASE_COUNT; ++phase) {
+            timing_values.append(
+                phase == static_cast<int32_t>(
+                    p2_generic_combat_state_.confirm_phase)
+                ? 1.0f
+                : 0.0f);
+        }
+        timing_values.append({
+            normalizedNonNegative(
+                p2_generic_combat_state_.defense_phase_age_frames,
+                PHASE_AGE_SCALE_FRAMES),
+            normalizedNonNegative(
+                p2_generic_combat_state_.confirm_phase_age_frames,
+                PHASE_AGE_SCALE_FRAMES),
+            static_cast<float>(
+                p2_generic_combat_state_.queue_window_open),
+            static_cast<float>(
+                p2_generic_combat_state_.last_action_accepted),
+        });
+
+        Q_ASSERT(timing_values.size() == 32);
+        int32_t timing_index = 0;
+        result[40] = timing_values[timing_index++];
+        result[41] = timing_values[timing_index++];
+        for (int32_t index = 104; index < 134; ++index)
+            result[index] = timing_values[timing_index++];
+        Q_ASSERT(timing_index == timing_values.size());
+    }
+
+    ppo_previous_observation_ = observation;
+    has_ppo_previous_observation_ = true;
+    return result;
+}
+
+void FbneoTrainingCore::resetPpoObservationState() {
+    ppo_previous_observation_ = {};
+    has_ppo_previous_observation_ = false;
+    p2_ppo_frame_counter_ = 0;
+    p2_generic_combat_state_ = {};
+    p2_combat_timing_state_ = {};
+    has_p2_combat_timing_state_ = false;
+    p2_event_epoch_ = 0;
+    has_p2_event_epoch_ = false;
+    p2_last_action_accepted_ = false;
 }
 
 QVector<bool> FbneoTrainingCore::p2ActionMask(

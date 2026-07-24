@@ -20,12 +20,24 @@
 #include <vector>
 
 #include "../gamememreadercore.h"
+#include "../kof98movedata.h"
 #include "libretro.h"
 
 namespace {
 
 static_assert(sizeof(kof_env_step_event_v1) == 28);
 static_assert(sizeof(kof_env_step_events_v1) == 464);
+static_assert(sizeof(kof_env_step_event_v2) == 40);
+static_assert(sizeof(kof_env_step_events_v2) == 656);
+static_assert(sizeof(kof_env_step_event_v3) == 68);
+static_assert(sizeof(kof_env_step_events_v3) == 1104);
+static_assert(sizeof(kof_env_step_event_v4) == 76);
+static_assert(sizeof(kof_env_step_events_v4) == 1232);
+static_assert(sizeof(kof_env_player_timing_state_v1) == 24);
+static_assert(sizeof(kof_env_combat_timing_state_v1) == 80);
+static_assert(sizeof(kof_env_step_event_v5) == 96);
+static_assert(sizeof(kof_env_step_events_v5) == 3096);
+static_assert(sizeof(kof_env_move_data_v1) == 76);
 
 using retro_set_environment_t = void (*)(retro_environment_t);
 using retro_set_video_refresh_t = void (*)(retro_video_refresh_t);
@@ -105,6 +117,372 @@ struct InputFrame {
     int32_t frames = 0;
 };
 
+// P1 高階 Action 的完整生命週期。腳本播放位置、queue 狀態與事件歸因
+// serial 必須一起重設，否則載入 state 後可能把新命中算到舊 Action。
+struct ActionRuntimeState {
+    std::vector<InputFrame> script;
+    size_t script_index = 0;
+    int32_t script_remaining_frames = 0;
+    int32_t active_action_id = -1;
+    int32_t queued_action_id = -1;
+    int32_t last_started_action_id = -1;
+    uint32_t last_started_action_serial = 0;
+    int32_t last_started_action_age_frames = 0;
+    bool action_start_event_pending = false;
+    int32_t active_action_elapsed_frames = 0;
+    bool last_action_accepted = false;
+    uint32_t next_action_serial = 0;
+    uint32_t active_action_serial = 0;
+
+    void clearScript() {
+        script.clear();
+        script_index = 0;
+        script_remaining_frames = 0;
+    }
+
+    int32_t scriptRemainingFrames() const {
+        int32_t remaining = std::max(0, script_remaining_frames);
+        for (size_t index = script_index + 1; index < script.size(); ++index)
+            remaining += std::max(0, script[index].frames);
+        return remaining;
+    }
+
+    void reset() {
+        clearScript();
+        active_action_id = -1;
+        queued_action_id = -1;
+        last_started_action_id = -1;
+        last_started_action_serial = 0;
+        last_started_action_age_frames = 0;
+        action_start_event_pending = false;
+        active_action_elapsed_frames = 0;
+        last_action_accepted = false;
+        active_action_serial = 0;
+    }
+};
+
+struct DamageAttributionState {
+    int32_t action_id = -1;
+    uint32_t action_serial = 0;
+    int32_t age_frames = 0;
+    int32_t target_y = -1;
+    bool target_airborne_before = false;
+    bool target_airborne_after = false;
+
+    void reset() {
+        *this = {};
+        action_id = -1;
+        target_y = -1;
+    }
+};
+
+struct ActionHandoffState {
+    int32_t action_id = -1;
+    uint32_t action_serial = 0;
+    int32_t age_frames = 0;
+
+    void reset() {
+        *this = {};
+        action_id = -1;
+    }
+};
+
+enum class GuardReactionPhase {
+    Idle,
+    WaitingForCountdown,
+    CountdownActive,
+    RefreshPending,
+};
+
+// D2:D3/E3 不是全域 blockstun enum；只有先看到真實 BLOCK_CONTACT，
+// 才追蹤後續倒數。候選值還必須出現 N→N-1，避免把上一個動作留下的
+// 503、11 等 stale counter 誤認成這次防禦硬直。
+struct GuardReactionState {
+    int32_t attacker_action_id = -1;
+    uint32_t attacker_action_serial = 0;
+    uint32_t reaction_serial = 0;
+    int32_t age_frames = 0;
+    int32_t counter_at_contact = -1;
+    int32_t candidate_counter = -1;
+    uint64_t contact_frame = 0;
+    uint64_t not_before_frame = 0;
+    uint64_t candidate_counter_frame = 0;
+    GuardReactionPhase phase = GuardReactionPhase::Idle;
+    bool active = false;
+    bool confirmed_block_contact = false;
+    bool countdown_loaded = false;
+    bool refresh_pending = false;
+    bool start_emitted = false;
+    bool end_emitted = false;
+    bool manual_guard_hold_active = false;
+    bool manual_success_emitted = false;
+
+    void begin(int32_t action_id,
+               uint32_t action_serial,
+               uint32_t new_reaction_serial,
+               uint64_t frame,
+               int32_t hit_guard_stop,
+               int32_t reaction_counter,
+               bool manual_guard) {
+        reset();
+        attacker_action_id = action_id;
+        attacker_action_serial = action_serial;
+        reaction_serial = new_reaction_serial;
+        counter_at_contact = reaction_counter;
+        contact_frame = frame;
+        not_before_frame =
+            frame + static_cast<uint64_t>(std::max(1, hit_guard_stop));
+        phase = GuardReactionPhase::WaitingForCountdown;
+        active = true;
+        confirmed_block_contact = true;
+        manual_guard_hold_active = manual_guard;
+    }
+
+    void refresh(int32_t action_id,
+                 uint32_t action_serial,
+                 uint64_t frame,
+                 int32_t hit_guard_stop,
+                 int32_t reaction_counter,
+                 bool manual_guard) {
+        attacker_action_id = action_id;
+        attacker_action_serial = action_serial;
+        age_frames = 0;
+        counter_at_contact = reaction_counter;
+        contact_frame = frame;
+        not_before_frame =
+            frame + static_cast<uint64_t>(std::max(1, hit_guard_stop));
+        candidate_counter = -1;
+        candidate_counter_frame = 0;
+        refresh_pending = true;
+        phase = GuardReactionPhase::RefreshPending;
+        manual_guard_hold_active =
+            manual_guard_hold_active || manual_guard;
+    }
+
+    void reset() {
+        *this = {};
+        attacker_action_id = -1;
+        counter_at_contact = -1;
+        candidate_counter = -1;
+        phase = GuardReactionPhase::Idle;
+    }
+};
+
+// StrategyV4 對稱的受擊/防禦反應快照。這個 tracker 只提供可觀察
+// timing state，不負責判定 Reward；真正的防禦事件仍由有 contact 證據
+// 的 GuardReactionState 處理。E3 只負責分類，D2:D3 只在已鎖定的反應
+// 中提供剩餘子階段幀數。
+struct ReactionTimingState {
+    int32_t kind = KOF_ENV_REACTION_NONE;
+    int32_t remaining = 0;
+    int32_t age_frames = 0;
+    bool active = false;
+    bool countdown_seen = false;
+
+    void beginOrRefresh(int32_t new_kind) {
+        if (new_kind != KOF_ENV_REACTION_GUARD &&
+            new_kind != KOF_ENV_REACTION_HIT) {
+            return;
+        }
+
+        // 每次有新的實際接觸證據，都必須等待該次反應自己的 N->N-1；
+        // 不沿用前一段命中或多段格擋留下的 remaining。
+        remaining = 0;
+        countdown_seen = false;
+        age_frames = 0;
+        kind = new_kind;
+        active = true;
+    }
+
+    void reset() {
+        *this = {};
+        kind = KOF_ENV_REACTION_NONE;
+    }
+};
+
+// 一個 Python step 內的事件批次，以及跨 frame 才能完成的命中歸因狀態。
+struct CombatEventState {
+    kof_env_step_events_v1 v1 {};
+    kof_env_step_events_v2 v2 {};
+    kof_env_step_events_v3 v3 {};
+    kof_env_step_events_v4 v4 {};
+    kof_env_step_events_v5 v5 {};
+    DamageAttributionState recent_damage;
+    ActionHandoffState handoff;
+    std::array<GuardReactionState, 2> guard_reactions;
+    std::array<ReactionTimingState, 2> reactions;
+    std::array<bool, 2> block_contact_active {};
+    uint32_t event_epoch = 1;
+    uint32_t next_guard_reaction_serial = 0;
+
+    void clearBatch() {
+        v1 = {};
+        v1.struct_size = sizeof(kof_env_step_events_v1);
+        v1.version = KOF_ENV_STEP_EVENTS_VERSION_1;
+        v2 = {};
+        v2.struct_size = sizeof(kof_env_step_events_v2);
+        v2.version = KOF_ENV_STEP_EVENTS_VERSION_2;
+        v3 = {};
+        v3.struct_size = sizeof(kof_env_step_events_v3);
+        v3.version = KOF_ENV_STEP_EVENTS_VERSION_3;
+        v4 = {};
+        v4.struct_size = sizeof(kof_env_step_events_v4);
+        v4.version = KOF_ENV_STEP_EVENTS_VERSION_4;
+        v5 = {};
+        v5.struct_size = sizeof(kof_env_step_events_v5);
+        v5.version = KOF_ENV_STEP_EVENTS_VERSION_5;
+        v5.batch_event_epoch = event_epoch;
+    }
+
+    void resetTracking() {
+        recent_damage.reset();
+        handoff.reset();
+        for (auto &reaction : guard_reactions)
+            reaction.reset();
+        for (auto &reaction : reactions)
+            reaction.reset();
+        block_contact_active.fill(false);
+    }
+
+    uint32_t allocateGuardReactionSerial() {
+        ++next_guard_reaction_serial;
+        if (next_guard_reaction_serial == 0)
+            ++next_guard_reaction_serial;
+        return next_guard_reaction_serial;
+    }
+
+    void advanceEpoch() {
+        ++event_epoch;
+        if (event_epoch == 0)
+            ++event_epoch;
+        next_guard_reaction_serial = 0;
+        resetTracking();
+        // clearBatch() 只在 step 開始時執行；reset/load 或 step 中途換局
+        // 仍必須讓批次 epoch 與 timing state 立即一致。
+        v5.batch_event_epoch = event_epoch;
+    }
+
+    void removeV5HitEventsForBlock(int32_t frame_offset,
+                                   int32_t source_player,
+                                   int32_t target_player) {
+        uint32_t write_index = 0;
+        for (uint32_t read_index = 0;
+             read_index < v5.event_count;
+             ++read_index) {
+            const auto &event = v5.events[read_index];
+            const bool same_contact =
+                event.frame_offset == frame_offset &&
+                event.source_player == source_player &&
+                event.target_player == target_player;
+            const bool provisional_hit =
+                event.event_type == KOF_ENV_STEP_EVENT_COMBO_HIT ||
+                event.event_type == KOF_ENV_STEP_EVENT_DAMAGE_ONLY ||
+                event.event_type == KOF_ENV_STEP_EVENT_CLEAN_HIT;
+            if (same_contact && provisional_hit)
+                continue;
+
+            if (write_index != read_index)
+                v5.events[write_index] = event;
+            ++write_index;
+        }
+        v5.event_count = write_index;
+    }
+
+    void rollbackFrame(int32_t frame_offset) {
+        const auto rollback = [frame_offset](auto &batch) {
+            while (batch.event_count > 0 &&
+                   batch.events[batch.event_count - 1].frame_offset ==
+                       frame_offset) {
+                --batch.event_count;
+            }
+        };
+        rollback(v1);
+        rollback(v2);
+        rollback(v3);
+        rollback(v4);
+        rollback(v5);
+    }
+};
+
+enum class P2ControlMode {
+    Disabled,
+    ScriptedStyle,
+    ActionApi,
+};
+
+// P2 的風格腳本與公開 Action API 共用同一組輸出腳本，但控制模式互斥。
+// 單一 enum 可避免 random_ai_enabled/action_ai_enabled 同時為 true。
+struct P2ControllerState {
+    std::vector<InputFrame> script;
+    size_t script_index = 0;
+    int32_t script_remaining_frames = 0;
+    int32_t training_action_id = -1;
+    int32_t training_action_elapsed_frames = 0;
+    int32_t last_started_action_id = -1;
+    uint32_t next_action_serial = 0;
+    uint32_t last_started_action_serial = 0;
+    int32_t last_started_action_age_frames = 0;
+    bool action_start_event_pending = false;
+    int32_t active_action_id = -1;
+    int32_t queued_action_id = -1;
+    int32_t active_action_elapsed_frames = 0;
+    bool last_action_accepted = false;
+    P2ControlMode mode = P2ControlMode::Disabled;
+    kof_env_p2_style style = KOF_ENV_P2_STYLE_ONIYAKI;
+    uint32_t training_cycle = 0;
+
+    bool scriptedStyleEnabled() const {
+        return mode == P2ControlMode::ScriptedStyle;
+    }
+
+    bool actionApiEnabled() const {
+        return mode == P2ControlMode::ActionApi;
+    }
+
+    void clearScript() {
+        script.clear();
+        script_index = 0;
+        script_remaining_frames = 0;
+        training_action_id = -1;
+        training_action_elapsed_frames = 0;
+    }
+
+    int32_t scriptRemainingFrames() const {
+        int32_t remaining = std::max(0, script_remaining_frames);
+        for (size_t index = script_index + 1; index < script.size(); ++index)
+            remaining += std::max(0, script[index].frames);
+        return remaining;
+    }
+
+    void resetActions() {
+        clearScript();
+        active_action_id = -1;
+        queued_action_id = -1;
+        active_action_elapsed_frames = 0;
+        last_action_accepted = false;
+        last_started_action_id = -1;
+        last_started_action_serial = 0;
+        last_started_action_age_frames = 0;
+        action_start_event_pending = false;
+    }
+};
+
+struct RuntimePaths {
+    std::string game;
+    std::string system_directory;
+    std::string save_directory;
+};
+
+struct CachedState {
+    std::wstring path;
+    std::vector<uint8_t> data;
+
+    void clear() {
+        path.clear();
+        data.clear();
+    }
+};
+
 struct FollowUpRule {
     int32_t parent_action_id = -1;
     int32_t child_action_id = -1;
@@ -115,16 +493,97 @@ struct FollowUpRule {
 };
 
 struct FrameCombatState {
+    // 單一 emulator frame 的戰鬥快照。
+    //
+    // runFrames() 會在 retro_run() 前後各讀取一次，事件偵測只比較同一
+    // frame 的 before/after。不能改用 Python step 的首尾值，因為一個
+    // step 通常跨越 4 個以上 frame，會漏掉中間短暫出現的命中、格擋、
+    // hitstop 或 blockstun 邊緣。
+
+    // P1/P2 當前血量。預設 -1 表示 RAM 讀取失敗；before > after 代表
+    // 該 frame 受到傷害。
+    int32_t p1_health = -1;
     int32_t p2_health = -1;
+
+    // 雙方當前連段數。before < after 用來辨識對應玩家的連段命中。
     int32_t p1_combo = -1;
+    int32_t p2_combo = -1;
+
+    // P1 Guard Crush 耐久值，位址 player base + 0x147
+    // (P1: 0x108247)。數值在格擋時下降，可作為真實 block contact 的
+    // 證據之一；它不是 blockstun timer。
+    int32_t p1_guard_crush_value = -1;
+    int32_t p2_guard_crush_value = -1;
+
+    // Hit/Guard Stop 原始 byte，位址 player base + 0x125
+    // (P1: 0x108225、P2: 0x108425)。保留 before/after 值寫入 V3 event，
+    // 供除錯與驗證 hitstop；目前不單獨拿它判斷格擋成功。
+    int32_t p1_hit_guard_stop_raw = -1;
+    int32_t p2_hit_guard_stop_raw = -1;
+
+    // P1 反應子階段倒數，位址 player base + 0xD2:D3
+    // (P1: 0x1081D2)。Motorola 68000 採 big-endian，所以必須以 signed
+    // 16-bit 解讀；例如 00:10=16、FF:FF=-1。它只在已確認的地面防禦
+    // tracker 內解讀，不能全域視為 blockstun timer。
+    int32_t p1_reaction_d2_raw = -1;
+    int32_t p1_reaction_counter = -1;
+    int32_t p2_reaction_d2_raw = -1;
+    int32_t p2_reaction_counter = -1;
+
+    // P1 狀態 flags 原始 byte，位址 player base + 0xE3
+    // (P1: 0x1081E3)。bit 0x20 在受制狀態期間成立；它不是獨立的
+    // blockstun timer，因此必須和已確認的 block contact 及 D2 邊緣
+    // 一起使用。
+    int32_t p1_reaction_e3_raw = -1;
+    int32_t p2_reaction_e3_raw = -1;
+
+    // 角色世界座標。事件需要它判斷左右朝向、P1 是否真的按住「後」，
+    // 以及目標在受擊前後是否位於空中。
+    game_memory::Point p1_position;
+    game_memory::Point p2_position;
+
+    // 對應座標是否成功讀取。座標不可用時不能把預設 Point 當成真值。
+    bool has_p1_position = false;
+    bool has_p2_position = false;
+
+    // 該 frame 的 P2 Attack/ProjectileAttack box 是否與 P1 Guard box
+    // 重疊。這是物理格擋接觸候選，和 Attack × Vulnerability 的命中
+    // overlap 不同；仍需搭配 P2 攻擊中、Guard Crush 變化及防禦輸入。
+    bool p2_attack_guard_overlap = false;
+    bool p1_attack_guard_overlap = false;
 };
 
 constexpr size_t P1_PORT = 0;
 constexpr size_t P2_PORT = 1;
 constexpr size_t PLAYER_PORT_COUNT = 2;
 constexpr int32_t COMBO_EVENT_DAMAGE_GRACE_FRAMES = 2;
+// age 0、1、2 共涵蓋三個取樣 frame。只用於 queued child 已開始輸入，
+// 但畫面上仍是 parent 招式延遲命中的情況。
+constexpr int32_t ACTION_HANDOFF_HIT_GRACE_FRAMES = 2;
+// Action 腳本結束後，判定可能延遲數幀才造成傷害；fallback 只在有限
+// 時間內保留歸因，避免很久以後的飛行道具命中被算到上一個普通技。
+constexpr int32_t ACTION_ATTRIBUTION_FALLBACK_FRAMES = 240;
+// D2/E3 追蹤只應涵蓋同一段格擋反應。若候選邊緣不完整，超時後丟棄，
+// 避免下一次無關的 E3 falling edge 被誤認為這次 blockstun 結束。
+constexpr int32_t GUARD_REACTION_TIMEOUT_FRAMES = 240;
+
+constexpr bool shouldAbortUnexpectedReactionCounter(
+    bool countdown_seen,
+    int32_t counter_after,
+    bool reaction_ended) {
+    return countdown_seen && counter_after < 0 && !reaction_ended;
+}
+
+static_assert(shouldAbortUnexpectedReactionCounter(true, -2, false));
+static_assert(shouldAbortUnexpectedReactionCounter(true, -1, false));
+static_assert(!shouldAbortUnexpectedReactionCounter(true, -1, true));
+static_assert(!shouldAbortUnexpectedReactionCounter(true, 0, false));
+constexpr int32_t KOF98_AIRBORNE_Y_THRESHOLD = 185;
 constexpr int32_t WALK_FORWARD_ACTION_ID = 1;
 constexpr int32_t WALK_BACK_ACTION_ID = 2;
+constexpr int32_t CROUCH_GUARD_ACTION_ID = 3;
+constexpr int32_t STAND_GUARD_ACTION_ID = 4;
+constexpr int32_t STAND_A_ACTION_ID = 6;
 constexpr int32_t STAND_B_ACTION_ID = 7;
 constexpr int32_t KYO_CROUCH_A_ACTION_ID = 10;
 constexpr int32_t KYO_CROUCH_B_ACTION_ID = 11;
@@ -149,6 +608,8 @@ constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_COMBO_SCRIPT_ID = 1000;
 constexpr int32_t KYO_SEVENTY_FIVE_SHIKI_KAI_RED_KICK_SCRIPT_ID = 1001;
 constexpr int32_t KYO_CROUCH_A_MUSHIKI_BUFFER_SCRIPT_ID = 1002;
 constexpr int32_t KYO_MUSHIKI_FINISH_SCRIPT_ID = 1003;
+constexpr int32_t P1_HOLD_ACTION_FIRST = 1;
+constexpr int32_t P1_HOLD_ACTION_LAST = 4;
 constexpr int32_t KYO_CLOSE_C_SEVENTY_FIVE_SHIKI_KAI_TRIGGER_FRAME = 5;
 constexpr int32_t KYO_FORWARD_B_FOLLOW_UP_TRIGGER_FRAME = 37;
 constexpr int32_t KYO_FORWARD_B_OROCHINAGI_TRIGGER_FRAME = 19;
@@ -163,6 +624,36 @@ constexpr int32_t KYO_ARAGAMI_YANO_SABI_TRIGGER_FRAME = 10;
 constexpr int32_t KYO_YANO_SABI_MIGIRI_UGACHI_TRIGGER_FRAME = 29;
 constexpr int32_t KYO_CROUCH_B_CROUCH_A_TRIGGER_FRAME = 17;
 constexpr int32_t KYO_CROUCH_A_MUSHIKI_TRIGGER_FRAME = 9;
+
+bool hitboxRectsOverlap(const game_memory::HitboxRect &a,
+                        const game_memory::HitboxRect &b) {
+    return a.left < b.left + b.width &&
+           a.left + a.width > b.left &&
+           a.top < b.top + b.height &&
+           a.top + a.height > b.top;
+}
+
+bool hasAttackGuardboxOverlap(const game_memory::HitboxOverlay &overlay,
+                              int32_t attack_owner,
+                              int32_t target_owner) {
+    for (const game_memory::HitboxRect &attack : overlay.boxes) {
+        if (attack.owner != attack_owner ||
+            (attack.type != game_memory::HitboxAttack &&
+             attack.type != game_memory::HitboxProjectileAttack)) {
+            continue;
+        }
+
+        for (const game_memory::HitboxRect &guardbox : overlay.boxes) {
+            if (guardbox.owner != target_owner ||
+                guardbox.type != game_memory::HitboxGuard) {
+                continue;
+            }
+            if (hitboxRectsOverlap(attack, guardbox))
+                return true;
+        }
+    }
+    return false;
+}
 
 enum class CharacterID {
     Kyo,
@@ -190,6 +681,32 @@ std::vector<InputFrame> simpleAction(const kof_env_joypad_state &input) {
         { input, 4 },
         { {}, 2 },
     };
+}
+
+bool isPublicActionId(int32_t action_id) {
+    return action_id >= 0 && action_id < KOF_ENV_PUBLIC_ACTION_COUNT;
+}
+
+bool isP1HoldActionId(int32_t action_id) {
+    return action_id >= P1_HOLD_ACTION_FIRST && action_id <= P1_HOLD_ACTION_LAST;
+}
+
+std::vector<InputFrame> p1ActionScript(
+    int32_t action_id,
+    const std::vector<InputFrame> &script) {
+    if (!isP1HoldActionId(action_id))
+        return script;
+
+    // 共用 LUT 保持原樣，避免改變 P2 腳本節奏。P1 的移動／防禦只送出
+    // 一個 decision-sized chunk，下一個 repeat4 決策便能繼續保持、放開，
+    // 或立刻切換成攻擊，不必等待額外的 neutral 尾幀。
+    if (script.size() == 2 &&
+        script[0].frames == KOF_ENV_P1_HOLD_CHUNK_FRAMES &&
+        script[1].frames == 2) {
+        return { script[0] };
+    }
+
+    return script;
 }
 
 CharacterActionTable buildCharacterActions(bool forward_is_right) {
@@ -671,10 +1188,10 @@ public:
             unloadGame();
         clearStateCache();
 
-        game_path_utf8_ = absoluteUtf8Path(game_path);
-        system_directory_utf8_ = absoluteUtf8Path(system_directory);
-        save_directory_utf8_ = absoluteUtf8Path(save_directory);
-        if (game_path_utf8_.empty())
+        paths_.game = absoluteUtf8Path(game_path);
+        paths_.system_directory = absoluteUtf8Path(system_directory);
+        paths_.save_directory = absoluteUtf8Path(save_directory);
+        if (paths_.game.empty())
             return fail("Game path is empty.");
 
         if (!initialized_) {
@@ -690,7 +1207,7 @@ public:
         }
 
         retro_game_info info {};
-        info.path = game_path_utf8_.c_str();
+        info.path = paths_.game.c_str();
         info.data = nullptr;
         info.size = 0;
         info.meta = nullptr;
@@ -699,6 +1216,21 @@ public:
             return fail("FBNeo could not load game content.");
 
         game_loaded_ = true;
+        size_t ram_size = 0;
+        if (!systemRam(&ram_size) || ram_size == 0) {
+            // Some FBNeo instances publish RETRO_MEMORY_SYSTEM_RAM only after
+            // their first frame.  Prime it before Python can load a state and
+            // request an observation; the state immediately replaces this
+            // zero-input warm-up frame.
+            joypads_[P1_PORT] = {};
+            joypads_[P2_PORT] = {};
+            g_active_runtime = this;
+            retro_run_();
+            if (!systemRam(&ram_size) || ram_size == 0) {
+                unloadGame();
+                return fail("FBNeo did not expose System RAM after its warm-up frame.");
+            }
+        }
         return true;
     }
 
@@ -709,11 +1241,15 @@ public:
         joypads_[P1_PORT] = {};
         joypads_[P2_PORT] = {};
         last_frame_joypads_ = {};
+        previous_frame_joypads_ = {};
+        previous_p1_guard_action_active_ = false;
+        engine_frame_index_ = 0;
+        combat_boundary_in_batch_ = false;
         clearActionState();
         clearP2ActionState();
-        p2_training_cycle_ = 0;
+        p2_controller_.training_cycle = 0;
         clearStepEvents();
-        clearCombatEventState();
+        combat_events_.advanceEpoch();
         retro_reset_();
         return true;
     }
@@ -728,17 +1264,21 @@ public:
         if (!cacheStateFile(path))
             return false;
 
-        if (!retro_unserialize_(cached_state_data_.data(), cached_state_data_.size()))
+        if (!retro_unserialize_(cached_state_.data.data(), cached_state_.data.size()))
             return fail("Core rejected state data.");
 
         joypads_[P1_PORT] = {};
         joypads_[P2_PORT] = {};
         last_frame_joypads_ = {};
+        previous_frame_joypads_ = {};
+        previous_p1_guard_action_active_ = false;
+        engine_frame_index_ = 0;
+        combat_boundary_in_batch_ = false;
         clearActionState();
         clearP2ActionState();
-        p2_training_cycle_ = 0;
+        p2_controller_.training_cycle = 0;
         clearStepEvents();
-        clearCombatEventState();
+        combat_events_.advanceEpoch();
         return true;
     }
 
@@ -763,8 +1303,8 @@ public:
         if (!file)
             return fail("Could not write state file.");
 
-        cached_state_path_ = path;
-        cached_state_data_ = std::move(data);
+        cached_state_.path = path;
+        cached_state_.data = std::move(data);
         return true;
     }
 
@@ -793,20 +1333,22 @@ public:
     }
 
     void setP2RandomAiEnabled(bool enabled) {
-        p2_random_ai_enabled_ = enabled;
-        if (enabled)
-            p2_action_ai_enabled_ = false;
-        clearP2RandomAiScript();
+        if (enabled) {
+            p2_controller_.mode = P2ControlMode::ScriptedStyle;
+        } else if (p2_controller_.scriptedStyleEnabled()) {
+            p2_controller_.mode = P2ControlMode::Disabled;
+        }
         clearP2ActionState();
-        p2_training_cycle_ = 0;
+        p2_controller_.training_cycle = 0;
         joypads_[P2_PORT] = {};
     }
 
     void setP2ActionAiEnabled(bool enabled) {
-        p2_action_ai_enabled_ = enabled;
-        if (enabled)
-            p2_random_ai_enabled_ = false;
-        clearP2RandomAiScript();
+        if (enabled) {
+            p2_controller_.mode = P2ControlMode::ActionApi;
+        } else if (p2_controller_.actionApiEnabled()) {
+            p2_controller_.mode = P2ControlMode::Disabled;
+        }
         clearP2ActionState();
         joypads_[P2_PORT] = {};
     }
@@ -817,64 +1359,173 @@ public:
             return fail("P2 style is out of range.");
         }
 
-        p2_style_ = static_cast<kof_env_p2_style>(style);
-        clearP2RandomAiScript();
-        p2_training_cycle_ = 0;
+        p2_controller_.style = static_cast<kof_env_p2_style>(style);
+        // 切換風格時也清除上一個腳本的 action/serial 歸因，避免新一局
+        // 的第一個受擊事件被錯算成前一種 P2 風格的招式。
+        clearP2ActionState();
+        p2_controller_.training_cycle = 0;
         joypads_[P2_PORT] = {};
         return true;
     }
 
     bool inputReady() const {
-        return active_action_id_ < 0;
+        return p1_action_.active_action_id < 0;
+    }
+
+    bool snapshotSafe() const {
+        kof_env_observation observation {};
+        return game_loaded_ &&
+               getObservation(&observation) &&
+               observation.round_time > 0 &&
+               observation.p1_health > 0 &&
+               observation.p2_health > 0 &&
+               observation.p1_has_position != 0 &&
+               observation.p2_has_position != 0 &&
+               p1ReadyForAction() &&
+               p2ReadyForAction() &&
+               p1_action_.active_action_id < 0 &&
+               p1_action_.queued_action_id < 0 &&
+               p1_action_.script.empty() &&
+               !p1_action_.action_start_event_pending &&
+               p2_controller_.active_action_id < 0 &&
+               p2_controller_.queued_action_id < 0 &&
+               p2_controller_.script.empty() &&
+               !p2_controller_.action_start_event_pending;
     }
 
     bool canQueueAction(int32_t action_id) const {
-        if (active_action_id_ < 0 || queued_action_id_ >= 0)
-            return false;
-
-        const FollowUpRule *rule = action_lut_.findFollowUpRule(
-            active_action_id_,
-            action_id);
-        return rule &&
-               active_action_elapsed_frames_ >= rule->queue_open_frame &&
-               active_action_elapsed_frames_ < rule->queue_close_frame_exclusive;
-    }
-
-    bool p2InputReady() const {
-        return p2_active_action_id_ < 0;
-    }
-
-    bool canQueueP2Action(int32_t action_id) const {
-        if (!p2_action_ai_enabled_ ||
-            p2_active_action_id_ < 0 ||
-            p2_queued_action_id_ >= 0) {
+        if (!isPublicActionId(action_id) ||
+            p1_action_.active_action_id < 0 ||
+            p1_action_.queued_action_id >= 0) {
             return false;
         }
 
         const FollowUpRule *rule = action_lut_.findFollowUpRule(
-            p2_active_action_id_,
+            p1_action_.active_action_id,
             action_id);
         return rule &&
-               p2_active_action_elapsed_frames_ >= rule->queue_open_frame &&
-               p2_active_action_elapsed_frames_ < rule->queue_close_frame_exclusive;
+               p1_action_.active_action_elapsed_frames >= rule->queue_open_frame &&
+               p1_action_.active_action_elapsed_frames < rule->queue_close_frame_exclusive;
+    }
+
+    bool p2InputReady() const {
+        return p2_controller_.active_action_id < 0;
+    }
+
+    // P2 有兩條控制路徑：setP2Action 使用 p2_controller_.active_action_id，訓練用
+    // scripted style 則使用 p2_controller_.training_action_id。腳本輸入通常比畫面上的
+    // 攻擊判定先結束，因此再保留一個有上限的 last-started fallback。
+    int32_t currentP2ActionId() const {
+        if (p2_controller_.actionApiEnabled() &&
+            p2_controller_.active_action_id >= 0) {
+            return p2_controller_.active_action_id;
+        }
+        if (p2_controller_.training_action_id >= 0)
+            return p2_controller_.training_action_id;
+        return p2_controller_.last_started_action_age_frames <= ACTION_ATTRIBUTION_FALLBACK_FRAMES
+            ? p2_controller_.last_started_action_id
+            : -1;
+    }
+
+    uint32_t currentP2ActionSerial() const {
+        return currentP2ActionId() >= 0 ? p2_controller_.last_started_action_serial : 0;
+    }
+
+    int32_t currentP2ActionElapsedFrames() const {
+        if (p2_controller_.actionApiEnabled() &&
+            p2_controller_.active_action_id >= 0) {
+            return p2_controller_.active_action_elapsed_frames;
+        }
+        if (p2_controller_.training_action_id >= 0)
+            return p2_controller_.training_action_elapsed_frames;
+        return p2_controller_.last_started_action_age_frames;
+    }
+
+    bool canQueueP2Action(int32_t action_id) const {
+        if (!isPublicActionId(action_id) ||
+            !p2_controller_.actionApiEnabled() ||
+            p2_controller_.active_action_id < 0 ||
+            p2_controller_.queued_action_id >= 0) {
+            return false;
+        }
+
+        const FollowUpRule *rule = action_lut_.findFollowUpRule(
+            p2_controller_.active_action_id,
+            action_id);
+        return rule &&
+               p2_controller_.active_action_elapsed_frames >= rule->queue_open_frame &&
+               p2_controller_.active_action_elapsed_frames < rule->queue_close_frame_exclusive;
     }
 
     bool getActionStatus(kof_env_action_status *status) const {
         if (!status)
             return false;
 
-        status->active_action_id = active_action_id_;
-        status->queued_action_id = queued_action_id_;
-        status->last_started_action_id = last_started_action_id_;
-        status->action_accepted = last_action_accepted_ ? 1 : 0;
-        status->step_last_hit_action_id = -1;
-        for (uint32_t index = 0; index < step_events_.event_count; ++index) {
-            const auto &event = step_events_.events[index];
-            if (event.event_type == KOF_ENV_STEP_EVENT_COMBO_HIT ||
-                event.event_type == KOF_ENV_STEP_EVENT_DAMAGE_ONLY) {
-                status->step_last_hit_action_id = event.action_id;
-            }
+        status->active_action_id = p1_action_.active_action_id;
+        status->queued_action_id = p1_action_.queued_action_id;
+        status->last_started_action_id = p1_action_.last_started_action_id;
+        status->action_accepted = p1_action_.last_action_accepted ? 1 : 0;
+        return true;
+    }
+
+    bool getStrategyStateV1(kof_env_strategy_state_v1 *state) const {
+        if (!state)
+            return fail("Strategy state output pointer is null.");
+        if (state->struct_size != sizeof(kof_env_strategy_state_v1))
+            return fail("Strategy state v1 struct size does not match the DLL ABI.");
+        if (state->version != KOF_ENV_STRATEGY_STATE_VERSION_1)
+            return fail("Unsupported strategy state version.");
+
+        kof_env_strategy_state_v1 result {};
+        result.struct_size = sizeof(kof_env_strategy_state_v1);
+        result.version = KOF_ENV_STRATEGY_STATE_VERSION_1;
+        result.p1_active_action_id = p1_action_.active_action_id;
+        result.p1_queued_action_id = p1_action_.queued_action_id;
+        result.p1_last_started_action_id = p1_action_.last_started_action_id;
+        result.p1_action_elapsed_frames = p1_action_.active_action_elapsed_frames;
+        result.p1_action_remaining_frames = actionScriptRemainingFrames();
+
+        const bool p2_uses_action_ai = p2_controller_.actionApiEnabled();
+        result.p2_active_action_id = p2_uses_action_ai
+            ? p2_controller_.active_action_id
+            : p2_controller_.training_action_id;
+        result.p2_queued_action_id = p2_uses_action_ai
+            ? p2_controller_.queued_action_id
+            : -1;
+        result.p2_action_elapsed_frames = p2_uses_action_ai
+            ? p2_controller_.active_action_elapsed_frames
+            : p2_controller_.training_action_elapsed_frames;
+        result.p2_action_remaining_frames = p2ActionScriptRemainingFrames();
+        result.p1_input_ready = inputReady() ? 1 : 0;
+        result.p2_input_ready = (p2_uses_action_ai
+                ? p2InputReady()
+                : p2_controller_.script.empty())
+            ? 1
+            : 0;
+        result.p2_scripted = p2_controller_.mode != P2ControlMode::Disabled ? 1 : 0;
+
+        size_t ram_size = 0;
+        const uint8_t *ram_ptr = systemRam(&ram_size);
+        if (ram_ptr && ram_size > 0) {
+            const game_memory::GameMemReaderCore mem_reader(ram_ptr, ram_size);
+            // ABI 欄位仍名為 status，但內容是 base+0x7c 的 hitbox slot
+            // active mask；不可拿數值 7 當作 blockstun 狀態。
+            result.p1_status = mem_reader.readP1HitboxActiveMask();
+            result.p2_status = mem_reader.readP2HitboxActiveMask();
+            result.p1_ready = mem_reader.p1ReadyForAction() ? 1 : 0;
+            result.p2_ready = mem_reader.p2ReadyForAction() ? 1 : 0;
+            bool p1_facing_left = false;
+            if (mem_reader.readP1FacingLeft(p1_facing_left))
+                result.p1_facing_left = p1_facing_left ? 1 : 0;
+            bool p2_facing_left = false;
+            if (mem_reader.readP2FacingLeft(p2_facing_left))
+                result.p2_facing_left = p2_facing_left ? 1 : 0;
+        } else {
+            result.p1_status = -1;
+            result.p2_status = -1;
         }
+
+        *state = result;
         return true;
     }
 
@@ -886,23 +1537,153 @@ public:
         if (events->version != KOF_ENV_STEP_EVENTS_VERSION_1)
             return fail("Unsupported step events version.");
 
-        *events = step_events_;
+        *events = combat_events_.v1;
+        return true;
+    }
+
+    bool getStepEventsV2(kof_env_step_events_v2 *events) const {
+        if (!events)
+            return fail("Step events output pointer is null.");
+        if (events->struct_size != sizeof(kof_env_step_events_v2))
+            return fail("Step events v2 struct size does not match the DLL ABI.");
+        if (events->version != KOF_ENV_STEP_EVENTS_VERSION_2)
+            return fail("Unsupported step events version.");
+
+        *events = combat_events_.v2;
+        return true;
+    }
+
+    bool getStepEventsV3(kof_env_step_events_v3 *events) const {
+        if (!events)
+            return fail("Step events output pointer is null.");
+        if (events->struct_size != sizeof(kof_env_step_events_v3))
+            return fail("Step events v3 struct size does not match the DLL ABI.");
+        if (events->version != KOF_ENV_STEP_EVENTS_VERSION_3)
+            return fail("Unsupported step events version.");
+
+        *events = combat_events_.v3;
+        return true;
+    }
+
+    bool getStepEventsV4(kof_env_step_events_v4 *events) const {
+        if (!events)
+            return fail("Step events output pointer is null.");
+        if (events->struct_size != sizeof(kof_env_step_events_v4))
+            return fail("Step events v4 struct size does not match the DLL ABI.");
+        if (events->version != KOF_ENV_STEP_EVENTS_VERSION_4)
+            return fail("Unsupported step events version.");
+
+        *events = combat_events_.v4;
+        return true;
+    }
+
+    bool getStepEventsV5(kof_env_step_events_v5 *events) const {
+        if (!events)
+            return fail("Step events output pointer is null.");
+        if (events->struct_size != sizeof(kof_env_step_events_v5))
+            return fail("Step events v5 struct size does not match the DLL ABI.");
+        if (events->version != KOF_ENV_STEP_EVENTS_VERSION_5)
+            return fail("Unsupported step events version.");
+
+        *events = combat_events_.v5;
+        return true;
+    }
+
+    bool getCombatTimingStateV1(kof_env_combat_timing_state_v1 *state) const {
+        if (!state)
+            return fail("Combat timing state output pointer is null.");
+        if (state->struct_size != sizeof(kof_env_combat_timing_state_v1))
+            return fail("Combat timing state v1 struct size does not match the DLL ABI.");
+        if (state->version != KOF_ENV_COMBAT_TIMING_STATE_VERSION_1)
+            return fail("Unsupported combat timing state version.");
+
+        kof_env_combat_timing_state_v1 result {};
+        result.struct_size = sizeof(kof_env_combat_timing_state_v1);
+        result.version = KOF_ENV_COMBAT_TIMING_STATE_VERSION_1;
+        result.engine_frame = engine_frame_index_;
+        result.event_epoch = combat_events_.event_epoch;
+
+        const auto fill_player = [](
+                                     kof_env_player_timing_state_v1 &target,
+                                     bool input_script_ready,
+                                     int32_t input_script_remaining,
+                                     const ReactionTimingState &reaction) {
+            target.input_script_ready = input_script_ready ? 1 : 0;
+            target.input_script_remaining =
+                std::max(0, input_script_remaining);
+            target.reaction_valid = reaction.active ? 1 : 0;
+            target.reaction_kind = reaction.active
+                ? reaction.kind
+                : KOF_ENV_REACTION_NONE;
+            target.reaction_remaining =
+                reaction.active && reaction.countdown_seen
+                ? std::max(0, reaction.remaining)
+                : 0;
+            target.reaction_remaining_valid =
+                reaction.active && reaction.countdown_seen ? 1 : 0;
+
+            // 尚未以 Actionable Frame Oracle 驗證攻擊方 recovery RAM。
+            // 明確標成 unknown，不能拿 input-script ready 代替。
+            target.actionable_valid = 0;
+            target.actionable = 0;
+            target.recovery_valid = 0;
+            target.recovery_remaining = 0;
+        };
+
+        fill_player(
+            result.p1,
+            inputReady(),
+            actionScriptRemainingFrames(),
+            combat_events_.reactions[P1_PORT]);
+        const bool p2_script_ready = p2_controller_.actionApiEnabled()
+            ? p2InputReady()
+            : p2_controller_.script.empty();
+        fill_player(
+            result.p2,
+            p2_script_ready,
+            p2ActionScriptRemainingFrames(),
+            combat_events_.reactions[P2_PORT]);
+
+        result.frame_advantage_valid = 0;
+        result.frame_advantage = 0;
+        *state = result;
         return true;
     }
 
     void clearStepEvents() {
-        step_events_ = {};
-        step_events_.struct_size = sizeof(kof_env_step_events_v1);
-        step_events_.version = KOF_ENV_STEP_EVENTS_VERSION_1;
+        // 每次 step/runFrames 都產生一批獨立事件；V1、V2 分開清空，
+        // 舊客戶端不會讀到 V2 新增的防禦與 P1 受傷事件。
+        combat_events_.clearBatch();
     }
 
     void clearCombatEventState() {
-        recent_damage_action_id_ = -1;
-        recent_damage_action_serial_ = 0;
-        recent_damage_age_frames_ = 0;
+        combat_events_.recent_damage.reset();
+    }
+
+    void clearActionHandoffState() {
+        combat_events_.handoff.reset();
+    }
+
+    void handleInStepCombatBoundary(int32_t frame_offset) {
+        // ACTION_STARTED 會在 retro_run() 前先寫入；如果同一幀其實發生
+        // 換局，該事件屬於舊回合的無效輸入，必須連同本幀其他事件回滾。
+        // 本批較早幀的 KO/傷害事件仍保留，並以舊 epoch 回傳給 Python。
+        combat_events_.rollbackFrame(frame_offset);
+        combat_events_.advanceEpoch();
+        combat_boundary_in_batch_ = true;
+
+        joypads_[P1_PORT] = {};
+        joypads_[P2_PORT] = {};
+        last_frame_joypads_ = {};
+        previous_frame_joypads_ = {};
+        previous_p1_guard_action_active_ = false;
+        clearActionState();
+        clearP2ActionState();
     }
 
     FrameCombatState readFrameCombatState() const {
+        // 同一幀前後各呼叫一次。這裡只留下事件判定真正需要的 RAM 與
+        // hitbox 摘要，避免把 GameMemReaderCore 的生命週期帶出本函式。
         FrameCombatState state;
         size_t ram_size = 0;
         const uint8_t *ram_ptr = systemRam(&ram_size);
@@ -910,9 +1691,70 @@ public:
             return state;
 
         const game_memory::GameMemReaderCore mem_reader(ram_ptr, ram_size);
+        state.p1_health = mem_reader.readP1Health();
         state.p2_health = mem_reader.readP2Health();
         state.p1_combo = mem_reader.readP1ComboCount();
+        state.p2_combo = mem_reader.readP2ComboCount();
+        state.p1_guard_crush_value = mem_reader.readP1GuardCrushValue();
+        state.p2_guard_crush_value = mem_reader.readP2GuardCrushValue();
+        state.p1_hit_guard_stop_raw = mem_reader.readP1HitGuardStopRaw();
+        state.p2_hit_guard_stop_raw = mem_reader.readP2HitGuardStopRaw();
+        const auto p1_reaction = mem_reader.readP1ReactionDebugState();
+        state.p1_reaction_d2_raw = p1_reaction.reaction_d2;
+        state.p1_reaction_counter = p1_reaction.reaction_d2d3_signed;
+        state.p1_reaction_e3_raw = p1_reaction.reaction_e3;
+        const auto p2_reaction = mem_reader.readP2ReactionDebugState();
+        state.p2_reaction_d2_raw = p2_reaction.reaction_d2;
+        state.p2_reaction_counter = p2_reaction.reaction_d2d3_signed;
+        state.p2_reaction_e3_raw = p2_reaction.reaction_e3;
+        state.has_p1_position = mem_reader.readP1Position(state.p1_position);
+        state.has_p2_position = mem_reader.readP2Position(state.p2_position);
+        const game_memory::HitboxOverlay overlay = mem_reader.getHitboxOverlay();
+        state.p2_attack_guard_overlap = hasAttackGuardboxOverlap(
+            overlay,
+            2,
+            1);
+        state.p1_attack_guard_overlap = hasAttackGuardboxOverlap(
+            overlay,
+            1,
+            2);
         return state;
+    }
+
+    bool joypadHoldingBack(const kof_env_joypad_state &input,
+                           const FrameCombatState &state,
+                           size_t player_port) const {
+        if (state.has_p1_position && state.has_p2_position) {
+            const bool opponent_is_right = player_port == P1_PORT
+                ? state.p2_position.x >= state.p1_position.x
+                : state.p1_position.x >= state.p2_position.x;
+            return opponent_is_right
+                       ? input.left != 0
+                       : input.right != 0;
+        }
+        return input.left != 0 || input.right != 0;
+    }
+
+    bool p1HoldingBack(const FrameCombatState &state) const {
+        return joypadHoldingBack(last_frame_joypads_[P1_PORT], state, P1_PORT);
+    }
+
+    bool p1WasHoldingBack(const FrameCombatState &state) const {
+        return joypadHoldingBack(
+            previous_frame_joypads_[P1_PORT],
+            state,
+            P1_PORT);
+    }
+
+    bool p2HoldingBack(const FrameCombatState &state) const {
+        return joypadHoldingBack(last_frame_joypads_[P2_PORT], state, P2_PORT);
+    }
+
+    bool p2WasHoldingBack(const FrameCombatState &state) const {
+        return joypadHoldingBack(
+            previous_frame_joypads_[P2_PORT],
+            state,
+            P2_PORT);
     }
 
     void appendStepEvent(int32_t frame_offset,
@@ -921,47 +1763,376 @@ public:
                          uint32_t action_serial,
                          int32_t combo_before,
                          int32_t combo_after,
-                         int32_t p2_hp_delta) {
-        if (step_events_.event_count >= KOF_ENV_STEP_EVENT_CAPACITY_V1) {
-            ++step_events_.dropped_event_count;
+                         int32_t p2_hp_delta,
+                         int32_t p1_hp_delta = 0,
+                         int32_t target_y_at_event = -1,
+                         bool target_airborne_before_event = false,
+                         bool target_airborne_after_event = false,
+                         bool hit_contact = false,
+                         bool block_contact = false,
+                         int32_t p1_hit_guard_stop_before = -1,
+                         int32_t p1_hit_guard_stop_after = -1,
+                         int32_t p2_hit_guard_stop_before = -1,
+                          int32_t p2_hit_guard_stop_after = -1,
+                          int32_t action_elapsed_frames_at_event = -1,
+                          uint32_t guard_reaction_serial = 0,
+                          int32_t source_player = 0,
+                          int32_t target_player = 0) {
+        if (source_player == 0 && target_player == 0) {
+            switch (event_type) {
+            case KOF_ENV_STEP_EVENT_ACTION_STARTED:
+                source_player = 1;
+                break;
+            case KOF_ENV_STEP_EVENT_COMBO_HIT:
+            case KOF_ENV_STEP_EVENT_DAMAGE_ONLY:
+                source_player = 1;
+                target_player = 2;
+                break;
+            default:
+                source_player = 2;
+                target_player = 1;
+                break;
+            }
+        }
+
+        // V1 只接受原本三種事件，維持既有 ABI 與舊前端行為。
+        if (event_type <= KOF_ENV_STEP_EVENT_DAMAGE_ONLY) {
+            if (combat_events_.v1.event_count >= KOF_ENV_STEP_EVENT_CAPACITY_V1) {
+                ++combat_events_.v1.dropped_event_count;
+            } else {
+                auto &event = combat_events_.v1.events[combat_events_.v1.event_count++];
+                event.frame_offset = frame_offset;
+                event.event_type = event_type;
+                event.action_id = action_id;
+                event.action_serial = action_serial;
+                event.combo_before = combo_before;
+                event.combo_after = combo_after;
+                event.p2_hp_delta = p2_hp_delta;
+            }
+        }
+
+        if (combat_events_.v2.event_count >= KOF_ENV_STEP_EVENT_CAPACITY_V2) {
+            ++combat_events_.v2.dropped_event_count;
+        } else {
+            auto &event = combat_events_.v2.events[combat_events_.v2.event_count++];
+            event.frame_offset = frame_offset;
+            event.event_type = event_type;
+            event.action_id = action_id;
+            event.action_serial = action_serial;
+            event.combo_before = combo_before;
+            event.combo_after = combo_after;
+            event.p1_hp_delta = p1_hp_delta;
+            event.p2_hp_delta = p2_hp_delta;
+            event.target_y_at_event = target_y_at_event;
+            event.target_airborne_at_event = target_airborne_before_event ? 1 : 0;
+            event.hit_contact = hit_contact ? 1 : 0;
+            event.block_contact = block_contact ? 1 : 0;
+            event.target_airborne_after_event = target_airborne_after_event ? 1 : 0;
+        }
+
+        if (combat_events_.v3.event_count >= KOF_ENV_STEP_EVENT_CAPACITY_V3) {
+            ++combat_events_.v3.dropped_event_count;
+        } else {
+            auto &event_v3 =
+                combat_events_.v3.events[combat_events_.v3.event_count++];
+            event_v3.frame_offset = frame_offset;
+            event_v3.event_type = event_type;
+            event_v3.action_id = action_id;
+            event_v3.action_serial = action_serial;
+            event_v3.combo_before = combo_before;
+            event_v3.combo_after = combo_after;
+            event_v3.p1_hp_delta = p1_hp_delta;
+            event_v3.p2_hp_delta = p2_hp_delta;
+            event_v3.target_y_at_event = target_y_at_event;
+            event_v3.target_airborne_at_event =
+                target_airborne_before_event ? 1 : 0;
+            event_v3.hit_contact = hit_contact ? 1 : 0;
+            event_v3.block_contact = block_contact ? 1 : 0;
+            event_v3.target_airborne_after_event =
+                target_airborne_after_event ? 1 : 0;
+            event_v3.p1_hit_guard_stop_before = p1_hit_guard_stop_before;
+            event_v3.p1_hit_guard_stop_after = p1_hit_guard_stop_after;
+            event_v3.p2_hit_guard_stop_before = p2_hit_guard_stop_before;
+            event_v3.p2_hit_guard_stop_after = p2_hit_guard_stop_after;
+            event_v3.action_elapsed_frames_at_event =
+                action_elapsed_frames_at_event;
+            const bool has_contact = hit_contact || block_contact;
+            event_v3.expected_blockstun_frames = has_contact
+                ? kof98::expectedBlockstunFrames(
+                      action_id,
+                      target_airborne_before_event)
+                : kof98::UnknownMoveValue;
+            event_v3.expected_blockstun_source =
+                event_v3.expected_blockstun_frames >= 0
+                    ? static_cast<int32_t>(
+                          kof98::MoveDataSource::PublishedTable)
+                    : static_cast<int32_t>(kof98::MoveDataSource::Unknown);
+        }
+
+        const bool has_contact = hit_contact || block_contact;
+        const int32_t expected_blockstun_frames = has_contact
+            ? kof98::expectedBlockstunFrames(
+                  action_id,
+                  target_airborne_before_event)
+            : kof98::UnknownMoveValue;
+        const int32_t expected_blockstun_source =
+            expected_blockstun_frames >= 0
+                ? static_cast<int32_t>(kof98::MoveDataSource::PublishedTable)
+                : static_cast<int32_t>(kof98::MoveDataSource::Unknown);
+
+        if (combat_events_.v4.event_count >= KOF_ENV_STEP_EVENT_CAPACITY_V4) {
+            ++combat_events_.v4.dropped_event_count;
+        } else {
+            auto &event_v4 =
+                combat_events_.v4.events[combat_events_.v4.event_count++];
+            event_v4.frame_offset = frame_offset;
+            event_v4.event_type = event_type;
+            event_v4.action_id = action_id;
+            event_v4.action_serial = action_serial;
+            event_v4.combo_before = combo_before;
+            event_v4.combo_after = combo_after;
+            event_v4.p1_hp_delta = p1_hp_delta;
+            event_v4.p2_hp_delta = p2_hp_delta;
+            event_v4.target_y_at_event = target_y_at_event;
+            event_v4.target_airborne_at_event =
+                target_airborne_before_event ? 1 : 0;
+            event_v4.hit_contact = hit_contact ? 1 : 0;
+            event_v4.block_contact = block_contact ? 1 : 0;
+            event_v4.target_airborne_after_event =
+                target_airborne_after_event ? 1 : 0;
+            event_v4.p1_hit_guard_stop_before = p1_hit_guard_stop_before;
+            event_v4.p1_hit_guard_stop_after = p1_hit_guard_stop_after;
+            event_v4.p2_hit_guard_stop_before = p2_hit_guard_stop_before;
+            event_v4.p2_hit_guard_stop_after = p2_hit_guard_stop_after;
+            event_v4.action_elapsed_frames_at_event =
+                action_elapsed_frames_at_event;
+            event_v4.expected_blockstun_frames = expected_blockstun_frames;
+            event_v4.expected_blockstun_source = expected_blockstun_source;
+            event_v4.event_epoch = combat_events_.event_epoch;
+            event_v4.guard_reaction_serial = guard_reaction_serial;
+        }
+
+        if (combat_events_.v5.event_count >= KOF_ENV_STEP_EVENT_CAPACITY_V5) {
+            ++combat_events_.v5.dropped_event_count;
             return;
         }
 
-        auto &event = step_events_.events[step_events_.event_count++];
+        auto &event_v5 = combat_events_.v5.events[combat_events_.v5.event_count++];
+        event_v5.frame_offset = frame_offset;
+        event_v5.event_type = event_type;
+        event_v5.action_id = action_id;
+        event_v5.action_serial = action_serial;
+        event_v5.combo_before = combo_before;
+        event_v5.combo_after = combo_after;
+        event_v5.p1_hp_delta = p1_hp_delta;
+        event_v5.p2_hp_delta = p2_hp_delta;
+        event_v5.target_y_at_event = target_y_at_event;
+        event_v5.target_airborne_at_event =
+            target_airborne_before_event ? 1 : 0;
+        event_v5.hit_contact = hit_contact ? 1 : 0;
+        event_v5.block_contact = block_contact ? 1 : 0;
+        event_v5.target_airborne_after_event =
+            target_airborne_after_event ? 1 : 0;
+        event_v5.p1_hit_guard_stop_before = p1_hit_guard_stop_before;
+        event_v5.p1_hit_guard_stop_after = p1_hit_guard_stop_after;
+        event_v5.p2_hit_guard_stop_before = p2_hit_guard_stop_before;
+        event_v5.p2_hit_guard_stop_after = p2_hit_guard_stop_after;
+        event_v5.action_elapsed_frames_at_event =
+            action_elapsed_frames_at_event;
+        event_v5.expected_blockstun_frames = expected_blockstun_frames;
+        event_v5.expected_blockstun_source = expected_blockstun_source;
+        event_v5.event_epoch = combat_events_.event_epoch;
+        event_v5.guard_reaction_serial = guard_reaction_serial;
+        event_v5.source_player = source_player;
+        event_v5.target_player = target_player;
+        event_v5.absolute_engine_frame = engine_frame_index_;
+    }
+
+    void appendStepEventV5Only(
+        int32_t frame_offset,
+        kof_env_step_event_type event_type,
+        int32_t action_id,
+        uint32_t action_serial,
+        int32_t combo_before,
+        int32_t combo_after,
+        int32_t p1_hp_delta,
+        int32_t p2_hp_delta,
+        int32_t target_y_at_event,
+        bool target_airborne_before_event,
+        bool target_airborne_after_event,
+        bool hit_contact,
+        bool block_contact,
+        int32_t p1_hit_guard_stop_before,
+        int32_t p1_hit_guard_stop_after,
+        int32_t p2_hit_guard_stop_before,
+        int32_t p2_hit_guard_stop_after,
+        int32_t action_elapsed_frames_at_event,
+        uint32_t guard_reaction_serial,
+        int32_t source_player,
+        int32_t target_player) {
+        if (combat_events_.v5.event_count >= KOF_ENV_STEP_EVENT_CAPACITY_V5) {
+            ++combat_events_.v5.dropped_event_count;
+            return;
+        }
+
+        const bool has_contact = hit_contact || block_contact;
+        auto &event = combat_events_.v5.events[combat_events_.v5.event_count++];
         event.frame_offset = frame_offset;
         event.event_type = event_type;
         event.action_id = action_id;
         event.action_serial = action_serial;
         event.combo_before = combo_before;
         event.combo_after = combo_after;
+        event.p1_hp_delta = p1_hp_delta;
         event.p2_hp_delta = p2_hp_delta;
+        event.target_y_at_event = target_y_at_event;
+        event.target_airborne_at_event =
+            target_airborne_before_event ? 1 : 0;
+        event.hit_contact = hit_contact ? 1 : 0;
+        event.block_contact = block_contact ? 1 : 0;
+        event.target_airborne_after_event =
+            target_airborne_after_event ? 1 : 0;
+        event.p1_hit_guard_stop_before = p1_hit_guard_stop_before;
+        event.p1_hit_guard_stop_after = p1_hit_guard_stop_after;
+        event.p2_hit_guard_stop_before = p2_hit_guard_stop_before;
+        event.p2_hit_guard_stop_after = p2_hit_guard_stop_after;
+        event.action_elapsed_frames_at_event =
+            action_elapsed_frames_at_event;
+        event.expected_blockstun_frames = has_contact
+            ? kof98::expectedBlockstunFrames(
+                  action_id,
+                  target_airborne_before_event)
+            : kof98::UnknownMoveValue;
+        event.expected_blockstun_source =
+            event.expected_blockstun_frames >= 0
+                ? static_cast<int32_t>(kof98::MoveDataSource::PublishedTable)
+                : static_cast<int32_t>(kof98::MoveDataSource::Unknown);
+        event.event_epoch = combat_events_.event_epoch;
+        event.guard_reaction_serial = guard_reaction_serial;
+        event.source_player = source_player;
+        event.target_player = target_player;
+        event.absolute_engine_frame = engine_frame_index_;
+    }
+
+    void updateReactionTiming(size_t player_port,
+                              int32_t reaction_counter_before,
+                              int32_t reaction_counter_after,
+                              int32_t reaction_e3_before,
+                              int32_t reaction_e3_after,
+                              bool guard_contact,
+                              bool hit_contact) {
+        if (player_port >= PLAYER_PORT_COUNT)
+            return;
+
+        auto &reaction = combat_events_.reactions[player_port];
+        const int32_t signature_before =
+            reaction_e3_before >= 0 ? reaction_e3_before & 0x60 : -1;
+        const int32_t signature_after =
+            reaction_e3_after >= 0 ? reaction_e3_after & 0x60 : -1;
+        if (guard_contact && signature_after == 0x20) {
+            reaction.beginOrRefresh(KOF_ENV_REACTION_GUARD);
+        } else if (hit_contact && signature_after == 0x60) {
+            reaction.beginOrRefresh(KOF_ENV_REACTION_HIT);
+        }
+
+        if (!reaction.active)
+            return;
+
+        ++reaction.age_frames;
+        const bool countdown_progressed =
+            reaction_counter_before > 0 &&
+            reaction_counter_after == reaction_counter_before - 1;
+        if (countdown_progressed) {
+            reaction.countdown_seen = true;
+            reaction.remaining = reaction_counter_after + 1;
+        } else if (reaction.countdown_seen && reaction_counter_after >= 0) {
+            reaction.remaining = reaction_counter_after + 1;
+        }
+
+        const bool reaction_ended =
+            reaction.countdown_seen &&
+            reaction_counter_before == 0 &&
+            reaction_counter_after == -1 &&
+            (reaction.kind != KOF_ENV_REACTION_GUARD ||
+             (signature_before == 0x20 && signature_after == 0x00));
+        // 已確認倒數後，只有 0 -> -1 是目前驗證過的正常結束。
+        // 0 -> -2、正數直接跳負值或其他未知負值一律保守失效，
+        // 避免把舊 remaining 暴露給 PPO 直到 240F timeout。
+        const bool unexpected_negative =
+            shouldAbortUnexpectedReactionCounter(
+                reaction.countdown_seen,
+                reaction_counter_after,
+                reaction_ended);
+        if (reaction_ended ||
+            unexpected_negative ||
+            reaction.age_frames > GUARD_REACTION_TIMEOUT_FRAMES) {
+            reaction.reset();
+        }
     }
 
     void detectFrameCombatEvents(int32_t frame_offset,
                                  int32_t acting_action_id,
                                  uint32_t acting_action_serial,
+                                 bool p1_guard_action_active,
+                                 bool p1_guard_action_was_active,
                                  const FrameCombatState &before,
                                  const FrameCombatState &after) {
-        if (recent_damage_action_id_ >= 0)
-            ++recent_damage_age_frames_;
+        // runFrames() 中途若換局，保留本批次較早已寫入的合法事件，只清除
+        // 跨幀 tracker。這和 explicit reset/loadState 的整批 clear 不同。
+        const bool combat_boundary =
+            (before.p1_health >= 0 && after.p1_health > before.p1_health) ||
+            (before.p2_health >= 0 && after.p2_health > before.p2_health);
+        if (combat_boundary) {
+            handleInStepCombatBoundary(frame_offset);
+            return;
+        }
+
+        if (combat_events_.recent_damage.action_id >= 0)
+            ++combat_events_.recent_damage.age_frames;
 
         const int32_t p2_hp_delta =
             before.p2_health >= 0 && after.p2_health >= 0
                 ? std::max(0, before.p2_health - after.p2_health)
                 : 0;
+        const int32_t p1_hp_delta =
+            before.p1_health >= 0 && after.p1_health >= 0
+                ? std::max(0, before.p1_health - after.p1_health)
+                : 0;
         const bool combo_rose =
             before.p1_combo >= 0 &&
             after.p1_combo >= 0 &&
             after.p1_combo > before.p1_combo;
+        const bool p2_combo_rose =
+            before.p2_combo >= 0 &&
+            after.p2_combo >= 0 &&
+            after.p2_combo > before.p2_combo;
+        int32_t target_y = before.has_p2_position
+            ? before.p2_position.y
+            : (after.has_p2_position ? after.p2_position.y : -1);
+        bool target_airborne_before =
+            before.has_p2_position &&
+            before.p2_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
+        bool target_airborne_after =
+            after.has_p2_position &&
+            after.p2_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
 
         if (combo_rose) {
             int32_t hit_action_id = acting_action_id;
             uint32_t hit_action_serial = acting_action_serial;
-            if (p2_hp_delta == 0 &&
-                recent_damage_action_id_ >= 0 &&
-                recent_damage_age_frames_ <= COMBO_EVENT_DAMAGE_GRACE_FRAMES) {
-                hit_action_id = recent_damage_action_id_;
-                hit_action_serial = recent_damage_action_serial_;
+            // Queue 觸發後，child 的輸入腳本可能已開始，但畫面上的 parent
+            // 判定會晚 1~2 幀才命中。handoff grace 只修正這段短窗口。
+            if (combat_events_.handoff.action_id >= 0 &&
+                combat_events_.handoff.age_frames <= ACTION_HANDOFF_HIT_GRACE_FRAMES) {
+                hit_action_id = combat_events_.handoff.action_id;
+                hit_action_serial = combat_events_.handoff.action_serial;
+            } else if (p2_hp_delta == 0 &&
+                combat_events_.recent_damage.action_id >= 0 &&
+                combat_events_.recent_damage.age_frames <= COMBO_EVENT_DAMAGE_GRACE_FRAMES) {
+                hit_action_id = combat_events_.recent_damage.action_id;
+                hit_action_serial = combat_events_.recent_damage.action_serial;
+                target_y = combat_events_.recent_damage.target_y;
+                target_airborne_before = combat_events_.recent_damage.target_airborne_before;
+                target_airborne_after = combat_events_.recent_damage.target_airborne_after;
             }
 
             appendStepEvent(
@@ -971,8 +2142,20 @@ public:
                 hit_action_serial,
                 before.p1_combo,
                 after.p1_combo,
-                p2_hp_delta);
+                p2_hp_delta,
+                0,
+                target_y,
+                target_airborne_before,
+                target_airborne_after,
+                true,
+                false,
+                before.p1_hit_guard_stop_raw,
+                after.p1_hit_guard_stop_raw,
+                before.p2_hit_guard_stop_raw,
+                after.p2_hit_guard_stop_raw,
+                p1_action_.active_action_elapsed_frames);
             clearCombatEventState();
+            clearActionHandoffState();
         } else if (p2_hp_delta > 0) {
             appendStepEvent(
                 frame_offset,
@@ -981,108 +2164,688 @@ public:
                 acting_action_serial,
                 before.p1_combo,
                 after.p1_combo,
-                p2_hp_delta);
-            recent_damage_action_id_ = acting_action_id;
-            recent_damage_action_serial_ = acting_action_serial;
-            recent_damage_age_frames_ = 0;
-        } else if (recent_damage_age_frames_ > COMBO_EVENT_DAMAGE_GRACE_FRAMES) {
+                p2_hp_delta,
+                0,
+                target_y,
+                target_airborne_before,
+                target_airborne_after,
+                true,
+                false,
+                before.p1_hit_guard_stop_raw,
+                after.p1_hit_guard_stop_raw,
+                before.p2_hit_guard_stop_raw,
+                after.p2_hit_guard_stop_raw,
+                p1_action_.active_action_elapsed_frames);
+            combat_events_.recent_damage.action_id = acting_action_id;
+            combat_events_.recent_damage.action_serial = acting_action_serial;
+            combat_events_.recent_damage.age_frames = 0;
+            combat_events_.recent_damage.target_y = target_y;
+            combat_events_.recent_damage.target_airborne_before = target_airborne_before;
+            combat_events_.recent_damage.target_airborne_after = target_airborne_after;
+        } else if (combat_events_.recent_damage.age_frames > COMBO_EVENT_DAMAGE_GRACE_FRAMES) {
             clearCombatEventState();
         }
+
+        const int32_t p2_action_id = currentP2ActionId();
+        const uint32_t p2_action_serial = currentP2ActionSerial();
+        const bool guard_value_spent =
+            before.p1_guard_crush_value >= 0 &&
+            after.p1_guard_crush_value >= 0 &&
+            before.p1_guard_crush_value > after.p1_guard_crush_value;
+        const bool guardbox_contact =
+            before.p2_attack_guard_overlap || after.p2_attack_guard_overlap;
+        const int32_t reaction_kind_before =
+            before.p1_reaction_e3_raw >= 0
+                ? before.p1_reaction_e3_raw & 0x60
+                : -1;
+        const int32_t reaction_kind_after =
+            after.p1_reaction_e3_raw >= 0
+                ? after.p1_reaction_e3_raw & 0x60
+                : -1;
+        const bool guard_signature_after = reaction_kind_after == 0x20;
+        const bool manual_guard_input =
+            (p1_guard_action_active &&
+             (p1HoldingBack(before) || p1HoldingBack(after))) ||
+            (p1_guard_action_was_active &&
+             (p1WasHoldingBack(before) || p1WasHoldingBack(after)));
+        const bool chip_block_fallback =
+            guard_signature_after &&
+            p1_hp_delta > 0;
+
+        // 0x7C 是 hitbox slot active mask，不是 blockstun enum。物理格擋
+        // 以 Guard Crush 消耗為主要證據；E3=0x20 下的 chip damage 與
+        // Attack/Guard box overlap 只作補強。物理結果不依賴 P2 高階
+        // Action ID，因此 raw joypad 與遊戲內 CPU 也能建立 tracker；
+        // 這些來源的 attacker action 合法為 -1/0。
+        const bool block_contact =
+            guard_signature_after &&
+            (guard_value_spent ||
+             chip_block_fallback ||
+             guardbox_contact);
+        const bool block_edge =
+            block_contact &&
+            (!combat_events_.block_contact_active[P1_PORT] ||
+             guard_value_spent ||
+             p1_hp_delta > 0);
+
+        if (block_edge) {
+            const int32_t p1_y = before.has_p1_position
+                ? before.p1_position.y
+                : (after.has_p1_position ? after.p1_position.y : -1);
+            const bool p1_airborne_before =
+                before.has_p1_position &&
+                before.p1_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
+            const bool p1_airborne_after =
+                after.has_p1_position &&
+                after.p1_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
+
+            // 多段攻擊只維持一個 tracker。新 contact 會更新最後攻擊來源、
+            // 重設 hitstop gate，等新倒數再次出現 N→N-1 才解除 refresh。
+            auto &guard_reaction = combat_events_.guard_reactions[P1_PORT];
+            const int32_t hit_guard_stop = std::max(
+                before.p1_hit_guard_stop_raw,
+                after.p1_hit_guard_stop_raw);
+            if (!guard_reaction.active) {
+                guard_reaction.begin(
+                    p2_action_id,
+                    p2_action_serial,
+                    combat_events_.allocateGuardReactionSerial(),
+                    engine_frame_index_,
+                    hit_guard_stop,
+                    after.p1_reaction_counter,
+                    manual_guard_input);
+            } else {
+                guard_reaction.refresh(
+                    p2_action_id,
+                    p2_action_serial,
+                    engine_frame_index_,
+                    hit_guard_stop,
+                    after.p1_reaction_counter,
+                    manual_guard_input);
+            }
+
+            appendStepEvent(
+                frame_offset,
+                KOF_ENV_STEP_EVENT_BLOCK_CONTACT,
+                p2_action_id,
+                p2_action_serial,
+                before.p1_combo,
+                after.p1_combo,
+                0,
+                0,
+                p1_y,
+                p1_airborne_before,
+                p1_airborne_after,
+                false,
+                true,
+                before.p1_hit_guard_stop_raw,
+                after.p1_hit_guard_stop_raw,
+                before.p2_hit_guard_stop_raw,
+                after.p2_hit_guard_stop_raw,
+                currentP2ActionElapsedFrames(),
+                guard_reaction.reaction_serial);
+
+            // Manual 需要正面證據，而且同一條 guard string 最多發一次。
+            // 沒有手動證據時保持 Unknown；AUTO_GUARD 只保留給未來找到
+            // autoguard RAM source 後使用。
+            if (manual_guard_input && !guard_reaction.manual_success_emitted) {
+                appendStepEvent(
+                    frame_offset,
+                    KOF_ENV_STEP_EVENT_MANUAL_BLOCK_SUCCESS,
+                    p2_action_id,
+                    p2_action_serial,
+                    before.p1_combo,
+                    after.p1_combo,
+                    0,
+                    0,
+                    p1_y,
+                    p1_airborne_before,
+                    p1_airborne_after,
+                    false,
+                    true,
+                    before.p1_hit_guard_stop_raw,
+                    after.p1_hit_guard_stop_raw,
+                    before.p2_hit_guard_stop_raw,
+                    after.p2_hit_guard_stop_raw,
+                    currentP2ActionElapsedFrames(),
+                    guard_reaction.reaction_serial);
+                guard_reaction.manual_success_emitted = true;
+            }
+        }
+
+        auto &guard_reaction = combat_events_.guard_reactions[P1_PORT];
+        const int32_t p1_y = before.has_p1_position
+            ? before.p1_position.y
+            : (after.has_p1_position ? after.p1_position.y : -1);
+        const bool p1_airborne_before =
+            before.has_p1_position &&
+            before.p1_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
+        const bool p1_airborne_after =
+            after.has_p1_position &&
+            after.p1_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
+
+        // 合法 END 必須先於「E3 異常消失」處理。只接受完整 signed
+        // D2:D3 的 0→-1，且 E3 由 Guard signature 0x20 回到中性 0x00。
+        // 0→-2 或 0x20→0x60 都保守丟棄，不開啟訓練確反窗口。
+        const bool blockstun_ended =
+            guard_reaction.active &&
+            guard_reaction.confirmed_block_contact &&
+            guard_reaction.countdown_loaded &&
+            !guard_reaction.refresh_pending &&
+            !guard_reaction.end_emitted &&
+            before.p1_reaction_counter == 0 &&
+            after.p1_reaction_counter == -1 &&
+            reaction_kind_before == 0x20 &&
+            reaction_kind_after == 0x00;
+        if (blockstun_ended) {
+            appendStepEvent(
+                frame_offset,
+                KOF_ENV_STEP_EVENT_BLOCKSTUN_ENDED,
+                guard_reaction.attacker_action_id,
+                guard_reaction.attacker_action_serial,
+                before.p1_combo,
+                after.p1_combo,
+                0,
+                0,
+                p1_y,
+                p1_airborne_before,
+                p1_airborne_after,
+                false,
+                false,
+                before.p1_hit_guard_stop_raw,
+                after.p1_hit_guard_stop_raw,
+                before.p2_hit_guard_stop_raw,
+                after.p2_hit_guard_stop_raw,
+                currentP2ActionElapsedFrames(),
+                guard_reaction.reaction_serial);
+            guard_reaction.end_emitted = true;
+            guard_reaction.reset();
+        } else if (guard_reaction.active) {
+            const bool gate_open =
+                engine_frame_index_ >= guard_reaction.not_before_frame;
+            const bool waiting_for_countdown =
+                guard_reaction.phase == GuardReactionPhase::WaitingForCountdown ||
+                guard_reaction.phase == GuardReactionPhase::RefreshPending;
+            const bool countdown_progressed =
+                gate_open &&
+                waiting_for_countdown &&
+                reaction_kind_before == 0x20 &&
+                reaction_kind_after == 0x20 &&
+                before.p1_reaction_counter > 0 &&
+                after.p1_reaction_counter ==
+                    before.p1_reaction_counter - 1;
+
+            if (countdown_progressed) {
+                // 直接使用同一 emulator frame 的 before/after 驗證 N→N-1。
+                // 這同時涵蓋 1→0；舊的「after > 0」外層條件會漏掉它。
+                guard_reaction.countdown_loaded = true;
+                guard_reaction.refresh_pending = false;
+                guard_reaction.phase = GuardReactionPhase::CountdownActive;
+                guard_reaction.candidate_counter = -1;
+                guard_reaction.candidate_counter_frame = 0;
+
+                if (!guard_reaction.start_emitted) {
+                    // START 是確認 N→N-1 的 telemetry；Python 的確反邏輯
+                    // 只依可靠 END，因此不需要回填到前一幀。
+                    appendStepEvent(
+                        frame_offset,
+                        KOF_ENV_STEP_EVENT_BLOCKSTUN_STARTED,
+                        guard_reaction.attacker_action_id,
+                        guard_reaction.attacker_action_serial,
+                        before.p1_combo,
+                        after.p1_combo,
+                        0,
+                        0,
+                        p1_y,
+                        p1_airborne_before,
+                        p1_airborne_after,
+                        false,
+                        false,
+                        before.p1_hit_guard_stop_raw,
+                        after.p1_hit_guard_stop_raw,
+                        before.p2_hit_guard_stop_raw,
+                        after.p2_hit_guard_stop_raw,
+                        currentP2ActionElapsedFrames(),
+                        guard_reaction.reaction_serial);
+                    guard_reaction.start_emitted = true;
+                }
+            } else if (gate_open && reaction_kind_after != 0x20) {
+                // 合法 END 已在上方先處理；其餘 E3 消失或轉成 Hit
+                // signature 都是不完整/未知反應，不產生訓練事件。
+                guard_reaction.reset();
+            }
+        }
+
+        if (p1_hp_delta > 0) {
+            const int32_t p1_y = before.has_p1_position
+                ? before.p1_position.y
+                : (after.has_p1_position ? after.p1_position.y : -1);
+            const bool p1_airborne_before =
+                before.has_p1_position &&
+                before.p1_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
+            const bool p1_airborne_after =
+                after.has_p1_position &&
+                after.p1_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
+            const bool chip_damage = block_contact;
+            appendStepEvent(
+                frame_offset,
+                chip_damage
+                    ? KOF_ENV_STEP_EVENT_CHIP_DAMAGE
+                    : KOF_ENV_STEP_EVENT_CLEAN_HIT,
+                p2_action_id,
+                p2_action_serial,
+                before.p1_combo,
+                after.p1_combo,
+                0,
+                p1_hp_delta,
+                p1_y,
+                p1_airborne_before,
+                p1_airborne_after,
+                true,
+                chip_damage,
+                before.p1_hit_guard_stop_raw,
+                after.p1_hit_guard_stop_raw,
+                before.p2_hit_guard_stop_raw,
+                after.p2_hit_guard_stop_raw,
+                currentP2ActionElapsedFrames(),
+                block_contact
+                    ? combat_events_.guard_reactions[P1_PORT].reaction_serial
+                    : 0);
+        }
+
+        if (p1_hp_delta > 0 && !block_contact)
+            combat_events_.guard_reactions[P1_PORT].reset();
+
+        if (combat_events_.guard_reactions[P1_PORT].active) {
+            ++combat_events_.guard_reactions[P1_PORT].age_frames;
+            if (combat_events_.guard_reactions[P1_PORT].age_frames >
+                GUARD_REACTION_TIMEOUT_FRAMES) {
+                combat_events_.guard_reactions[P1_PORT].reset();
+            }
+        }
+
+        combat_events_.block_contact_active[P1_PORT] = block_contact;
+
+        // StrategyV4 對稱路徑：P1 攻擊、P2 防禦。這些新事件只寫入 V5，
+        // 避免改變 V1-V4 原本「以 P1 為學習主體」的事件集合。
+        const int32_t p2_reaction_kind_before =
+            before.p2_reaction_e3_raw >= 0
+                ? before.p2_reaction_e3_raw & 0x60
+                : -1;
+        const int32_t p2_reaction_kind_after =
+            after.p2_reaction_e3_raw >= 0
+                ? after.p2_reaction_e3_raw & 0x60
+                : -1;
+        const bool p2_guard_signature_after =
+            p2_reaction_kind_after == 0x20;
+        const bool p2_guard_value_spent =
+            before.p2_guard_crush_value >= 0 &&
+            after.p2_guard_crush_value >= 0 &&
+            before.p2_guard_crush_value > after.p2_guard_crush_value;
+        const bool p2_chip_block_fallback =
+            p2_guard_signature_after && p2_hp_delta > 0 && !combo_rose;
+        const bool p2_block_contact =
+            p2_guard_signature_after &&
+            (p2_guard_value_spent ||
+             p2_chip_block_fallback ||
+             before.p1_attack_guard_overlap ||
+             after.p1_attack_guard_overlap);
+        if (p2_block_contact) {
+            // P2 削血會先被舊相容路徑看成 DAMAGE_ONLY。V1-V4 保留原 ABI，
+            // 但 V5 必須讓 Hit/Block 互斥，避免同一幀同時推進
+            // StarterHit 與 StarterBlocked。
+            combat_events_.removeV5HitEventsForBlock(frame_offset, 1, 2);
+            clearCombatEventState();
+        }
+        const bool p2_block_edge =
+            p2_block_contact &&
+            (!combat_events_.block_contact_active[P2_PORT] ||
+             p2_guard_value_spent ||
+             p2_hp_delta > 0);
+        const bool p2_manual_guard_input =
+            p2HoldingBack(before) ||
+            p2HoldingBack(after) ||
+            p2WasHoldingBack(before) ||
+            p2WasHoldingBack(after);
+        auto &p2_guard_reaction =
+            combat_events_.guard_reactions[P2_PORT];
+        const int32_t p2_y = before.has_p2_position
+            ? before.p2_position.y
+            : (after.has_p2_position ? after.p2_position.y : -1);
+        const bool p2_airborne_before =
+            before.has_p2_position &&
+            before.p2_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
+        const bool p2_airborne_after =
+            after.has_p2_position &&
+            after.p2_position.y < KOF98_AIRBORNE_Y_THRESHOLD;
+
+        if (p2_block_edge) {
+            const int32_t hit_guard_stop = std::max(
+                before.p2_hit_guard_stop_raw,
+                after.p2_hit_guard_stop_raw);
+            if (!p2_guard_reaction.active) {
+                p2_guard_reaction.begin(
+                    acting_action_id,
+                    acting_action_serial,
+                    combat_events_.allocateGuardReactionSerial(),
+                    engine_frame_index_,
+                    hit_guard_stop,
+                    after.p2_reaction_counter,
+                    p2_manual_guard_input);
+            } else {
+                p2_guard_reaction.refresh(
+                    acting_action_id,
+                    acting_action_serial,
+                    engine_frame_index_,
+                    hit_guard_stop,
+                    after.p2_reaction_counter,
+                    p2_manual_guard_input);
+            }
+
+            appendStepEventV5Only(
+                frame_offset,
+                KOF_ENV_STEP_EVENT_BLOCK_CONTACT,
+                acting_action_id,
+                acting_action_serial,
+                before.p1_combo,
+                after.p1_combo,
+                0,
+                0,
+                p2_y,
+                p2_airborne_before,
+                p2_airborne_after,
+                false,
+                true,
+                before.p1_hit_guard_stop_raw,
+                after.p1_hit_guard_stop_raw,
+                before.p2_hit_guard_stop_raw,
+                after.p2_hit_guard_stop_raw,
+                p1_action_.active_action_elapsed_frames,
+                p2_guard_reaction.reaction_serial,
+                1,
+                2);
+
+            if (p2_manual_guard_input &&
+                !p2_guard_reaction.manual_success_emitted) {
+                appendStepEventV5Only(
+                    frame_offset,
+                    KOF_ENV_STEP_EVENT_MANUAL_BLOCK_SUCCESS,
+                    acting_action_id,
+                    acting_action_serial,
+                    before.p1_combo,
+                    after.p1_combo,
+                    0,
+                    0,
+                    p2_y,
+                    p2_airborne_before,
+                    p2_airborne_after,
+                    false,
+                    true,
+                    before.p1_hit_guard_stop_raw,
+                    after.p1_hit_guard_stop_raw,
+                    before.p2_hit_guard_stop_raw,
+                    after.p2_hit_guard_stop_raw,
+                    p1_action_.active_action_elapsed_frames,
+                    p2_guard_reaction.reaction_serial,
+                    1,
+                    2);
+                p2_guard_reaction.manual_success_emitted = true;
+            }
+        }
+
+        const bool p2_blockstun_ended =
+            p2_guard_reaction.active &&
+            p2_guard_reaction.confirmed_block_contact &&
+            p2_guard_reaction.countdown_loaded &&
+            !p2_guard_reaction.refresh_pending &&
+            !p2_guard_reaction.end_emitted &&
+            before.p2_reaction_counter == 0 &&
+            after.p2_reaction_counter == -1 &&
+            p2_reaction_kind_before == 0x20 &&
+            p2_reaction_kind_after == 0x00;
+        if (p2_blockstun_ended) {
+            appendStepEventV5Only(
+                frame_offset,
+                KOF_ENV_STEP_EVENT_BLOCKSTUN_ENDED,
+                p2_guard_reaction.attacker_action_id,
+                p2_guard_reaction.attacker_action_serial,
+                before.p1_combo,
+                after.p1_combo,
+                0,
+                0,
+                p2_y,
+                p2_airborne_before,
+                p2_airborne_after,
+                false,
+                false,
+                before.p1_hit_guard_stop_raw,
+                after.p1_hit_guard_stop_raw,
+                before.p2_hit_guard_stop_raw,
+                after.p2_hit_guard_stop_raw,
+                p1_action_.active_action_elapsed_frames,
+                p2_guard_reaction.reaction_serial,
+                1,
+                2);
+            p2_guard_reaction.end_emitted = true;
+            p2_guard_reaction.reset();
+        } else if (p2_guard_reaction.active) {
+            const bool gate_open =
+                engine_frame_index_ >= p2_guard_reaction.not_before_frame;
+            const bool waiting_for_countdown =
+                p2_guard_reaction.phase ==
+                    GuardReactionPhase::WaitingForCountdown ||
+                p2_guard_reaction.phase ==
+                    GuardReactionPhase::RefreshPending;
+            const bool countdown_progressed =
+                gate_open &&
+                waiting_for_countdown &&
+                p2_reaction_kind_before == 0x20 &&
+                p2_reaction_kind_after == 0x20 &&
+                before.p2_reaction_counter > 0 &&
+                after.p2_reaction_counter ==
+                    before.p2_reaction_counter - 1;
+            if (countdown_progressed) {
+                p2_guard_reaction.countdown_loaded = true;
+                p2_guard_reaction.refresh_pending = false;
+                p2_guard_reaction.phase =
+                    GuardReactionPhase::CountdownActive;
+                if (!p2_guard_reaction.start_emitted) {
+                    appendStepEventV5Only(
+                        frame_offset,
+                        KOF_ENV_STEP_EVENT_BLOCKSTUN_STARTED,
+                        p2_guard_reaction.attacker_action_id,
+                        p2_guard_reaction.attacker_action_serial,
+                        before.p1_combo,
+                        after.p1_combo,
+                        0,
+                        0,
+                        p2_y,
+                        p2_airborne_before,
+                        p2_airborne_after,
+                        false,
+                        false,
+                        before.p1_hit_guard_stop_raw,
+                        after.p1_hit_guard_stop_raw,
+                        before.p2_hit_guard_stop_raw,
+                        after.p2_hit_guard_stop_raw,
+                        p1_action_.active_action_elapsed_frames,
+                        p2_guard_reaction.reaction_serial,
+                        1,
+                        2);
+                    p2_guard_reaction.start_emitted = true;
+                }
+            } else if (gate_open && p2_reaction_kind_after != 0x20) {
+                p2_guard_reaction.reset();
+            }
+        }
+
+        if (p2_chip_block_fallback) {
+            appendStepEventV5Only(
+                frame_offset,
+                KOF_ENV_STEP_EVENT_CHIP_DAMAGE,
+                acting_action_id,
+                acting_action_serial,
+                before.p1_combo,
+                after.p1_combo,
+                0,
+                p2_hp_delta,
+                p2_y,
+                p2_airborne_before,
+                p2_airborne_after,
+                false,
+                true,
+                before.p1_hit_guard_stop_raw,
+                after.p1_hit_guard_stop_raw,
+                before.p2_hit_guard_stop_raw,
+                after.p2_hit_guard_stop_raw,
+                p1_action_.active_action_elapsed_frames,
+                p2_guard_reaction.reaction_serial,
+                1,
+                2);
+        }
+
+        if (p2_guard_reaction.active) {
+            ++p2_guard_reaction.age_frames;
+            if (p2_guard_reaction.age_frames >
+                GUARD_REACTION_TIMEOUT_FRAMES) {
+                p2_guard_reaction.reset();
+            }
+        }
+        combat_events_.block_contact_active[P2_PORT] = p2_block_contact;
+
+        if (combat_events_.handoff.action_id >= 0) {
+            ++combat_events_.handoff.age_frames;
+            if (combat_events_.handoff.age_frames > ACTION_HANDOFF_HIT_GRACE_FRAMES)
+                clearActionHandoffState();
+        }
+
+        updateReactionTiming(
+            P1_PORT,
+            before.p1_reaction_counter,
+            after.p1_reaction_counter,
+            before.p1_reaction_e3_raw,
+            after.p1_reaction_e3_raw,
+            block_edge,
+            (p1_hp_delta > 0 || p2_combo_rose) &&
+                !block_contact &&
+                reaction_kind_after == 0x60);
+        updateReactionTiming(
+            P2_PORT,
+            before.p2_reaction_counter,
+            after.p2_reaction_counter,
+            before.p2_reaction_e3_raw,
+            after.p2_reaction_e3_raw,
+            p2_block_edge,
+            (p2_hp_delta > 0 || combo_rose) &&
+                !p2_block_contact &&
+                p2_reaction_kind_after == 0x60);
     }
 
     void clearActionScript() {
-        active_script_.clear();
-        active_script_index_ = 0;
-        active_script_remaining_frames_ = 0;
+        p1_action_.clearScript();
+    }
+
+    int32_t actionScriptRemainingFrames() const {
+        return p1_action_.scriptRemainingFrames();
+    }
+
+    int32_t p2ActionScriptRemainingFrames() const {
+        return p2_controller_.scriptRemainingFrames();
     }
 
     void clearActionState() {
-        clearActionScript();
-        active_action_id_ = -1;
-        active_action_serial_ = 0;
-        action_start_event_pending_ = false;
-        queued_action_id_ = -1;
-        last_started_action_id_ = -1;
-        last_started_action_serial_ = 0;
-        active_action_elapsed_frames_ = 0;
-        last_action_accepted_ = false;
+        clearActionHandoffState();
+        p1_action_.reset();
     }
 
     bool startActionScript(int32_t action_id, std::vector<InputFrame> script) {
         if (script.empty())
             return fail("Action script is empty.");
 
-        active_script_ = std::move(script);
-        active_script_index_ = 0;
-        active_script_remaining_frames_ = active_script_[0].frames;
-        active_action_id_ = action_id;
-        active_action_elapsed_frames_ = 0;
-        if (action_id != IDLE_ACTION_ID) {
-            ++next_action_serial_;
-            if (next_action_serial_ == 0)
-                ++next_action_serial_;
-            active_action_serial_ = next_action_serial_;
-            action_start_event_pending_ = true;
-            last_started_action_id_ = action_id;
-            last_started_action_serial_ = active_action_serial_;
+        if (p1_action_.active_action_id > IDLE_ACTION_ID &&
+            p1_action_.active_action_serial != 0 &&
+            action_id != p1_action_.active_action_id) {
+            // Cancel 發生時 child 已成為 active，但 parent 的攻擊框可能在
+            // 接下來數幀才命中；暫存 parent serial 才不會把命中歸給 child。
+            combat_events_.handoff.action_id = p1_action_.active_action_id;
+            combat_events_.handoff.action_serial = p1_action_.active_action_serial;
+            combat_events_.handoff.age_frames = 0;
         } else {
-            active_action_serial_ = 0;
-            action_start_event_pending_ = false;
+            clearActionHandoffState();
         }
-        joypads_[P1_PORT] = active_script_[0].state;
+
+        p1_action_.script = std::move(script);
+        p1_action_.script_index = 0;
+        p1_action_.script_remaining_frames = p1_action_.script[0].frames;
+        p1_action_.active_action_id = action_id;
+        p1_action_.active_action_elapsed_frames = 0;
+        if (action_id != IDLE_ACTION_ID) {
+            ++p1_action_.next_action_serial;
+            if (p1_action_.next_action_serial == 0)
+                ++p1_action_.next_action_serial;
+            p1_action_.active_action_serial = p1_action_.next_action_serial;
+            p1_action_.action_start_event_pending = true;
+            p1_action_.last_started_action_id = action_id;
+            p1_action_.last_started_action_serial = p1_action_.active_action_serial;
+            p1_action_.last_started_action_age_frames = 0;
+        } else {
+            p1_action_.active_action_serial = 0;
+            p1_action_.action_start_event_pending = false;
+        }
+        joypads_[P1_PORT] = p1_action_.script[0].state;
         return true;
     }
 
     void advanceActionScriptFrame() {
-        if (active_script_.empty())
+        if (p1_action_.script.empty())
             return;
 
-        if (active_script_remaining_frames_ <= 0) {
-            ++active_script_index_;
-            if (active_script_index_ >= active_script_.size()) {
+        if (p1_action_.script_remaining_frames <= 0) {
+            ++p1_action_.script_index;
+            if (p1_action_.script_index >= p1_action_.script.size()) {
                 clearActionScript();
                 joypads_[P1_PORT] = {};
                 return;
             }
 
-            active_script_remaining_frames_ = active_script_[active_script_index_].frames;
+            p1_action_.script_remaining_frames = p1_action_.script[p1_action_.script_index].frames;
         }
 
-        if (active_script_remaining_frames_ <= 0)
+        if (p1_action_.script_remaining_frames <= 0)
             return;
 
-        joypads_[P1_PORT] = active_script_[active_script_index_].state;
-        --active_script_remaining_frames_;
+        joypads_[P1_PORT] = p1_action_.script[p1_action_.script_index].state;
+        --p1_action_.script_remaining_frames;
     }
 
     void finishActionScriptFrame() {
-        if (active_script_.empty())
+        if (p1_action_.script.empty())
             return;
 
-        if (active_script_remaining_frames_ <= 0 &&
-            active_script_index_ + 1 >= active_script_.size()) {
+        if (p1_action_.script_remaining_frames <= 0 &&
+            p1_action_.script_index + 1 >= p1_action_.script.size()) {
             clearActionScript();
             joypads_[P1_PORT] = {};
         }
     }
 
     void advanceActionLifecycleFrame() {
-        if (active_action_id_ < 0)
+        if (p1_action_.active_action_id < 0)
             return;
 
-        ++active_action_elapsed_frames_;
-        if (queued_action_id_ >= 0) {
+        ++p1_action_.active_action_elapsed_frames;
+        if (p1_action_.queued_action_id >= 0) {
             const FollowUpRule *rule = action_lut_.findFollowUpRule(
-                active_action_id_,
-                queued_action_id_);
+                p1_action_.active_action_id,
+                p1_action_.queued_action_id);
             if (!rule) {
                 clearActionState();
                 return;
             }
 
-            if (active_action_elapsed_frames_ >= rule->execute_frame) {
-                const int32_t queued_action_id = queued_action_id_;
-                queued_action_id_ = -1;
+            if (p1_action_.active_action_elapsed_frames >= rule->execute_frame) {
+                const int32_t queued_action_id = p1_action_.queued_action_id;
+                p1_action_.queued_action_id = -1;
                 if (!startActionById(queued_action_id, rule->script_action_id)) {
                     clearActionState();
                 }
@@ -1090,39 +2853,47 @@ public:
             return;
         }
 
-        if (active_script_.empty() &&
+        if (p1_action_.script.empty() &&
             !action_lut_.hasPendingFollowUpWindow(
-                active_action_id_,
-                active_action_elapsed_frames_)) {
-            active_action_id_ = -1;
-            active_action_serial_ = 0;
-            action_start_event_pending_ = false;
-            active_action_elapsed_frames_ = 0;
+                p1_action_.active_action_id,
+                p1_action_.active_action_elapsed_frames)) {
+            p1_action_.active_action_id = -1;
+            p1_action_.active_action_serial = 0;
+            p1_action_.action_start_event_pending = false;
+            p1_action_.active_action_elapsed_frames = 0;
         }
     }
 
     void clearP2RandomAiScript() {
-        p2_random_script_.clear();
-        p2_random_script_index_ = 0;
-        p2_random_script_remaining_frames_ = 0;
+        p2_controller_.clearScript();
     }
 
     void clearP2ActionState() {
-        clearP2RandomAiScript();
-        p2_active_action_id_ = -1;
-        p2_queued_action_id_ = -1;
-        p2_active_action_elapsed_frames_ = 0;
-        p2_last_action_accepted_ = false;
+        p2_controller_.resetActions();
     }
 
-    bool startP2RandomAiScript(std::vector<InputFrame> script) {
+    bool startP2RandomAiScript(std::vector<InputFrame> script,
+                               int32_t action_id = -1) {
         if (script.empty())
             return false;
 
-        p2_random_script_ = std::move(script);
-        p2_random_script_index_ = 0;
-        p2_random_script_remaining_frames_ = p2_random_script_[0].frames;
-        joypads_[P2_PORT] = p2_random_script_[0].state;
+        p2_controller_.script = std::move(script);
+        p2_controller_.script_index = 0;
+        p2_controller_.script_remaining_frames = p2_controller_.script[0].frames;
+        p2_controller_.training_action_id = action_id;
+        p2_controller_.training_action_elapsed_frames = 0;
+        if (action_id > IDLE_ACTION_ID) {
+            // scripted P2 沒有 p2_controller_.active_action_id，因此在腳本啟動時自行
+            // 配發 serial，讓 Physical Fight 的傷害事件仍可精確歸因。
+            ++p2_controller_.next_action_serial;
+            if (p2_controller_.next_action_serial == 0)
+                ++p2_controller_.next_action_serial;
+            p2_controller_.last_started_action_id = action_id;
+            p2_controller_.last_started_action_serial = p2_controller_.next_action_serial;
+            p2_controller_.last_started_action_age_frames = 0;
+            p2_controller_.action_start_event_pending = true;
+        }
+        joypads_[P2_PORT] = p2_controller_.script[0].state;
         return true;
     }
 
@@ -1136,7 +2907,7 @@ public:
         std::vector<InputFrame> script = action_it->second;
         if (cooldown_frames > 0)
             script.push_back({ {}, cooldown_frames });
-        return startP2RandomAiScript(std::move(script));
+        return startP2RandomAiScript(std::move(script), action_id);
     }
 
     bool startP2ActionById(int32_t action_id, int32_t script_action_id = -1) {
@@ -1153,56 +2924,58 @@ public:
         const auto action_it = actions->find(resolved_script_action_id);
         if (action_it == actions->cend())
             return fail("P2 action id is out of range.");
-        if (!startP2RandomAiScript(action_it->second))
+        if (!startP2RandomAiScript(action_it->second, action_id))
             return fail("P2 action script is empty.");
 
-        p2_active_action_id_ = action_id;
-        p2_active_action_elapsed_frames_ = 0;
+        p2_controller_.active_action_id = action_id;
+        p2_controller_.active_action_elapsed_frames = 0;
         return true;
     }
 
     bool setP2Action(int32_t action_id) {
-        p2_last_action_accepted_ = false;
-        if (!p2_action_ai_enabled_)
+        p2_controller_.last_action_accepted = false;
+        if (!p2_controller_.actionApiEnabled())
             return fail("P2 action AI is disabled.");
+        if (!isPublicActionId(action_id))
+            return fail("P2 action id is outside the public action set.");
 
-        if (p2_active_action_id_ >= 0) {
+        if (p2_controller_.active_action_id >= 0) {
             if (action_id == IDLE_ACTION_ID) {
-                p2_last_action_accepted_ = true;
+                p2_controller_.last_action_accepted = true;
                 return true;
             }
 
             if (canQueueP2Action(action_id)) {
-                p2_queued_action_id_ = action_id;
-                p2_last_action_accepted_ = true;
+                p2_controller_.queued_action_id = action_id;
+                p2_controller_.last_action_accepted = true;
                 return true;
             }
 
             return true;
         }
 
-        p2_last_action_accepted_ = startP2ActionById(action_id);
-        return p2_last_action_accepted_;
+        p2_controller_.last_action_accepted = startP2ActionById(action_id);
+        return p2_controller_.last_action_accepted;
     }
 
     void advanceP2ActionLifecycleFrame() {
-        if (p2_active_action_id_ < 0)
+        if (p2_controller_.active_action_id < 0)
             return;
 
-        ++p2_active_action_elapsed_frames_;
-        if (p2_queued_action_id_ >= 0) {
+        ++p2_controller_.active_action_elapsed_frames;
+        if (p2_controller_.queued_action_id >= 0) {
             const FollowUpRule *rule = action_lut_.findFollowUpRule(
-                p2_active_action_id_,
-                p2_queued_action_id_);
+                p2_controller_.active_action_id,
+                p2_controller_.queued_action_id);
             if (!rule) {
                 clearP2ActionState();
                 joypads_[P2_PORT] = {};
                 return;
             }
 
-            if (p2_active_action_elapsed_frames_ >= rule->execute_frame) {
-                const int32_t queued_action_id = p2_queued_action_id_;
-                p2_queued_action_id_ = -1;
+            if (p2_controller_.active_action_elapsed_frames >= rule->execute_frame) {
+                const int32_t queued_action_id = p2_controller_.queued_action_id;
+                p2_controller_.queued_action_id = -1;
                 if (!startP2ActionById(queued_action_id, rule->script_action_id)) {
                     clearP2ActionState();
                     joypads_[P2_PORT] = {};
@@ -1211,21 +2984,21 @@ public:
             return;
         }
 
-        if (p2_random_script_.empty() &&
+        if (p2_controller_.script.empty() &&
             !action_lut_.hasPendingFollowUpWindow(
-                p2_active_action_id_,
-                p2_active_action_elapsed_frames_)) {
-            p2_active_action_id_ = -1;
-            p2_active_action_elapsed_frames_ = 0;
+                p2_controller_.active_action_id,
+                p2_controller_.active_action_elapsed_frames)) {
+            p2_controller_.active_action_id = -1;
+            p2_controller_.active_action_elapsed_frames = 0;
         }
     }
 
     void finishP2ActionScriptFrame() {
-        if (!p2_action_ai_enabled_ || p2_random_script_.empty())
+        if (!p2_controller_.actionApiEnabled() || p2_controller_.script.empty())
             return;
 
-        if (p2_random_script_remaining_frames_ <= 0 &&
-            p2_random_script_index_ + 1 >= p2_random_script_.size()) {
+        if (p2_controller_.script_remaining_frames <= 0 &&
+            p2_controller_.script_index + 1 >= p2_controller_.script.size()) {
             clearP2RandomAiScript();
             joypads_[P2_PORT] = {};
         }
@@ -1239,8 +3012,8 @@ public:
         if (!actions || actions->empty())
             return false;
 
-        const uint32_t cycle = p2_training_cycle_++;
-        switch (p2_style_) {
+        const uint32_t cycle = p2_controller_.training_cycle++;
+        switch (p2_controller_.style) {
         case KOF_ENV_P2_STYLE_ONIYAKI:
             return startP2Action(*actions, KYO_ONIYAKI_ACTION_ID);
 
@@ -1255,22 +3028,22 @@ public:
                 return startP2RandomAiScript({
                     { stand_guard, 42 },
                     { {}, 10 },
-                });
+                }, WALK_BACK_ACTION_ID);
             case 1:
                 return startP2RandomAiScript({
                     { crouch_guard, 36 },
                     { {}, 8 },
-                });
+                }, 3);
             case 2:
                 return startP2RandomAiScript({
                     { stand_guard, 18 },
                     { {}, 18 },
-                });
+                }, WALK_BACK_ACTION_ID);
             default:
                 return startP2RandomAiScript({
                     { crouch_guard, 24 },
                     { {}, 14 },
-                });
+                }, 3);
             }
         }
 
@@ -1305,57 +3078,59 @@ public:
     }
 
     void advanceP2RandomAiFrame() {
-        if (p2_action_ai_enabled_) {
-            if (p2_random_script_.empty()) {
+        if (p2_controller_.actionApiEnabled()) {
+            if (p2_controller_.script.empty()) {
                 joypads_[P2_PORT] = {};
                 return;
             }
 
-            if (p2_random_script_remaining_frames_ <= 0) {
-                ++p2_random_script_index_;
-                if (p2_random_script_index_ >= p2_random_script_.size()) {
+            if (p2_controller_.script_remaining_frames <= 0) {
+                ++p2_controller_.script_index;
+                if (p2_controller_.script_index >= p2_controller_.script.size()) {
                     clearP2RandomAiScript();
                     joypads_[P2_PORT] = {};
                     return;
                 }
-                p2_random_script_remaining_frames_ =
-                    p2_random_script_[p2_random_script_index_].frames;
+                p2_controller_.script_remaining_frames =
+                    p2_controller_.script[p2_controller_.script_index].frames;
             }
 
-            if (p2_random_script_remaining_frames_ > 0) {
-                joypads_[P2_PORT] = p2_random_script_[p2_random_script_index_].state;
-                --p2_random_script_remaining_frames_;
+            if (p2_controller_.script_remaining_frames > 0) {
+                joypads_[P2_PORT] = p2_controller_.script[p2_controller_.script_index].state;
+                --p2_controller_.script_remaining_frames;
+                ++p2_controller_.training_action_elapsed_frames;
             }
             return;
         }
 
-        if (!p2_random_ai_enabled_) {
+        if (!p2_controller_.scriptedStyleEnabled()) {
             clearP2RandomAiScript();
             return;
         }
 
-        if (p2_random_script_.empty()) {
+        if (p2_controller_.script.empty()) {
             if (!startP2TrainingAction())
                 joypads_[P2_PORT] = {};
             return;
         }
 
-        if (p2_random_script_remaining_frames_ <= 0) {
-            ++p2_random_script_index_;
-            if (p2_random_script_index_ >= p2_random_script_.size()) {
+        if (p2_controller_.script_remaining_frames <= 0) {
+            ++p2_controller_.script_index;
+            if (p2_controller_.script_index >= p2_controller_.script.size()) {
                 clearP2RandomAiScript();
                 joypads_[P2_PORT] = {};
                 return;
             }
 
-            p2_random_script_remaining_frames_ = p2_random_script_[p2_random_script_index_].frames;
+            p2_controller_.script_remaining_frames = p2_controller_.script[p2_controller_.script_index].frames;
         }
 
-        if (p2_random_script_remaining_frames_ <= 0)
+        if (p2_controller_.script_remaining_frames <= 0)
             return;
 
-        joypads_[P2_PORT] = p2_random_script_[p2_random_script_index_].state;
-        --p2_random_script_remaining_frames_;
+        joypads_[P2_PORT] = p2_controller_.script[p2_controller_.script_index].state;
+        --p2_controller_.script_remaining_frames;
+        ++p2_controller_.training_action_elapsed_frames;
     }
 
     bool startActionById(int32_t action_id, int32_t script_action_id = -1) {
@@ -1382,20 +3157,25 @@ public:
         if (action_it == actions->cend())
             return fail("Action id is out of range.");
 
-        return startActionScript(action_id, action_it->second);
+        return startActionScript(
+            action_id,
+            p1ActionScript(action_id, action_it->second));
     }
 
     bool setAction(int32_t action_id) {
-        last_action_accepted_ = false;
-        if (active_action_id_ >= 0) {
+        p1_action_.last_action_accepted = false;
+        if (!isPublicActionId(action_id))
+            return fail("Action id is outside the public action set.");
+
+        if (p1_action_.active_action_id >= 0) {
             if (action_id == IDLE_ACTION_ID) {
-                last_action_accepted_ = true;
+                p1_action_.last_action_accepted = true;
                 return true;
             }
 
             if (canQueueAction(action_id)) {
-                queued_action_id_ = action_id;
-                last_action_accepted_ = true;
+                p1_action_.queued_action_id = action_id;
+                p1_action_.last_action_accepted = true;
                 return true;
             }
 
@@ -1403,8 +3183,8 @@ public:
             return true;
         }
 
-        last_action_accepted_ = startActionById(action_id);
-        return last_action_accepted_;
+        p1_action_.last_action_accepted = startActionById(action_id);
+        return p1_action_.last_action_accepted;
     }
 
     bool runFrames(int32_t frame_count) {
@@ -1414,21 +3194,58 @@ public:
             return fail("Frame count cannot be negative.");
 
         clearStepEvents();
+        combat_boundary_in_batch_ = false;
         g_active_runtime = this;
         for (int32_t frame = 0; frame < frame_count; ++frame) {
+            if (combat_boundary_in_batch_) {
+                // 換局後同一次 runFrames() 的剩餘幀只讓核心完成轉場。
+                // 不重啟 P1/P2 腳本，也不產生新 epoch 的半套事件。
+                joypads_[P1_PORT] = {};
+                joypads_[P2_PORT] = {};
+                previous_frame_joypads_ = last_frame_joypads_;
+                last_frame_joypads_ = joypads_;
+                retro_run_();
+                ++engine_frame_index_;
+                continue;
+            }
+
+            // 每個 emulator frame 的固定順序：先推進並套用輸入，再拍攝
+            // before，執行 retro_run，最後以 after 產生事件。事件必須在
+            // lifecycle 結束前完成，否則本幀命中會失去正確 action serial。
+            if (p1_action_.last_started_action_id >= 0 &&
+                p1_action_.last_started_action_age_frames < INT32_MAX) {
+                ++p1_action_.last_started_action_age_frames;
+            }
+            if (p2_controller_.last_started_action_id >= 0 &&
+                p2_controller_.last_started_action_age_frames < INT32_MAX) {
+                ++p2_controller_.last_started_action_age_frames;
+            }
+
             advanceActionScriptFrame();
             advanceP2RandomAiFrame();
+            previous_frame_joypads_ = last_frame_joypads_;
             last_frame_joypads_ = joypads_;
+            const bool has_recent_p1_action =
+                p1_action_.last_started_action_id > IDLE_ACTION_ID &&
+                p1_action_.last_started_action_age_frames <=
+                    ACTION_ATTRIBUTION_FALLBACK_FRAMES;
             const int32_t acting_action_id =
-                active_action_id_ > IDLE_ACTION_ID
-                    ? active_action_id_
-                    : last_started_action_id_;
+                p1_action_.active_action_id > IDLE_ACTION_ID
+                    ? p1_action_.active_action_id
+                    : (has_recent_p1_action ? p1_action_.last_started_action_id : -1);
             const uint32_t acting_action_serial =
-                active_action_id_ > IDLE_ACTION_ID
-                    ? active_action_serial_
-                    : last_started_action_serial_;
+                p1_action_.active_action_id > IDLE_ACTION_ID
+                    ? p1_action_.active_action_serial
+                    : (has_recent_p1_action ? p1_action_.last_started_action_serial : 0);
+            const bool p1_guard_action_active =
+                p1_action_.active_action_id == WALK_BACK_ACTION_ID ||
+                p1_action_.active_action_id == CROUCH_GUARD_ACTION_ID ||
+                p1_action_.active_action_id == STAND_GUARD_ACTION_ID;
+            const bool p1_guard_action_was_active =
+                previous_p1_guard_action_active_;
+            previous_p1_guard_action_active_ = p1_guard_action_active;
             const FrameCombatState before = readFrameCombatState();
-            if (action_start_event_pending_) {
+            if (p1_action_.action_start_event_pending) {
                 appendStepEvent(
                     frame,
                     KOF_ENV_STEP_EVENT_ACTION_STARTED,
@@ -1436,8 +3253,44 @@ public:
                     acting_action_serial,
                     before.p1_combo,
                     before.p1_combo,
+                    0,
+                    0,
+                    -1,
+                    false,
+                    false,
+                    false,
+                    false,
+                    before.p1_hit_guard_stop_raw,
+                    before.p1_hit_guard_stop_raw,
+                    before.p2_hit_guard_stop_raw,
+                    before.p2_hit_guard_stop_raw,
+                    p1_action_.active_action_elapsed_frames);
+                p1_action_.action_start_event_pending = false;
+            }
+            if (p2_controller_.action_start_event_pending) {
+                appendStepEventV5Only(
+                    frame,
+                    KOF_ENV_STEP_EVENT_ACTION_STARTED,
+                    currentP2ActionId(),
+                    currentP2ActionSerial(),
+                    before.p2_combo,
+                    before.p2_combo,
+                    0,
+                    0,
+                    -1,
+                    false,
+                    false,
+                    false,
+                    false,
+                    before.p1_hit_guard_stop_raw,
+                    before.p1_hit_guard_stop_raw,
+                    before.p2_hit_guard_stop_raw,
+                    before.p2_hit_guard_stop_raw,
+                    currentP2ActionElapsedFrames(),
+                    0,
+                    2,
                     0);
-                action_start_event_pending_ = false;
+                p2_controller_.action_start_event_pending = false;
             }
             retro_run_();
             const FrameCombatState after = readFrameCombatState();
@@ -1445,13 +3298,16 @@ public:
                 frame,
                 acting_action_id,
                 acting_action_serial,
+                p1_guard_action_active,
+                p1_guard_action_was_active,
                 before,
                 after);
             finishActionScriptFrame();
             finishP2ActionScriptFrame();
             advanceActionLifecycleFrame();
-            if (p2_action_ai_enabled_)
+            if (p2_controller_.actionApiEnabled())
                 advanceP2ActionLifecycleFrame();
+            ++engine_frame_index_;
         }
 
         return true;
@@ -1615,10 +3471,10 @@ public:
     bool environment(unsigned command, void *data) {
         switch (command) {
         case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
-            *static_cast<const char **>(data) = system_directory_utf8_.c_str();
+            *static_cast<const char **>(data) = paths_.system_directory.c_str();
             return true;
         case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
-            *static_cast<const char **>(data) = save_directory_utf8_.c_str();
+            *static_cast<const char **>(data) = paths_.save_directory.c_str();
             return true;
         case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
             static_cast<retro_log_callback *>(data)->log = logPrintf;
@@ -1723,7 +3579,7 @@ private:
     }
 
     bool cacheStateFile(const std::wstring &path) {
-        if (path == cached_state_path_ && !cached_state_data_.empty())
+        if (path == cached_state_.path && !cached_state_.data.empty())
             return true;
 
         std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -1742,14 +3598,13 @@ private:
         if (!file)
             return fail("Could not read complete state file.");
 
-        cached_state_path_ = path;
-        cached_state_data_ = std::move(data);
+        cached_state_.path = path;
+        cached_state_.data = std::move(data);
         return true;
     }
 
     void clearStateCache() {
-        cached_state_path_.clear();
-        cached_state_data_.clear();
+        cached_state_.clear();
     }
 
     void close() {
@@ -1775,8 +3630,15 @@ private:
         clearStateCache();
         joypads_[P1_PORT] = {};
         joypads_[P2_PORT] = {};
+        last_frame_joypads_ = {};
+        previous_frame_joypads_ = {};
+        previous_p1_guard_action_active_ = false;
+        engine_frame_index_ = 0;
+        combat_boundary_in_batch_ = false;
         clearActionState();
         clearP2ActionState();
+        clearStepEvents();
+        combat_events_.advanceEpoch();
     }
 
     void installCallbacks() {
@@ -1891,39 +3753,16 @@ private:
     bool game_loaded_ = false;
     std::array<kof_env_joypad_state, PLAYER_PORT_COUNT> joypads_ {};
     std::array<kof_env_joypad_state, PLAYER_PORT_COUNT> last_frame_joypads_ {};
-    std::vector<InputFrame> active_script_;
-    size_t active_script_index_ = 0;
-    int32_t active_script_remaining_frames_ = 0;
-    int32_t active_action_id_ = -1;
-    int32_t queued_action_id_ = -1;
-    int32_t last_started_action_id_ = -1;
-    uint32_t last_started_action_serial_ = 0;
-    int32_t active_action_elapsed_frames_ = 0;
-    bool last_action_accepted_ = false;
-    uint32_t next_action_serial_ = 0;
-    uint32_t active_action_serial_ = 0;
-    bool action_start_event_pending_ = false;
-    kof_env_step_events_v1 step_events_ {};
-    int32_t recent_damage_action_id_ = -1;
-    uint32_t recent_damage_action_serial_ = 0;
-    int32_t recent_damage_age_frames_ = 0;
-    std::vector<InputFrame> p2_random_script_;
-    size_t p2_random_script_index_ = 0;
-    int32_t p2_random_script_remaining_frames_ = 0;
-    bool p2_random_ai_enabled_ = false;
-    bool p2_action_ai_enabled_ = false;
-    int32_t p2_active_action_id_ = -1;
-    int32_t p2_queued_action_id_ = -1;
-    int32_t p2_active_action_elapsed_frames_ = 0;
-    bool p2_last_action_accepted_ = false;
-    kof_env_p2_style p2_style_ = KOF_ENV_P2_STYLE_ONIYAKI;
-    uint32_t p2_training_cycle_ = 0;
+    std::array<kof_env_joypad_state, PLAYER_PORT_COUNT> previous_frame_joypads_ {};
+    bool previous_p1_guard_action_active_ = false;
+    uint64_t engine_frame_index_ = 0;
+    bool combat_boundary_in_batch_ = false;
+    ActionRuntimeState p1_action_;
+    CombatEventState combat_events_;
+    P2ControllerState p2_controller_;
     CharacterActionMapLut action_lut_;
-    std::string game_path_utf8_;
-    std::string system_directory_utf8_;
-    std::string save_directory_utf8_;
-    std::wstring cached_state_path_;
-    std::vector<uint8_t> cached_state_data_;
+    RuntimePaths paths_;
+    CachedState cached_state_;
     mutable std::string last_error_;
     kof_env_video_refresh_t video_refresh_callback_ = nullptr;
     void *video_refresh_user_data_ = nullptr;
@@ -1957,6 +3796,22 @@ FbneoTrainingRuntime *runtimeFromHandle(kof_env_handle handle) {
 } // namespace
 
 extern "C" {
+
+uint32_t kof_env_api_version(void) {
+    return KOF_ENV_API_VERSION;
+}
+
+uint32_t kof_env_public_action_count(void) {
+    return KOF_ENV_PUBLIC_ACTION_COUNT;
+}
+
+uint32_t kof_env_action_set_version(void) {
+    return KOF_ENV_ACTION_SET_VERSION;
+}
+
+uint32_t kof_env_p1_hold_chunk_frames(void) {
+    return KOF_ENV_P1_HOLD_CHUNK_FRAMES;
+}
 
 kof_env_handle kof_env_create(void) {
     return new FbneoTrainingRuntime();
@@ -1992,6 +3847,11 @@ int kof_env_load_state(kof_env_handle handle, const wchar_t *state_path) {
 int kof_env_save_state(kof_env_handle handle, const wchar_t *state_path) {
     auto *runtime = runtimeFromHandle(handle);
     return runtime && runtime->saveState(state_path) ? 1 : 0;
+}
+
+int kof_env_snapshot_safe(kof_env_handle handle) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->snapshotSafe() ? 1 : 0;
 }
 
 void kof_env_set_joypad(kof_env_handle handle, const kof_env_joypad_state *state) {
@@ -2071,10 +3931,86 @@ int kof_env_get_action_status(kof_env_handle handle,
     return runtime && runtime->getActionStatus(status) ? 1 : 0;
 }
 
+int kof_env_get_strategy_state_v1(kof_env_handle handle,
+                                  kof_env_strategy_state_v1 *state) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->getStrategyStateV1(state) ? 1 : 0;
+}
+
+int kof_env_get_combat_timing_state_v1(
+    kof_env_handle handle,
+    kof_env_combat_timing_state_v1 *state) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->getCombatTimingStateV1(state) ? 1 : 0;
+}
+
 int kof_env_get_step_events_v1(kof_env_handle handle,
                                kof_env_step_events_v1 *events) {
     auto *runtime = runtimeFromHandle(handle);
     return runtime && runtime->getStepEventsV1(events) ? 1 : 0;
+}
+
+int kof_env_get_step_events_v2(kof_env_handle handle,
+                               kof_env_step_events_v2 *events) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->getStepEventsV2(events) ? 1 : 0;
+}
+
+int kof_env_get_step_events_v3(kof_env_handle handle,
+                               kof_env_step_events_v3 *events) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->getStepEventsV3(events) ? 1 : 0;
+}
+
+int kof_env_get_step_events_v4(kof_env_handle handle,
+                               kof_env_step_events_v4 *events) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->getStepEventsV4(events) ? 1 : 0;
+}
+
+int kof_env_get_step_events_v5(kof_env_handle handle,
+                               kof_env_step_events_v5 *events) {
+    auto *runtime = runtimeFromHandle(handle);
+    return runtime && runtime->getStepEventsV5(events) ? 1 : 0;
+}
+
+int kof_env_get_kyo_move_data_v1(int32_t action_id,
+                                 int32_t variant,
+                                 kof_env_move_data_v1 *move_data) {
+    if (!move_data ||
+        move_data->struct_size != sizeof(kof_env_move_data_v1) ||
+        move_data->version != KOF_ENV_MOVE_DATA_VERSION_1) {
+        return 0;
+    }
+
+    const kof98::MoveData *source = kof98::findKyoMoveData(
+        action_id,
+        static_cast<kof98::MoveVariant>(variant));
+    if (!source)
+        return 0;
+
+    kof_env_move_data_v1 result {};
+    result.struct_size = sizeof(kof_env_move_data_v1);
+    result.version = KOF_ENV_MOVE_DATA_VERSION_1;
+    result.action_id = source->action_id;
+    result.variant = static_cast<int32_t>(source->variant);
+    result.move_class = static_cast<int32_t>(source->move_class);
+    result.startup_frames = source->startup_frames;
+    result.active_frames = source->active_frames;
+    result.recovery_frames = source->recovery_frames;
+    result.reach_front = source->reach_front;
+    result.reach_back = source->reach_back;
+    result.movement_forward = source->movement_forward;
+    result.attack_y_min = source->attack_y_min;
+    result.attack_y_max = source->attack_y_max;
+    result.anti_ground_small_jump_y = source->anti_ground_small_jump_y;
+    result.anti_ground_normal_jump_y = source->anti_ground_normal_jump_y;
+    result.ground_blockstun_frames = source->ground_blockstun_frames;
+    result.air_blockstun_frames = source->air_blockstun_frames;
+    result.flags = source->flags;
+    result.source = static_cast<int32_t>(source->source);
+    *move_data = result;
+    return 1;
 }
 
 int kof_env_run_frames(kof_env_handle handle, int32_t frame_count) {

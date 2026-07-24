@@ -177,6 +177,8 @@ if(QNEOGEO_BUILD_TOOLS)
     add_library(fbneo_training SHARED
         gamememreadercore.cpp
         gamememreadercore.h
+        kof98movedata.cpp
+        kof98movedata.h
         tools/fbneo_training.cpp
         tools/fbneo_training.h
     )
@@ -189,6 +191,9 @@ if(QNEOGEO_BUILD_TOOLS)
     target_include_directories(fbneo_training PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/neocd_libretro/deps/libretro-common/include"
     )
+    if(MSVC)
+        target_compile_options(fbneo_training PRIVATE /utf-8)
+    endif()
 endif()
 
 if(QNEOGEO_BUILD_QT_APP)
@@ -255,6 +260,10 @@ if(QNEOGEO_BUILD_QT_APP)
         gamememreader.h
         gamememreadercore.cpp
         gamememreadercore.h
+        koframtracelogger.cpp
+        koframtracelogger.h
+        kof98movedata.cpp
+        kof98movedata.h
         libretrocore.cpp
         libretrocore.h
         main.cpp
@@ -282,6 +291,10 @@ if(QNEOGEO_BUILD_QT_APP)
     target_include_directories(qneogeo PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/neocd_libretro/deps/libretro-common/include"
     )
+
+    if(MSVC)
+        target_compile_options(qneogeo PRIVATE /utf-8)
+    endif()
 
     target_link_libraries(qneogeo PRIVATE Qt6::Widgets Qt6::OpenGL Qt6::OpenGLWidgets RtAudio::rtaudio SampleRate::samplerate xinput)
 

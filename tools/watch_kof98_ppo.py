@@ -1,3 +1,20 @@
+"""OpenGL 觀賽器:目視檢查模型/腳本的實際行為(pygame + PyOpenGL)。
+
+三種驅動模式(擇一):
+    --model:         載入 MaskablePPO 模型自主決策(預設 deterministic,
+                      --stochastic 改為抽樣)。mask 由 env 依 profile 提供。
+    --fixed-actions:  照劇本播放動作序列(驗證 C++ 腳本用,不代表模型會)。
+    --random / 無:    隨機或純待機。
+
+Profile 差異(重要,常見誤解):
+    --profile combo(預設):強制 action_repeat=1、載 combo state、
+        依 --combo-scenario 的 mask 引導 —— 模型只能演出該 scenario。
+        看模型「自由發揮」要配 --mask-level physical。
+    --profile fight:實戰模式,配 --p2-training-ai 開啟 P2 對手、
+        --action-repeat 4 對齊訓練條件。
+
+快捷鍵:SPACE 暫停、R 重置、ESC 離開。--hitboxes 疊加判定框。
+"""
 from __future__ import annotations
 
 import argparse
@@ -16,6 +33,13 @@ from kof98_env import (
     Kof98Env,
     P2Style,
     TrainingProfile,
+)
+from kof98_observation import (
+    OBSERVATION_V1_SIZE,
+    OBSERVATION_V2_SIZE,
+    OBSERVATION_SCHEMA_V2_ID,
+    OBSERVATION_SCHEMA_V3_ID,
+    ObservationVersion,
 )
 
 
@@ -656,6 +680,36 @@ def main() -> int:
     root = args.root.resolve()
     state_path = resolve_state_path(root, args.state)
     model_path = args.model if args.model is None or args.model.is_absolute() else root / args.model
+    model = None
+    model_action_count = 29
+    observation_version = ObservationVersion.V1
+    if args.model:
+        from sb3_contrib import MaskablePPO
+
+        model = MaskablePPO.load(str(model_path), device=args.device)
+        model_action_count = int(model.action_space.n)
+        model_observation_size = int(model.observation_space.shape[0])
+        if model_observation_size == OBSERVATION_V1_SIZE:
+            observation_version = ObservationVersion.V1
+        elif model_observation_size == OBSERVATION_V2_SIZE:
+            model_schema = getattr(
+                model,
+                "kof_observation_schema_id",
+                OBSERVATION_SCHEMA_V2_ID,
+            )
+            if model_schema == OBSERVATION_SCHEMA_V3_ID:
+                observation_version = ObservationVersion.V3
+            elif model_schema == OBSERVATION_SCHEMA_V2_ID:
+                observation_version = ObservationVersion.V2
+            else:
+                raise ValueError(
+                    "A 140-value model must declare a supported observation "
+                    f"schema, got {model_schema!r}"
+                )
+        else:
+            raise ValueError(
+                f"Unsupported model observation size: {model_observation_size}"
+            )
 
     if args.show_paths:
         import OpenGL
@@ -672,6 +726,7 @@ def main() -> int:
         print(f"  game: {root / 'roms' / 'fbneo' / 'kof98.zip'}", flush=True)
         print(f"  state: {state_path if state_path else '(none)'}", flush=True)
         print(f"  model: {model_path if model_path else '(none)'}", flush=True)
+        print(f"  observation: {observation_version.value}", flush=True)
         print(f"  profile: {args.profile}", flush=True)
         print(f"  P2 training AI: {'on' if args.p2_training_ai else 'off'}", flush=True)
         print(f"  P2 style: {args.p2_style}", flush=True)
@@ -703,6 +758,7 @@ def main() -> int:
         p2_style=P2Style(args.p2_style),
         combo_scenario=args.combo_scenario,
         action_mask_level=ActionMaskLevel(args.mask_level),
+        observation_version=observation_version,
     )
     env.client.set_video_refresh_callback(sink.receive)
 
@@ -711,13 +767,7 @@ def main() -> int:
         if invalid_actions:
             raise ValueError(f"Fixed action ids are out of range: {invalid_actions}")
 
-    model = None
-    model_action_count = env.action_space.n
-    if args.model:
-        from sb3_contrib import MaskablePPO
-
-        model = MaskablePPO.load(str(model_path), device=args.device)
-        model_action_count = int(model.action_space.n)
+    if model is not None:
         if model_action_count != env.action_space.n:
             print(
                 f"Warning: model has {model_action_count} actions, environment has "

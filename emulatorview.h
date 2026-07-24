@@ -77,8 +77,27 @@ public:
         bool isNeutral() const;
     };
 
+    struct PlayerMemoryDiagnostics {
+        int32_t hit_guard_stop = -1;
+        int32_t reaction_d2 = -1;
+        int32_t reaction_d3 = -1;
+        int32_t reaction_d2d3_unsigned = -1;
+        int32_t reaction_d2d3_signed = -1;
+        int32_t reaction_e0 = -1;
+        int32_t reaction_e1 = -1;
+        int32_t reaction_e2 = -1;
+        int32_t reaction_e3 = -1;
+        int32_t d4_high = -1;
+        int32_t d5_low = -1;
+        int32_t d4_signed = -1;
+        int32_t recovery_control_e7 = -1;
+        int32_t guard_crush = -1;
+    };
+
     void setHitboxOverlay(QVector<HitboxRect> boxes, QVector<HitboxAxis> axes);
     void submitInputFrame(int32_t player, const JoypadInput &input, uint64_t frameNumber);
+    void setPlayerMemoryDiagnostics(int32_t player,
+                                    const PlayerMemoryDiagnostics &diagnostics);
     void clearInputHistory();
 
 signals:

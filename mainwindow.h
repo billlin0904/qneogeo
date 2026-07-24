@@ -5,6 +5,7 @@
 #include <QVector>
 
 #include <cstdint>
+#include <memory>
 
 class QAction;
 class QActionGroup;
@@ -13,6 +14,7 @@ class QEvent;
 class QLabel;
 class LibretroCore;
 class MemorySearchDialog;
+class KofRamTraceLogger;
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
@@ -68,6 +70,8 @@ private:
     void updateInputOverlay();
     void updateKof98Overlay();
     void updateOverlayLabelPositions();
+    void setRamTraceEnabled(bool enabled);
+    void stopRamTrace(const QString &status_message = {});
 
     Ui::MainWindow *ui_;
     EmulatorView *emulator_view_;
@@ -78,10 +82,14 @@ private:
     QVector<QAction *> load_state_actions_;
     QAction *pause_when_inactive_action_;
     QAction *gameplay_with_ai_p2_action_;
+    QAction *gameplay_ai_pure_policy_action_;
     QAction *show_fps_action_;
+    QAction *show_health_action_;
+    QAction *show_power_action_;
     QAction *show_input_history_action_;
     QAction *show_input_frame_numbers_action_;
     QAction *show_hitboxes_action_;
+    QAction *record_ram_trace_action_;
     QAction *neocd_core_action_;
     QAction *fbneo_core_action_;
     QAction *fbneo_training_core_action_;
@@ -93,6 +101,7 @@ private:
     QLabel *combo_label_;
     QLabel *power_label_;
     MemorySearchDialog *memory_search_dialog_ = nullptr;
+    std::unique_ptr<KofRamTraceLogger> ram_trace_logger_;
     QString current_game_path_;
     CoreKind core_kind_ = CoreKind::NeoCd;
     bool auto_paused_for_focus_loss_ = false;
